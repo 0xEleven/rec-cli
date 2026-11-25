@@ -12,13 +12,13 @@ _rec_load_config
 _rec_detect_terminal() {
   if [[ -n "$KITTY_WINDOW_ID" || -n "$KITTY_PID" || "$TERM" == "xterm-kitty" ]]; then
     echo "kitty"
-  elif [[ "$TERM_PROGRAM" == "Tabby" ]]; then
+  elif [[ "${TERM_PROGRAM:l}" == "tabby" || -n "${TABBY_CONFIG_DIRECTORY:-}" ]]; then
     echo "tabby"
   elif [[ -n "$ALACRITTY_WINDOW_ID" || -n "$ALACRITTY_SOCKET" || "$TERM" == "alacritty" ]]; then
     echo "alacritty"
-  elif [[ "$TERM_PROGRAM" == "WezTerm" || -n "$WEZTERM_PANE" ]]; then
+  elif [[ "${TERM_PROGRAM:l}" == "wezterm" || -n "$WEZTERM_PANE" ]]; then
     echo "wezterm"
-  elif [[ "$TERM_PROGRAM" == "ghostty" || -n "$GHOSTTY_RESOURCES_DIR" ]]; then
+  elif [[ "${TERM_PROGRAM:l}" == "ghostty" || -n "$GHOSTTY_RESOURCES_DIR" ]]; then
     echo "ghostty"
   elif [[ "$TERM" == "foot" || "$TERM" == "foot-extra" ]]; then
     echo "foot"
@@ -26,6 +26,8 @@ _rec_detect_terminal() {
     echo "konsole"
   elif [[ -n "$GNOME_TERMINAL_SCREEN" || "$VTE_VERSION" != "" ]]; then
     echo "gnome-terminal"
+  elif [[ "$(ps -o comm= -p $PPID 2>/dev/null)" == "tabby" ]]; then
+    echo "tabby"
   elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" && "$TERM" == xterm* ]]; then
     echo "xterm"
   fi

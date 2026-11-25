@@ -935,6 +935,7 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
         fg = _deepest_fg_cmd(pid, children_map, procs)
         kitty_sock = _read_proc_env_var(pid, "KITTY_LISTEN_ON") if term == "kitty" else ""
         kitty_win = _read_proc_env_var(pid, "KITTY_WINDOW_ID") if term == "kitty" else ""
+        tmux_pane = _read_proc_env_var(pid, "TMUX_PANE")
         open_unrecorded.append({
             "pid": pid,
             "terminal": term,
@@ -943,6 +944,7 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
             "fg_cmd": fg,
             "kitty_sock": kitty_sock,
             "kitty_win": kitty_win,
+            "tmux_pane": tmux_pane,
         })
         covered_pts.add(pts)
         running_counts[term] = running_counts.get(term, 0) + 1
@@ -1698,7 +1700,7 @@ class RecGuiWindow(QMainWindow):
             QMessageBox.information(self, "rec-cli", "Open a terminal and run: rec start")
 
     def _attach_open_terminal(self, info: dict):
-        """Attach via kitty remote control if available, otherwise copy `rec start`."""
+        """Start recording in-place via kitty remote / tmux if available, else copy `exec zsh` / `rec start`."""
         sock = info.get("kitty_sock", "")
         win_id = info.get("kitty_win", "")
         if sock and win_id and shutil.which("kitty"):
@@ -1707,7 +1709,19 @@ class RecGuiWindow(QMainWindow):
                     ["kitty", "@", "--to", sock, "send-text", "--match", f"id:{win_id}", "rec start\r"],
                     check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
                 )
-                self._show_toast(f"Started recording in Kitty #{win_id}")
+                self._show_toast(f"Recording in Kitty #{win_id}")
+                QTimer.singleShot(600, lambda: self._refresh_sessions(force=True))
+                return
+            except Exception:
+                pass
+        tmux_pane = info.get("tmux_pane", "")
+        if tmux_pane and shutil.which("tmux"):
+            try:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", tmux_pane, "rec start", "Enter"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+                )
+                self._show_toast(f"Recording in tmux {tmux_pane}")
                 QTimer.singleShot(600, lambda: self._refresh_sessions(force=True))
                 return
             except Exception:
@@ -1877,7 +1891,7 @@ class RecGuiWindow(QMainWindow):
             return
 
         if managed:
-            sec = QLabel("RECORDING SESSIONS")
+            sec = QLabel("LIVE TERMINALS (1-CLICK RECORD)")
             sec.setObjectName("sectionLabel")
             self.sessions_lay.addWidget(sec)
 
@@ -1887,7 +1901,7 @@ class RecGuiWindow(QMainWindow):
         if open_terms:
             if managed:
                 self.sessions_lay.addSpacing(8)
-            sec2 = QLabel("OPEN TERMINALS (NOT RECORDING)")
+            sec2 = QLabel("PRE-HOOK TABS (REOPEN OR RUN EXEC ZSH ONCE FOR 1-CLICK)")
             sec2.setObjectName("sectionLabel")
             self.sessions_lay.addWidget(sec2)
 
@@ -2042,16 +2056,16 @@ class RecGuiWindow(QMainWindow):
         btns = QHBoxLayout()
         btns.setSpacing(6)
 
-        can_remote = bool(o.get("kitty_sock") and o.get("kitty_win"))
+        can_remote = bool((o.get("kitty_sock") and o.get("kitty_win")) or o.get("tmux_pane"))
         if can_remote:
             b_attach = QPushButton("Record")
             b_attach.setObjectName("recBtn")
-            b_attach.setToolTip("Start recording inside this existing Kitty tab")
+            b_attach.setToolTip("Start recording directly inside this existing tab")
             b_attach.clicked.connect(lambda _c=False, info=o: self._attach_open_terminal(info))
             btns.addWidget(b_attach)
         else:
             b_copy = QPushButton("Copy rec start")
-            b_copy.setToolTip("Opened before standby hook. Paste 'rec start' in this tab, or reopen it for 1-click in-place recording.")
+            b_copy.setToolTip("Linux cannot inject into a shell opened before rec-cli standby. Run 'rec start' or 'exec zsh' once, and all future tabs get 1-click Record.")
             b_copy.clicked.connect(lambda _c=False, info=o: self._attach_open_terminal(info))
             btns.addWidget(b_copy)
 
