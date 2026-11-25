@@ -192,6 +192,56 @@ def is_alive(pid: int) -> bool:
         return False
 
 
+def load_legacy_asciinema() -> list[dict]:
+    """Detect pre-v1.3.0 `asciinema rec` wrapper sessions so `rec ps` never hides them."""
+    uid = os.getuid()
+    found = []
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                if os.stat(entry.path).st_uid != uid:
+                    continue
+                with open(f"{entry.path}/cmdline", "rb") as f:
+                    parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\x00") if x]
+                if not parts:
+                    continue
+                joined = " ".join(parts)
+                if "asciinema" not in os.path.basename(parts[0]) and not any("asciinema" in p for p in parts[:2]):
+                    continue
+                if "rec" not in parts[1:4]:
+                    continue
+                cast = next((p for p in reversed(parts) if p.endswith(".cast")), "")
+                started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
+                cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
+                try:
+                    cwd = os.readlink(f"{entry.path}/cwd")
+                except OSError:
+                    cwd = ""
+                found.append({
+                    "pid": pid,
+                    "child_pid": 0,
+                    "state": "recording",
+                    "name": "legacy",
+                    "terminal": "old-tab",
+                    "cast": cast,
+                    "meta": "",
+                    "cwd": cwd,
+                    "fg_cmd": "asciinema rec (old tab — type 'exit' to finish)",
+                    "last_cmd": "",
+                    "started_at": started_at,
+                    "cast_size": cast_size,
+                    "legacy": True,
+                })
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
+
+
 def load_sessions() -> list[dict]:
     items = []
     for p in sorted(sess_dir.glob("*.json")):
@@ -209,6 +259,7 @@ def load_sessions() -> list[dict]:
             items.append(data)
         except Exception:
             continue
+    items.extend(load_legacy_asciinema())
     items.sort(key=lambda x: (0 if x.get("state") == "recording" else 1 if x.get("state") == "paused" else 2, x.get("pid", 0)))
     return items
 
@@ -306,6 +357,24 @@ if action in ("stop", "cancel", "pause", "resume"):
     target = args[0] if args else ""
     matches = resolve_targets(sessions, target, require_active=(action != "resume"))
     if not matches:
+        if not target and os.environ.get("ASCIINEMA_REC"):
+            if action == "cancel":
+                cast_f = os.environ.get("_TERM_REC_CAST", "")
+                meta_f = os.environ.get("_TERM_REC_META", "")
+                for fpath in (cast_f, meta_f):
+                    if fpath and os.path.exists(fpath):
+                        try:
+                            os.unlink(fpath)
+                        except OSError:
+                            pass
+                print(f"{C_YELLOW}✕ Discarded legacy asciinema clip.{C_RESET} Type 'exit' or Ctrl+D to close this pre-v1.3.0 tab; new tabs use live rec-pty.", file=sys.stderr)
+                sys.exit(0)
+            print(
+                f"{C_YELLOW}This tab is running a legacy asciinema session (opened before v1.3.0).{C_RESET}\n"
+                f"Type 'exit' or press Ctrl+D to stop & save it — new tabs automatically use rec-pty with live 'rec stop' / 'rec pause' / 'rec ps'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if not target:
             print("Not currently recording in this terminal. Run 'rec ps' to manage other terminals.", file=sys.stderr)
         else:
@@ -313,6 +382,9 @@ if action in ("stop", "cancel", "pause", "resume"):
         sys.exit(1)
     for s in matches:
         pid = s["pid"]
+        if s.get("legacy"):
+            print(f"{C_YELLOW}PID {pid} is a legacy asciinema tab (pre-v1.3.0).{C_RESET} Type 'exit' inside that tab to save it, or 'rec kill {pid}' to terminate it.", file=sys.stderr)
+            continue
         send_ctrl(pid, action)
         label = s.get("name") or s.get("fg_cmd") or f"PID {pid}"
         if action == "stop":

@@ -465,24 +465,72 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
-def load_live_sessions() -> list[dict]:
-    if not SESS_DIR.is_dir():
-        return []
-    out = []
-    for p in sorted(SESS_DIR.glob("*.json")):
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            pid = int(data.get("pid", 0))
-            if pid <= 0 or not is_pid_alive(pid):
-                p.unlink(missing_ok=True)
-                (ACTIVE_DIR / str(pid)).unlink(missing_ok=True)
+def load_legacy_asciinema() -> list[dict]:
+    uid = os.getuid()
+    found = []
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
                 continue
-            cast = data.get("cast", "")
-            if cast and os.path.exists(cast):
-                data["cast_size"] = os.path.getsize(cast)
-            out.append(data)
-        except Exception:
-            continue
+            pid = int(entry.name)
+            try:
+                if os.stat(entry.path).st_uid != uid:
+                    continue
+                with open(f"{entry.path}/cmdline", "rb") as f:
+                    parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\x00") if x]
+                if not parts:
+                    continue
+                if "asciinema" not in os.path.basename(parts[0]) and not any("asciinema" in p for p in parts[:2]):
+                    continue
+                if "rec" not in parts[1:4]:
+                    continue
+                cast = next((p for p in reversed(parts) if p.endswith(".cast")), "")
+                started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
+                cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
+                try:
+                    cwd = os.readlink(f"{entry.path}/cwd")
+                except OSError:
+                    cwd = ""
+                found.append({
+                    "pid": pid,
+                    "child_pid": 0,
+                    "state": "recording",
+                    "name": "legacy-tab",
+                    "terminal": "old-tab",
+                    "cast": cast,
+                    "meta": "",
+                    "cwd": cwd,
+                    "fg_cmd": "asciinema rec (pre-v1.3.0 tab — type exit in tab to save)",
+                    "last_cmd": "",
+                    "started_at": started_at,
+                    "cast_size": cast_size,
+                    "legacy": True,
+                })
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
+
+
+def load_live_sessions() -> list[dict]:
+    out = []
+    if SESS_DIR.is_dir():
+        for p in sorted(SESS_DIR.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                pid = int(data.get("pid", 0))
+                if pid <= 0 or not is_pid_alive(pid):
+                    p.unlink(missing_ok=True)
+                    (ACTIVE_DIR / str(pid)).unlink(missing_ok=True)
+                    continue
+                cast = data.get("cast", "")
+                if cast and os.path.exists(cast):
+                    data["cast_size"] = os.path.getsize(cast)
+                out.append(data)
+            except Exception:
+                continue
+    out.extend(load_legacy_asciinema())
     order = {"recording": 0, "paused": 1, "standby": 2}
     out.sort(key=lambda x: (order.get(x.get("state", "standby"), 2), x.get("pid", 0)))
     return out
@@ -1036,6 +1084,8 @@ class RecGuiWindow(QMainWindow):
         sessions = load_live_sessions()
         count = 0
         for s in sessions:
+            if s.get("legacy"):
+                continue
             if s.get("state") in ("recording", "paused"):
                 if send_session_cmd(s["pid"], "stop"):
                     count += 1
@@ -1208,7 +1258,12 @@ class RecGuiWindow(QMainWindow):
             # Contextual action buttons
             btns = QHBoxLayout()
             btns.setSpacing(6)
-            if state == "recording":
+            if s.get("legacy"):
+                b_kill = QPushButton("Kill Legacy Tab")
+                b_kill.setObjectName("dangerBtn")
+                b_kill.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "kill"))
+                btns.addWidget(b_kill)
+            elif state == "recording":
                 b_pause = QPushButton("Pause")
                 b_pause.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "pause"))
                 b_mark = QPushButton("+ Mark")
