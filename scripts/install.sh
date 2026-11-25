@@ -6,7 +6,7 @@ set -euo pipefail
 #           Fedora, RHEL, Rocky, Alma, CentOS, openSUSE, Alpine, Void, Gentoo
 # Shells:   Zsh, Bash, Fish
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 PREFIX="${PREFIX:-$HOME/.local}"
 INSTALL_DEPS=1
 CONFIGURE_SHELLS=1
@@ -109,6 +109,7 @@ install_files() {
   mkdir -p "$bin_dir" "$share_dir/shell" "$share_dir/starship"
 
   install -m 755 "$REPO_ROOT/bin/rec-cli"   "$bin_dir/rec-cli"
+  install -m 755 "$REPO_ROOT/bin/rec-pty"   "$bin_dir/rec-pty"
   install -m 755 "$REPO_ROOT/bin/cast2mp4"  "$bin_dir/cast2mp4"
   install -m 755 "$REPO_ROOT/bin/casts2mp4" "$bin_dir/casts2mp4"
 

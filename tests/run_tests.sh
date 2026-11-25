@@ -26,12 +26,47 @@ if command -v fish >/dev/null 2>&1; then
 fi
 
 echo "=== 2. rec-cli init & CLI commands ==="
-rec-cli version | grep -q "rec-cli 1.2.0"
+python3 -m py_compile "$REPO_ROOT/bin/rec-pty"
+rec-cli version | grep -q "rec-cli 1.3.0"
 rec-cli init zsh  | grep -q "_rec_is_allowed_terminal"
 rec-cli init bash | grep -q "_rec_bash_preexec"
 rec-cli init fish | grep -q "_rec_fish_preexec"
 XDG_CONFIG_HOME="$(mktemp -d)" rec-cli config auto | grep -q "Resolution set to auto"
-echo "PASS: rec-cli init & config auto work for zsh, bash, fish"
+echo "PASS: rec-pty compile, rec-cli init & config auto work for zsh, bash, fish"
+
+echo "=== 2b. Live process-manager test (rec-pty + rec ps/pause/resume/mark/stop/start/cancel/kill) ==="
+RT_TEST="$(mktemp -d)"
+CAST_TEST="$(mktemp -d)"
+XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" "$REPO_ROOT/bin/rec-pty" --name ssh-box -- bash -c "sleep 8" >/dev/null 2>&1 &
+PTY_PID=$!
+# Wait up to 3s for session registration
+for _ in $(seq 1 30); do
+  [[ -f "$RT_TEST/rec-cli-$(id -u)/sessions/${PTY_PID}.json" ]] && break
+  sleep 0.1
+done
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "$PTY_PID"
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "ssh-box"
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli pause "$PTY_PID" | grep -q "Paused PID $PTY_PID"
+sleep 0.2
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "PAUSED"
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli resume "$PTY_PID" | grep -q "Resumed PID $PTY_PID"
+sleep 0.2
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli mark "$PTY_PID" "got root" | grep -q "Chapter marker"
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli stop "$PTY_PID" | grep -q "Stopped PID $PTY_PID"
+sleep 0.3
+# Child must STILL be alive in STANDBY mode (simulating live SSH session surviving rec stop!)
+kill -0 "$PTY_PID"
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "STANDBY"
+# Remotely start a second clip on the exact same live PID, then cancel & kill cleanly
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli start "$PTY_PID" part2 | grep -q "Started recording on PID $PTY_PID"
+sleep 0.2
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "part2"
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli cancel "$PTY_PID" | grep -q "Canceled PID $PTY_PID"
+sleep 0.2
+XDG_RUNTIME_DIR="$RT_TEST" rec-cli kill "$PTY_PID" | grep -q "Terminated"
+wait "$PTY_PID" 2>/dev/null || true
+rm -rf "$RT_TEST" "$CAST_TEST"
+echo "PASS: Live PID process control (ps/pause/resume/mark/stop-without-dropping/start/cancel/kill) verified!"
 
 echo "=== 3. End-to-end 4K, vertical, redaction, chapters, gif/thumb/trim & split ==="
 if ! command -v agg >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
@@ -160,4 +195,4 @@ REC_VIDEO_DIR="$OUT" rec-cli stats | grep -q "Total clips:"
 echo "PASS: rec thumb, gif, trim, stats all verified"
 
 echo ""
-echo "ALL v1.2.0 TESTS PASSED!"
+echo "ALL v1.3.0 TESTS PASSED!"

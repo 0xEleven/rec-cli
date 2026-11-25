@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rec-cli — Terminal clip recorder CLI (v1.2.0)
-# Works across Linux distros with Zsh, Bash, and Fish.
+# rec-cli — Process-managed terminal clip recorder CLI (v1.3.0)
+# Manage parallel recordings across tabs, panes, and SSH sessions by PID or name.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli"
 CONF_FILE="$CONF_DIR/config"
 AUTO_OFF_FLAG="$CONF_DIR/auto-disabled"
 LEGACY_AUTO_OFF="$HOME/.config/term-rec/auto-disabled"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/rec-cli-$(id -u)"
 
 if [[ -f "$CONF_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -113,39 +114,271 @@ C_YELLOW=$'\033[38;2;224;175;104m'
 
 show_help() {
   cat <<EOF
-${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} - Terminal Clip Recorder for Linux (Zsh, Bash, Fish)
+${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} - Process-Managed Terminal Clip Recorder (Zsh, Bash, Fish)
 
-${C_CYAN}Session Control:${C_RESET}
-  ${C_BOLD}rec start [name]${C_RESET}          Start recording this terminal (auto-named by process if omitted)
-  ${C_BOLD}rec stop${C_RESET}                  Stop recording & render MP4 in background (keeps tab open)
-  ${C_BOLD}rec cancel${C_RESET}                Stop recording & discard the take (saves nothing)
-  ${C_BOLD}rec mark <label>${C_RESET}          Drop a YouTube chapter marker during an active recording
-  ${C_BOLD}rec status${C_RESET}                Show live recording state, config & clip stats
+${C_CYAN}Process & Parallel Recording Control (works across tabs, panes & SSH):${C_RESET}
+  ${C_BOLD}rec ps${C_RESET}                         List all live recording processes with PID, state, name & cmd
+  ${C_BOLD}rec start [name]${C_RESET}               Start recording this terminal (or: rec start <pid> [name])
+  ${C_BOLD}rec stop [pid|name|all]${C_RESET}        Stop & render MP4 without dropping SSH or closing the tab
+  ${C_BOLD}rec pause [pid|name|all]${C_RESET}       Pause recording live (keeps SSH/shell alive)
+  ${C_BOLD}rec resume [pid|name|all]${C_RESET}      Resume a paused recording
+  ${C_BOLD}rec cancel [pid|name|all]${C_RESET}      Stop & discard recording without saving
+  ${C_BOLD}rec mark [pid|name] <label>${C_RESET}    Drop a YouTube chapter marker into this or another PID
+  ${C_BOLD}rec kill <pid|name|all>${C_RESET}        Force-terminate a recording session process
+  ${C_BOLD}rec status${C_RESET}                     Show current tab status, active PIDs, config & clip stats
 
 ${C_CYAN}Content Tools:${C_RESET}
-  ${C_BOLD}rec list${C_RESET}                  List saved MP4 clips in ${VIDEO_DIR}
-  ${C_BOLD}rec play [clip|latest]${C_RESET}    Preview the latest (or named) clip
-  ${C_BOLD}rec gif [clip|latest]${C_RESET}     Export a palette-optimized GIF for READMEs / Discord / X
-  ${C_BOLD}rec thumb [clip|latest]${C_RESET}   Extract a PNG thumbnail frame from a clip
-  ${C_BOLD}rec trim <clip> <st> <en>${C_RESET} Lossless fast trim (e.g. rec trim latest 00:05 01:20)
-  ${C_BOLD}rec reels <file.cast>${C_RESET}     Render a 9:16 TikTok/Reels cursor-following clip (zero crop)
-  ${C_BOLD}rec stats${C_RESET}                 Show total runtime, disk usage, and top recorded tools
-  ${C_BOLD}rec render [speed]${C_RESET}        Convert pending finished .cast files now
-  ${C_BOLD}rec open${C_RESET}                  Open clips folder in your file manager
-  ${C_BOLD}rec clear [--yes]${C_RESET}         Delete saved MP4 clips and raw casts
+  ${C_BOLD}rec list${C_RESET}                       List saved MP4 clips in ${VIDEO_DIR}
+  ${C_BOLD}rec play [clip|latest]${C_RESET}         Preview the latest (or named) clip
+  ${C_BOLD}rec gif [clip|latest]${C_RESET}          Export a palette-optimized GIF
+  ${C_BOLD}rec thumb [clip|latest]${C_RESET}        Extract a PNG thumbnail frame
+  ${C_BOLD}rec trim <clip> <st> <en>${C_RESET}      Lossless fast trim (e.g. rec trim latest 00:05 01:20)
+  ${C_BOLD}rec reels <file.cast>${C_RESET}          Render a 9:16 TikTok/Reels cursor-following clip
+  ${C_BOLD}rec stats${C_RESET}                      Show total runtime, disk usage, and top tools
+  ${C_BOLD}rec render [speed]${C_RESET}             Convert pending finished .cast files now
+  ${C_BOLD}rec open${C_RESET}                       Open clips folder in your file manager
+  ${C_BOLD}rec clear [--yes]${C_RESET}              Delete saved MP4 clips and raw casts
 
 ${C_CYAN}Auto-Record & Configuration:${C_RESET}
-  ${C_BOLD}rec auto on|off${C_RESET}           Toggle auto-recording on new allowed terminal tabs
-  ${C_BOLD}rec config auto${C_RESET}           Auto-pick resolution from this device's screen
-  ${C_BOLD}rec config [key val]${C_RESET}      Configure resolution, reels-copy, speed, frame, redact, theme, terminals
-  ${C_BOLD}rec init <shell>${C_RESET}          Print shell integration for zsh, bash, or fish
-  ${C_BOLD}rec doctor${C_RESET}                Check dependencies & display resolution
-  ${C_BOLD}rec version${C_RESET}               Print version
+  ${C_BOLD}rec auto on|off${C_RESET}                Toggle auto-recording on new allowed terminal tabs
+  ${C_BOLD}rec config auto${C_RESET}                Auto-pick resolution from this device's screen
+  ${C_BOLD}rec config [key val]${C_RESET}           Configure resolution, reels-copy, speed, frame, redact, theme, terminals
+  ${C_BOLD}rec init <shell>${C_RESET}               Print shell integration for zsh, bash, or fish
+  ${C_BOLD}rec doctor${C_RESET}                     Check dependencies & display resolution
+  ${C_BOLD}rec version${C_RESET}                    Print version
 EOF
 }
 
 is_auto_disabled() {
   [[ -f "$AUTO_OFF_FLAG" || -f "$LEGACY_AUTO_OFF" ]]
+}
+
+# Python helper for live PID/name session management (`rec ps`, remote `stop`/`pause`/`resume`/`cancel`/`start`/`mark`/`kill`)
+run_session_mgr() {
+  python3 - "$RUNTIME_DIR" "${REC_PTY_PID:-}" "$@" <<'PYEOF'
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+runtime_dir = Path(sys.argv[1])
+my_pid = int(sys.argv[2]) if sys.argv[2].isdigit() else 0
+action = sys.argv[3]
+args = sys.argv[4:]
+
+sess_dir = runtime_dir / "sessions"
+active_dir = runtime_dir / "active"
+sess_dir.mkdir(parents=True, exist_ok=True)
+active_dir.mkdir(parents=True, exist_ok=True)
+
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_RED = "\033[38;2;247;118;142m"
+C_GREEN = "\033[38;2;158;206;106m"
+C_PURPLE = "\033[38;2;187;154;247m"
+C_CYAN = "\033[38;2;125;207;255m"
+C_YELLOW = "\033[38;2;224;175;104m"
+
+
+def is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def load_sessions() -> list[dict]:
+    items = []
+    for p in sorted(sess_dir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            pid = int(data.get("pid", 0))
+            if pid <= 0 or not is_alive(pid):
+                p.unlink(missing_ok=True)
+                (active_dir / str(pid)).unlink(missing_ok=True)
+                continue
+            # Refresh live cast size if file exists
+            cast = data.get("cast", "")
+            if cast and os.path.exists(cast):
+                data["cast_size"] = os.path.getsize(cast)
+            items.append(data)
+        except Exception:
+            continue
+    items.sort(key=lambda x: (0 if x.get("state") == "recording" else 1 if x.get("state") == "paused" else 2, x.get("pid", 0)))
+    return items
+
+
+def fmt_elapsed(started_at: float) -> str:
+    if not started_at or started_at <= 0:
+        return "-"
+    sec = max(0, int(time.time() - started_at))
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def fmt_size(n: int) -> str:
+    if not n:
+        return "-"
+    for u in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def resolve_targets(sessions: list[dict], target: str, require_active: bool = False) -> list[dict]:
+    pool = [s for s in sessions if s.get("state") in ("recording", "paused")] if require_active else sessions
+    if not target:
+        if my_pid:
+            mine = [s for s in sessions if s["pid"] == my_pid]
+            if mine:
+                return mine
+        return []
+    if target.lower() == "all":
+        return pool
+    if target.isdigit():
+        tpid = int(target)
+        return [s for s in sessions if s["pid"] == tpid or s.get("child_pid") == tpid]
+    tlow = target.lower()
+    exact = [s for s in pool if (s.get("name") or "").lower() == tlow]
+    if exact:
+        return exact
+    return [
+        s for s in pool
+        if tlow in (s.get("name") or "").lower()
+        or tlow in (s.get("fg_cmd") or "").lower()
+        or tlow in (s.get("last_cmd") or "").lower()
+    ]
+
+
+def send_ctrl(pid: int, command_line: str) -> None:
+    cmd_file = sess_dir / f"{pid}.cmd"
+    with open(cmd_file, "a", encoding="utf-8") as f:
+        f.write(command_line.strip() + "\n")
+    os.kill(pid, signal.SIGUSR1)
+
+
+sessions = load_sessions()
+
+if action == "ps":
+    if not sessions:
+        print(f"{C_DIM}No active rec-cli sessions. Open a Kitty/Tabby tab or run 'rec start'.{C_RESET}")
+        sys.exit(0)
+    print(f"{C_PURPLE}{C_BOLD}{'PID':<8} {'STATE':<10} {'NAME':<16} {'TERM':<8} {'TIME':<8} {'SIZE':<7} {'RUNNING / DIR'}{C_RESET}")
+    for s in sessions:
+        pid = s["pid"]
+        st = s.get("state", "standby")
+        if st == "recording":
+            st_col = f"{C_RED}● REC     {C_RESET}"
+        elif st == "paused":
+            st_col = f"{C_YELLOW}❚❚ PAUSED {C_RESET}"
+        else:
+            st_col = f"{C_DIM}○ STANDBY {C_RESET}"
+        name = s.get("name") or (s.get("last_cmd", "").split()[0] if s.get("last_cmd") else "auto")
+        if pid == my_pid:
+            name = f"{name}*"
+        name = name[:15]
+        term = (s.get("terminal") or "tty")[:7]
+        el = fmt_elapsed(s.get("started_at", 0)) if st != "standby" else "-"
+        sz = fmt_size(s.get("cast_size", 0)) if st != "standby" else "-"
+        cwd = (s.get("cwd") or "").replace(str(Path.home()), "~")
+        info = s.get("fg_cmd") or s.get("last_cmd") or cwd
+        if s.get("fg_cmd") and cwd:
+            info = f"{s['fg_cmd']}  ({cwd})"
+        print(f"{pid:<8} {st_col} {name:<16} {term:<8} {el:<8} {sz:<7} {info[:58]}")
+    print(f"{C_DIM}(* = current terminal; manage any PID from any terminal: rec stop <pid>, rec pause <pid>, rec mark <pid> <label>){C_RESET}")
+    sys.exit(0)
+
+if action == "count":
+    rec_n = sum(1 for s in sessions if s.get("state") == "recording")
+    paused_n = sum(1 for s in sessions if s.get("state") == "paused")
+    standby_n = sum(1 for s in sessions if s.get("state") == "standby")
+    print(f"{rec_n} recording, {paused_n} paused, {standby_n} standby")
+    sys.exit(0)
+
+if action in ("stop", "cancel", "pause", "resume"):
+    target = args[0] if args else ""
+    matches = resolve_targets(sessions, target, require_active=(action != "resume"))
+    if not matches:
+        if not target:
+            print("Not currently recording in this terminal. Run 'rec ps' to manage other terminals.", file=sys.stderr)
+        else:
+            print(f"No matching active recording found for '{target}'. Run 'rec ps' to list PIDs.", file=sys.stderr)
+        sys.exit(1)
+    for s in matches:
+        pid = s["pid"]
+        send_ctrl(pid, action)
+        label = s.get("name") or s.get("fg_cmd") or f"PID {pid}"
+        if action == "stop":
+            print(f"{C_GREEN}■ Stopped PID {pid}{C_RESET} ({label}) - rendering MP4 in background (shell/SSH stays alive).")
+        elif action == "cancel":
+            print(f"{C_YELLOW}✕ Canceled PID {pid}{C_RESET} ({label}) - clip discarded (shell/SSH stays alive).")
+        elif action == "pause":
+            print(f"{C_YELLOW}❚❚ Paused PID {pid}{C_RESET} ({label}).")
+        elif action == "resume":
+            print(f"{C_RED}● Resumed PID {pid}{C_RESET} ({label}).")
+    sys.exit(0)
+
+if action == "start":
+    # Remote start on a specific PID: `rec start <pid> [name]`
+    if not args or not args[0].isdigit():
+        sys.exit(2)  # caller handles local start
+    target_pid = int(args[0])
+    custom_name = args[1] if len(args) > 1 else ""
+    matches = [s for s in sessions if s["pid"] == target_pid]
+    if not matches:
+        print(f"No live rec-cli session with PID {target_pid}. Run 'rec ps' to see live PIDs.", file=sys.stderr)
+        sys.exit(1)
+    send_ctrl(target_pid, f"start {custom_name}".strip())
+    lbl = f" (name: {custom_name})" if custom_name else " (auto-named by process)"
+    print(f"{C_RED}● Started recording on PID {target_pid}{C_RESET}{lbl}.")
+    sys.exit(0)
+
+if action == "mark":
+    if not args:
+        print("Usage: rec mark [pid|name] <chapter label>", file=sys.stderr)
+        sys.exit(1)
+    # Check if first arg matches a live PID or named session when 2+ args provided
+    target_sessions = []
+    label = ""
+    if len(args) >= 2:
+        cand = resolve_targets(sessions, args[0], require_active=True)
+        if cand:
+            target_sessions = cand
+            label = " ".join(args[1:])
+    if not target_sessions:
+        target_sessions = resolve_targets(sessions, "", require_active=True)
+        label = " ".join(args)
+    if not target_sessions:
+        print("No active recording in this tab. Specify a PID from 'rec ps': rec mark <pid> <label>", file=sys.stderr)
+        sys.exit(1)
+    for s in target_sessions:
+        send_ctrl(s["pid"], f"mark {label}")
+        print(f"{C_PURPLE}◆ Chapter marker added to PID {s['pid']}:{C_RESET} {C_BOLD}{label}{C_RESET}")
+    sys.exit(0)
+
+if action == "kill":
+    if not args:
+        print("Usage: rec kill <pid|name|all>", file=sys.stderr)
+        sys.exit(1)
+    matches = resolve_targets(sessions, args[0], require_active=False)
+    if not matches:
+        print(f"No live rec-cli session matching '{args[0]}'.", file=sys.stderr)
+        sys.exit(1)
+    for s in matches:
+        pid = s["pid"]
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"{C_RED}☠ Terminated rec session PID {pid}{C_RESET}")
+        except OSError as exc:
+            print(f"Failed to terminate PID {pid}: {exc}", file=sys.stderr)
+    sys.exit(0)
+PYEOF
 }
 
 resolve_clip() {
@@ -202,41 +435,25 @@ cmd_init() {
   esac
 }
 
-cmd_mark() {
-  local label="${*:-}"
-  if [[ -z "$label" ]]; then
-    echo "Usage: rec mark <chapter label>" >&2
-    exit 1
-  fi
-  if [[ -z "${_TERM_REC_META:-}" ]]; then
-    echo "Not currently recording in this terminal. Run 'rec start' first." >&2
-    exit 1
-  fi
-  local ts
-  ts="$(date +%s.%3N 2>/dev/null || date +%s)"
-  printf 'MARK\t%s\t%s\n' "$ts" "$label" >> "$_TERM_REC_META"
-  echo -e "${C_PURPLE}◆ Chapter marker added:${C_RESET} ${C_BOLD}${label}${C_RESET}"
-}
-
 cmd_status() {
   mkdir -p "$CAST_DIR" "$VIDEO_DIR"
-  local disp_info
+  local disp_info counts
   disp_info="$(detect_display_info)"
+  counts="$(run_session_mgr count 2>/dev/null || echo "0")"
   echo -e "${C_PURPLE}${C_BOLD}=== rec-cli v${VERSION} Status ===${C_RESET}"
 
-  if [[ -n "${ASCIINEMA_REC:-}" || -n "${_TERM_REC_ACTIVE:-}" ]]; then
-    local cast_info=""
-    if [[ -n "${_TERM_REC_CAST:-}" && -f "${_TERM_REC_CAST}" ]]; then
-      local sz
-      sz="$(du -h "${_TERM_REC_CAST}" 2>/dev/null | cut -f1)"
-      cast_info=" (${C_DIM}$(basename "${_TERM_REC_CAST}"), ${sz}${C_RESET})"
+  if [[ -n "${REC_PTY_PID:-}" && -f "${RUNTIME_DIR}/active/${REC_PTY_PID}" ]]; then
+    local st
+    st="$(cat "${RUNTIME_DIR}/active/${REC_PTY_PID}" 2>/dev/null || echo "REC")"
+    if [[ "$st" == "PAUSED" ]]; then
+      echo -e "  This tab:     ${C_YELLOW}${C_BOLD}❚❚ PAUSED${C_RESET} (PID ${REC_PTY_PID})"
+    else
+      echo -e "  This tab:     ${C_RED}${C_BOLD}● RECORDING${C_RESET} (PID ${REC_PTY_PID})"
     fi
-    echo -e "  This tab:     ${C_RED}${C_BOLD}● RECORDING${C_RESET}${cast_info}"
-    if [[ -n "${_TERM_REC_META:-}" && -f "${_TERM_REC_META}" ]]; then
-      local cmds
-      cmds="$(awk -F'\t' '$1 != "NAME" && $1 != "MARK" {print $2}' "${_TERM_REC_META}" 2>/dev/null | tail -n 3 | paste -sd ', ' -)"
-      [[ -n "$cmds" ]] && echo -e "  Recent cmds:  ${C_CYAN}${cmds}${C_RESET}"
-    fi
+  elif [[ -n "${REC_PTY_PID:-}" ]]; then
+    echo -e "  This tab:     ${C_DIM}○ Standby${C_RESET} (PID ${REC_PTY_PID} - run 'rec start' to record)"
+  elif [[ -n "${ASCIINEMA_REC:-}" ]]; then
+    echo -e "  This tab:     ${C_RED}${C_BOLD}● RECORDING${C_RESET} (legacy asciinema)"
   else
     echo -e "  This tab:     ${C_DIM}○ Not recording${C_RESET}  ${C_DIM}(run 'rec start' to record)${C_RESET}"
   fi
@@ -247,9 +464,7 @@ cmd_status() {
     echo -e "  Auto-record:  ${C_GREEN}ON (${REC_TERMINALS})${C_RESET}  ${C_DIM}(run 'rec auto off' for manual)${C_RESET}"
   fi
 
-  local active_cnt
-  active_cnt="$(pgrep -fc 'asciinema rec' 2>/dev/null || true)"
-  echo -e "  Active panes: ${C_CYAN}${active_cnt:-0}${C_RESET}"
+  echo -e "  Live panes:   ${C_CYAN}${counts}${C_RESET}  ${C_DIM}(run 'rec ps' to manage by PID)${C_RESET}"
 
   local mp4_cnt mp4_size
   mp4_cnt="$(find "$VIDEO_DIR" -maxdepth 1 -name '*.mp4' 2>/dev/null | wc -l)"
@@ -307,15 +522,9 @@ cmd_config() {
     echo "  theme      = ${REC_THEME}   (tokyo-night | dracula | catppuccin | gruvbox | nord)"
     echo "  terminals  = ${REC_TERMINALS}"
     echo "  video-dir  = ${VIDEO_DIR}"
-    echo ""
-    echo -e "${C_DIM}Examples:${C_RESET}"
-    echo -e "${C_DIM}  rec config auto                 # auto-pick resolution from your display${C_RESET}"
-    echo -e "${C_DIM}  rec config resolution reels     # 9:16 cursor-following TikTok/Reels mode${C_RESET}"
-    echo -e "${C_DIM}  rec config reels-copy on        # export both landscape + 9:16 Reels clip${C_RESET}"
     return 0
   fi
 
-  # Shorthand: `rec config auto` sets resolution=auto based on running device display
   if [[ "$1" == "auto" && $# -eq 1 ]]; then
     set_config_key REC_RESOLUTION "auto"
     echo -e "${C_GREEN}✓ Resolution set to auto${C_RESET} (detected display: ${C_CYAN}${disp_info}${C_RESET})"
@@ -328,18 +537,17 @@ cmd_config() {
     exit 1
   fi
   case "$key" in
-    resolution|res) set_config_key REC_RESOLUTION "$val" ;;
+    resolution|res)   set_config_key REC_RESOLUTION "$val" ;;
     reels-copy|reels) set_config_key REC_REELS_COPY "$val" ;;
-    speed)          set_config_key REC_SPEED "$val" ;;
-    max-secs)       set_config_key REC_MAX_SECS "$val" ;;
-    frame)          set_config_key REC_FRAME "$val" ;;
-    redact)         set_config_key REC_REDACT "$val" ;;
-    theme)          set_config_key REC_THEME "$val" ;;
-    terminals)      set_config_key REC_TERMINALS "$val" ;;
-    video-dir)      set_config_key REC_VIDEO_DIR "$val" ;;
+    speed)            set_config_key REC_SPEED "$val" ;;
+    max-secs)         set_config_key REC_MAX_SECS "$val" ;;
+    frame)            set_config_key REC_FRAME "$val" ;;
+    redact)           set_config_key REC_REDACT "$val" ;;
+    theme)            set_config_key REC_THEME "$val" ;;
+    terminals)        set_config_key REC_TERMINALS "$val" ;;
+    video-dir)        set_config_key REC_VIDEO_DIR "$val" ;;
     *)
       echo "Unknown config key: $key" >&2
-      echo "Valid keys: auto, resolution, reels-copy, speed, max-secs, frame, redact, theme, terminals, video-dir" >&2
       exit 1
       ;;
   esac
@@ -349,11 +557,9 @@ cmd_config() {
 cmd_reels() {
   if [[ $# -lt 1 ]]; then
     echo "Usage: rec reels <file.cast> [output.mp4]" >&2
-    echo "Tip: or run 'rec config resolution reels' / 'rec config reels-copy on'" >&2
     exit 1
   fi
-  local input="$1"
-  local out="${2:-}"
+  local input="$1" out="${2:-}"
   if [[ -n "$out" ]]; then
     cast2mp4 --res reels "$input" "$out"
   else
@@ -368,12 +574,14 @@ cmd_play() {
   echo -e "${C_CYAN}Playing:${C_RESET} $(basename "$clip")"
   if command -v mpv >/dev/null 2>&1; then
     setsid -f mpv "$clip" </dev/null >/dev/null 2>&1
+  elif command -v parole >/dev/null 2>&1; then
+    setsid -f parole "$clip" </dev/null >/dev/null 2>&1
   elif command -v vlc >/dev/null 2>&1; then
     setsid -f vlc "$clip" </dev/null >/dev/null 2>&1
   elif command -v xdg-open >/dev/null 2>&1; then
     setsid -f xdg-open "$clip" </dev/null >/dev/null 2>&1
   else
-    echo "No player found (mpv/vlc/xdg-open). File: $clip"
+    echo "No player found. File: $clip"
   fi
 }
 
@@ -405,13 +613,11 @@ cmd_thumb() {
 cmd_trim() {
   if [[ $# -lt 3 ]]; then
     echo "Usage: rec trim <clip|latest> <start> <end>" >&2
-    echo "Example: rec trim latest 00:05 01:30" >&2
     exit 1
   fi
   local clip start end out
   clip="$(resolve_clip "$1")" || exit 1
-  start="$2"
-  end="$3"
+  start="$2"; end="$3"
   out="${clip%.mp4}_trimmed.mp4"
   ffmpeg -y -loglevel error -ss "$start" -to "$end" -i "$clip" -c copy -movflags +faststart "$out"
   echo -e "${C_GREEN}✓ Saved trimmed clip:${C_RESET} ${out} ($(du -h "$out" | cut -f1))"
@@ -472,12 +678,12 @@ cmd_doctor() {
   disp_info="$(detect_display_info)"
   echo -e "${C_PURPLE}${C_BOLD}=== rec-cli v${VERSION} Dependency Check ===${C_RESET}"
   local missing=0
-  for dep in asciinema agg ffmpeg ffprobe python3 flock setsid; do
+  for dep in rec-pty agg ffmpeg python3 flock setsid; do
     if command -v "$dep" >/dev/null 2>&1; then
       echo -e "  ${C_GREEN}✓${C_RESET} ${dep}  ${C_DIM}($(command -v "$dep"))${C_RESET}"
     else
       echo -e "  ${C_RED}✗${C_RESET} ${dep}  ${C_YELLOW}(MISSING)${C_RESET}"
-      [[ "$dep" != "ffprobe" ]] && missing=1
+      missing=1
     fi
   done
   if python3 -c "import PIL" 2>/dev/null; then
@@ -493,10 +699,10 @@ cmd_doctor() {
   if (( missing == 1 )); then
     echo ""
     echo -e "${C_YELLOW}Install missing deps:${C_RESET}"
-    echo "  Debian/Ubuntu/Kali: sudo apt install asciinema ffmpeg python3 python3-pil util-linux"
-    echo "  Arch/Manjaro:       sudo pacman -S asciinema ffmpeg python python-pillow util-linux"
-    echo "  Fedora/RHEL:        sudo dnf install asciinema ffmpeg python3 python3-pillow util-linux"
-    echo "  openSUSE:           sudo zypper install asciinema ffmpeg python3 python3-Pillow util-linux"
+    echo "  Debian/Ubuntu/Kali: sudo apt install ffmpeg python3 python3-pil util-linux"
+    echo "  Arch/Manjaro:       sudo pacman -S ffmpeg python python-pillow util-linux"
+    echo "  Fedora/RHEL:        sudo dnf install ffmpeg python3 python3-pillow util-linux"
+    echo "  openSUSE:           sudo zypper install ffmpeg python3 python3-Pillow util-linux"
     echo "  agg (any distro):   https://github.com/asciinema/agg/releases"
     return 1
   fi
@@ -539,8 +745,26 @@ cmd_open() {
 }
 
 case "${1:-help}" in
+  ps|jobs|active) run_session_mgr ps ;;
+  stop|off)       shift; run_session_mgr stop "$@" ;;
+  cancel|discard) shift; run_session_mgr cancel "$@" ;;
+  pause)          shift; run_session_mgr pause "$@" ;;
+  resume|unpause) shift; run_session_mgr resume "$@" ;;
+  mark|chapter)   shift; run_session_mgr mark "$@" ;;
+  kill)           shift; run_session_mgr kill "$@" ;;
+  start|on)
+    shift
+    # If first arg is a live PID, remotely start recording on that standby session!
+    if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+      run_session_mgr start "$@"
+    elif [[ -n "${REC_PTY_PID:-}" ]]; then
+      run_session_mgr start "$REC_PTY_PID" "${1:-}"
+    else
+      # Not yet inside rec-pty: spawn a fresh rec-pty session wrapping the current shell!
+      exec rec-pty ${1:+--name "$1"} -- "${SHELL:-/bin/sh}"
+    fi
+    ;;
   init) shift; cmd_init "${1:-}" ;;
-  mark|chapter) shift; cmd_mark "$@" ;;
   status|st) cmd_status ;;
   auto) shift; cmd_auto "${1:-}" ;;
   config|cfg) shift; cmd_config "$@" ;;
@@ -557,14 +781,6 @@ case "${1:-help}" in
   clear|clean) shift; cmd_clear "${1:-}" ;;
   version|-v|--version) echo "rec-cli ${VERSION}" ;;
   help|-h|--help) show_help ;;
-  start|on|stop|off|cancel|discard)
-    echo "Shell integration required for 'rec $1'." >&2
-    echo "Add one of these to your shell config and reload:" >&2
-    echo '  Zsh:  eval "$(rec-cli init zsh)"' >&2
-    echo '  Bash: eval "$(rec-cli init bash)"' >&2
-    echo '  Fish: rec-cli init fish | source' >&2
-    exit 1
-    ;;
   *)
     echo "Unknown subcommand: $1" >&2
     show_help

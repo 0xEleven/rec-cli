@@ -16,8 +16,9 @@
 
 ## What it does
 
+- Manage parallel recordings like processes (`rec ps`): start, stop, pause, resume, cancel, or drop chapter markers on ANY recording by PID or name from ANY other terminal, even while SSHed into a remote machine, without dropping your SSH session.
 - Records terminal sessions into MP4 videos at `auto` (detects your screen resolution automatically), `720p`, `1080p`, `1440p`, `4k`, `reels` (9:16 cursor-following auto-reframe), or `reels-4k`.
-- Auto-reframe for TikTok, Instagram Reels, and YouTube Shorts tracks your cursor with a smooth damped camera while typing and smoothly zooms out on wide output (like `nmap` tables) so nothing gets cropped.
+- Auto-reframe for TikTok, Instagram Reels, and YouTube Shorts tracks your cursor with smooth critically-damped springs and automatically fits full multi-line commands and wide output (like `nmap` tables) so nothing gets cropped.
 - Renders at 2x speed by default so typing looks snappy, and splits long sessions into 5-minute clips.
 - Names clips after the tool you actually ran (`nmap_20261125-134012.mp4`, `ffuf_..._part2.mp4`), ignoring `sudo`, `cd`, `ls`, and `clear`.
 - Only keeps sessions with both keyboard input and terminal output. Skips passive background panes like `openvpn`, `tail -f`, `watch`, and `htop`.
@@ -43,7 +44,7 @@ cd rec-cli
 Download the `.deb` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo apt install ./rec-cli_1.2.0_all.deb
+sudo apt install ./rec-cli_1.3.0_all.deb
 ```
 
 ### Fedora / RHEL / Rocky / Alma / openSUSE
@@ -51,9 +52,9 @@ sudo apt install ./rec-cli_1.2.0_all.deb
 Download the `.rpm` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo dnf install ./rec-cli-1.2.0-1.noarch.rpm
+sudo dnf install ./rec-cli-1.3.0-1.noarch.rpm
 # openSUSE
-sudo zypper install ./rec-cli-1.2.0-1.noarch.rpm
+sudo zypper install ./rec-cli-1.3.0-1.noarch.rpm
 ```
 
 ### Arch / Manjaro / EndeavourOS
@@ -76,11 +77,15 @@ Optional Starship `● REC` prompt badge: paste [starship/rec-module.toml](stars
 
 | Command | Action |
 | --- | --- |
-| `rec start [name]` | Start recording the current terminal (auto-named by process if no name is given) |
-| `rec stop` | Stop recording, keep the tab open in your current directory, and render the MP4 |
-| `rec cancel` | Stop recording and throw away the take |
-| `rec mark <label>` | Add a chapter marker (writes a `.chapters.txt` file next to the MP4) |
-| `rec status` | Show current tab status, auto-record mode, and saved clip count |
+| `rec ps` | List all live recording sessions with PID, state (`REC`/`PAUSED`/`STANDBY`), name, elapsed time, size, and running command |
+| `rec start [name]` | Start recording this terminal, or run `rec start <pid> [name]` to start a fresh clip on another live session |
+| `rec stop [pid\|name\|all]` | Stop and render MP4 without closing the tab or dropping SSH |
+| `rec pause [pid\|name\|all]` | Pause a recording live (keeps shell/SSH running) |
+| `rec resume [pid\|name\|all]` | Resume a paused recording |
+| `rec cancel [pid\|name\|all]` | Stop and discard the take without saving |
+| `rec mark [pid\|name] <label>` | Add a chapter marker to this or another PID (writes `.chapters.txt` next to the MP4) |
+| `rec kill <pid\|name\|all>` | Force-terminate a recording session process |
+| `rec status` | Show current tab status, active PIDs, and saved clip count |
 | `rec auto on\|off` | Switch between auto-recording new tabs and manual `rec start` |
 | `rec list` | List saved MP4 clips |
 | `rec play [clip\|latest]` | Open a clip in `mpv`, `vlc`, or your default player |

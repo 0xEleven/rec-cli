@@ -1,9 +1,9 @@
-# Optional Starship prompt badge — add `${custom.rec}` to your format string
-# in ~/.config/starship.toml and paste this module below:
+# Optional Starship live prompt badge (updates instantly even when controlled remotely!)
+# Add `${custom.rec}` to your format string in ~/.config/starship.toml:
 
 [custom.rec]
-when = 'test -n "$ASCIINEMA_REC"'
-command = 'echo "REC"'
+when = '(test -n "$_TERM_REC_MARKER" && test -f "$_TERM_REC_MARKER") || test -n "$ASCIINEMA_REC"'
+command = 'test -f "$_TERM_REC_MARKER" && cat "$_TERM_REC_MARKER" || echo "REC"'
 symbol = "●"
 style = "bg:#f7768e fg:#1a1b26 bold"
 format = '[](#f7768e)[ $symbol $output ]($style)[](#f7768e) '

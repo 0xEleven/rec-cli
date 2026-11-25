@@ -6,7 +6,7 @@ set -euo pipefail
 PREFIX="${PREFIX:-$HOME/.local}"
 [[ "${1:-}" == "--system" ]] && PREFIX="/usr/local"
 
-rm -f "$PREFIX/bin/rec-cli" "$PREFIX/bin/cast2mp4" "$PREFIX/bin/casts2mp4"
+rm -f "$PREFIX/bin/rec-cli" "$PREFIX/bin/rec-pty" "$PREFIX/bin/cast2mp4" "$PREFIX/bin/casts2mp4"
 rm -rf "$PREFIX/share/rec-cli"
 
 remove_hook() {

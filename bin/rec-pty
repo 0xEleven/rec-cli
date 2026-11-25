@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""rec-pty — Live process-managed PTY terminal recorder for rec-cli v1.3.0.
+
+Writes standard asciicast v2 (.cast) files with real stdin ("i") + stdout ("o")
+events, and supports live remote control from ANY other terminal via SIGUSR1:
+  - stop:   flush .cast, render MP4 in background, stay alive in standby passthrough (SSH never drops!)
+  - cancel: discard .cast, stay alive in standby passthrough
+  - pause:  pause recording (timestamps freeze cleanly)
+  - resume: resume recording
+  - start [name]: start a new clip on the same live shell/SSH session
+  - mark <label>: drop a chapter marker into the active clip
+"""
+
+from __future__ import annotations
+
+import codecs
+import errno
+import fcntl
+import json
+import os
+import pty
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+
+def get_runtime_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    d = Path(base) / f"rec-cli-{os.getuid()}"
+    (d / "sessions").mkdir(parents=True, exist_ok=True)
+    (d / "active").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_winsize(fd: int) -> tuple[int, int, int, int]:
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        rows, cols, xpix, ypix = struct.unpack("HHHH", packed)
+        if rows > 0 and cols > 0:
+            return rows, cols, xpix, ypix
+    except OSError:
+        pass
+    sz = shutil.get_terminal_size((100, 30))
+    return sz.lines, sz.columns, 0, 0
+
+
+def set_winsize(fd: int, rows: int, cols: int, xpix: int = 0, ypix: int = 0) -> None:
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, xpix, ypix))
+    except OSError:
+        pass
+
+
+def detect_terminal_name() -> str:
+    env = os.environ
+    if env.get("KITTY_WINDOW_ID") or env.get("KITTY_PID") or env.get("TERM") == "xterm-kitty":
+        return "kitty"
+    if env.get("TERM_PROGRAM") == "Tabby":
+        return "tabby"
+    if env.get("ALACRITTY_WINDOW_ID") or env.get("ALACRITTY_SOCKET") or env.get("TERM") == "alacritty":
+        return "alacritty"
+    if env.get("TERM_PROGRAM") == "WezTerm" or env.get("WEZTERM_PANE"):
+        return "wezterm"
+    if env.get("TERM_PROGRAM") == "ghostty" or env.get("GHOSTTY_RESOURCES_DIR"):
+        return "ghostty"
+    if env.get("TERM") in ("foot", "foot-extra"):
+        return "foot"
+    if env.get("KONSOLE_VERSION"):
+        return "konsole"
+    if env.get("GNOME_TERMINAL_SCREEN") or env.get("VTE_VERSION"):
+        return "gnome-terminal"
+    return env.get("TERM_PROGRAM") or env.get("TERM") or "tty"
+
+
+def get_child_cwd(child_pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{child_pid}/cwd")
+    except OSError:
+        return os.getcwd()
+
+
+def get_foreground_cmd(child_pid: int) -> str:
+    """Inspect /proc to find the most relevant foreground process inside this PTY."""
+    try:
+        # Walk direct/descendant children via /proc/*/stat
+        children_map: dict[int, list[int]] = {}
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/stat", "r", encoding="utf-8", errors="replace") as f:
+                    stat = f.read()
+                rparen = stat.rfind(")")
+                if rparen == -1:
+                    continue
+                fields = stat[rparen + 2:].split()
+                ppid = int(fields[1])
+                children_map.setdefault(ppid, []).append(int(entry.name))
+            except OSError:
+                continue
+
+        # Walk down to deepest active child process (e.g., zsh -> ssh user@host)
+        cur = child_pid
+        visited = {cur}
+        while True:
+            kids = [k for k in children_map.get(cur, []) if k not in visited]
+            if not kids:
+                break
+            cur = max(kids)
+            visited.add(cur)
+
+        if cur != child_pid:
+            with open(f"/proc/{cur}/cmdline", "rb") as f:
+                raw = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+            if raw:
+                return raw[:90]
+    except Exception:
+        pass
+    return ""
+
+
+class RecSession:
+    def __init__(
+        self,
+        shell_cmd: list[str],
+        initial_state: str = "recording",
+        name: str = "",
+        idle_limit: float = 2.0,
+        cast_dir: str = "",
+    ):
+        self.pid = os.getpid()
+        self.child_pid = 0
+        self.master_fd = -1
+        self.shell_cmd = shell_cmd
+        self.idle_limit = idle_limit
+        self.terminal = detect_terminal_name()
+
+        rec_dir = os.environ.get("REC_DIR") or os.environ.get("TERM_REC_DIR") or str(Path.home() / "Videos/terminal-recordings")
+        self.cast_dir = Path(cast_dir or (Path(rec_dir) / "casts"))
+        self.cast_dir.mkdir(parents=True, exist_ok=True)
+
+        self.runtime_dir = get_runtime_dir()
+        self.session_file = self.runtime_dir / "sessions" / f"{self.pid}.json"
+        self.cmd_file = self.runtime_dir / "sessions" / f"{self.pid}.cmd"
+        self.active_marker = self.runtime_dir / "active" / str(self.pid)
+
+        # Stable per-PTY meta pointer so the child shell's preexec hook always writes to the live clip
+        self.live_meta_link = self.runtime_dir / "sessions" / f"{self.pid}.meta"
+
+        self.state = "standby"  # "recording" | "paused" | "standby"
+        self.name = name
+        self.cast_path: Path | None = None
+        self.meta_path: Path | None = None
+        self.cast_fp = None
+        self.rec_started_at = 0.0
+        self.last_event_mono = 0.0
+        self.elapsed_recorded = 0.0
+        self.paused_at = 0.0
+
+        self.rows, self.cols, self.xpix, self.ypix = get_winsize(sys.stdin.fileno())
+        self.initial_state = initial_state
+        self.initial_name = name
+
+        # Self-pipe to wake select() cleanly from SIGUSR1 / SIGWINCH / SIGCHLD
+        self.wake_r, self.wake_w = os.pipe()
+        os.set_blocking(self.wake_r, False)
+        os.set_blocking(self.wake_w, False)
+        self.pending_ctrl = False
+        self.pending_winch = False
+        self.pending_terminate = False
+
+    def _wake(self) -> None:
+        try:
+            os.write(self.wake_w, b"x")
+        except OSError:
+            pass
+
+    def _update_active_marker(self) -> None:
+        try:
+            if self.state == "recording":
+                self.active_marker.write_text("REC\n", encoding="utf-8")
+            elif self.state == "paused":
+                self.active_marker.write_text("PAUSED\n", encoding="utf-8")
+            else:
+                self.active_marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _write_state_json(self) -> None:
+        try:
+            cast_size = 0
+            if self.cast_path and self.cast_path.exists():
+                cast_size = self.cast_path.stat().st_size
+            last_cmd = ""
+            if self.meta_path and self.meta_path.exists():
+                try:
+                    for line in self.meta_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                        parts = line.split("\t")
+                        if len(parts) >= 2 and parts[0] not in ("NAME", "MARK"):
+                            last_cmd = parts[1][:80]
+                except OSError:
+                    pass
+            fg = get_foreground_cmd(self.child_pid) if self.child_pid > 0 else ""
+            data = {
+                "pid": self.pid,
+                "child_pid": self.child_pid,
+                "state": self.state,
+                "name": self.name,
+                "terminal": self.terminal,
+                "cast": str(self.cast_path) if self.cast_path else "",
+                "meta": str(self.meta_path) if self.meta_path else "",
+                "cwd": get_child_cwd(self.child_pid) if self.child_pid > 0 else os.getcwd(),
+                "fg_cmd": fg,
+                "last_cmd": last_cmd,
+                "started_at": self.rec_started_at,
+                "cast_size": cast_size,
+            }
+            tmp = self.session_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, self.session_file)
+        except OSError:
+            pass
+
+    def _repoint_meta_link(self, target: Path | None) -> None:
+        try:
+            if self.live_meta_link.is_symlink() or self.live_meta_link.exists():
+                self.live_meta_link.unlink()
+            if target is not None:
+                target.touch(exist_ok=True)
+                os.symlink(target, self.live_meta_link)
+        except OSError:
+            pass
+
+    def start_recording(self, custom_name: str = "") -> None:
+        if self.state == "recording":
+            return
+        if self.state == "paused":
+            self.resume_recording()
+            return
+
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{self.pid}"
+        self.cast_path = self.cast_dir / f"session-{stamp}.cast"
+        self.meta_path = self.cast_dir / f"session-{stamp}.meta"
+        self.name = custom_name.strip()
+
+        self.meta_path.write_text(f"NAME\t{self.name}\n" if self.name else "", encoding="utf-8")
+        self._repoint_meta_link(self.meta_path)
+
+        now_epoch = int(time.time())
+        header = {
+            "version": 2,
+            "width": self.cols,
+            "height": self.rows,
+            "timestamp": now_epoch,
+            "idle_time_limit": self.idle_limit,
+            "env": {
+                "SHELL": os.environ.get("SHELL", "/bin/sh"),
+                "TERM": os.environ.get("TERM", "xterm-256color"),
+            },
+        }
+        self.cast_fp = open(self.cast_path, "w", encoding="utf-8", buffering=1)
+        self.cast_fp.write(json.dumps(header) + "\n")
+
+        self.rec_started_at = time.time()
+        self.last_event_mono = time.monotonic()
+        self.elapsed_recorded = 0.0
+        self.state = "recording"
+        self._update_active_marker()
+        self._write_state_json()
+
+    def pause_recording(self) -> None:
+        if self.state != "recording":
+            return
+        self.paused_at = time.monotonic()
+        self.state = "paused"
+        self._update_active_marker()
+        self._write_state_json()
+
+    def resume_recording(self) -> None:
+        if self.state != "paused":
+            return
+        self.last_event_mono = time.monotonic()
+        self.state = "recording"
+        self._update_active_marker()
+        self._write_state_json()
+
+    def add_mark(self, label: str) -> None:
+        if self.state not in ("recording", "paused") or not self.meta_path:
+            return
+        label = label.strip()
+        if not label:
+            return
+        try:
+            with open(self.meta_path, "a", encoding="utf-8") as mf:
+                mf.write(f"MARK\t{time.time():.3f}\t{label}\n")
+        except OSError:
+            pass
+
+    def stop_recording(self, discard: bool = False) -> None:
+        if self.state == "standby":
+            return
+
+        cast_p = self.cast_path
+        meta_p = self.meta_path
+
+        if self.cast_fp:
+            try:
+                self.cast_fp.flush()
+                self.cast_fp.close()
+            except OSError:
+                pass
+            self.cast_fp = None
+
+        self.state = "standby"
+        self.name = ""
+        self.cast_path = None
+        self.meta_path = None
+        self.rec_started_at = 0.0
+        self._repoint_meta_link(None)
+        self._update_active_marker()
+        self._write_state_json()
+
+        if discard:
+            for p in (cast_p, meta_p):
+                if p:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            return
+
+        if cast_p and cast_p.exists() and cast_p.stat().st_size > 0:
+            cast2mp4 = shutil.which("cast2mp4")
+            if cast2mp4:
+                try:
+                    subprocess.Popen(
+                        [cast2mp4, "--auto", "--cleanup", str(cast_p)],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                except OSError:
+                    pass
+        else:
+            for p in (cast_p, meta_p):
+                if p:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+    def record_event(self, etype: str, text: str) -> None:
+        if self.state != "recording" or not self.cast_fp or not text:
+            return
+        now = time.monotonic()
+        dt = max(0.0, now - self.last_event_mono)
+        self.last_event_mono = now
+        if self.idle_limit > 0 and dt > self.idle_limit:
+            dt = self.idle_limit
+        self.elapsed_recorded += dt
+        try:
+            self.cast_fp.write(json.dumps([round(self.elapsed_recorded, 6), etype, text]) + "\n")
+        except OSError:
+            pass
+
+    def process_control_file(self) -> None:
+        if not self.cmd_file.exists():
+            return
+        try:
+            lines = self.cmd_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            self.cmd_file.unlink(missing_ok=True)
+        except OSError:
+            return
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            verb = parts[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if verb == "stop":
+                self.stop_recording(discard=False)
+            elif verb == "cancel":
+                self.stop_recording(discard=True)
+            elif verb == "pause":
+                self.pause_recording()
+            elif verb == "resume":
+                self.resume_recording()
+            elif verb == "start":
+                if self.state != "standby":
+                    self.stop_recording(discard=False)
+                self.start_recording(custom_name=arg)
+            elif verb == "mark":
+                self.add_mark(arg)
+
+    def cleanup(self) -> None:
+        self.stop_recording(discard=False)
+        for p in (self.session_file, self.cmd_file, self.active_marker, self.live_meta_link):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for fd in (self.wake_r, self.wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def run(self) -> int:
+        # Install signal handlers before fork
+        def on_usr1(_sig, _frame):
+            self.pending_ctrl = True
+            self._wake()
+
+        def on_winch(_sig, _frame):
+            self.pending_winch = True
+            self._wake()
+
+        def on_term(_sig, _frame):
+            self.pending_terminate = True
+            self._wake()
+
+        signal.signal(signal.SIGUSR1, on_usr1)
+        signal.signal(signal.SIGWINCH, on_winch)
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGHUP, on_term)
+
+        # Prepare initial recording state before fork so env vars exist inside child
+        if self.initial_state == "recording":
+            self.start_recording(custom_name=self.initial_name)
+        else:
+            self._update_active_marker()
+            self._write_state_json()
+
+        child_pid, master_fd = pty.fork()
+        if child_pid == 0:
+            # Child process: expose stable rec-pty PID and live meta symlink
+            os.environ["REC_PTY_PID"] = str(self.pid)
+            os.environ["_TERM_REC_ACTIVE"] = "1"
+            os.environ["_TERM_REC_META"] = str(self.live_meta_link)
+            os.environ["_TERM_REC_MARKER"] = str(self.active_marker)
+            os.execvp(self.shell_cmd[0], self.shell_cmd)
+            os._exit(127)
+
+        self.child_pid = child_pid
+        self.master_fd = master_fd
+        set_winsize(master_fd, self.rows, self.cols, self.xpix, self.ypix)
+        self._write_state_json()
+
+        stdin_fd = sys.stdin.fileno()
+        stdout_fd = sys.stdout.fileno()
+        stdin_is_tty = os.isatty(stdin_fd)
+        old_termios = None
+
+        if stdin_is_tty:
+            old_termios = termios.tcgetattr(stdin_fd)
+            tty.setraw(stdin_fd)
+
+        in_dec = codecs.getincrementaldecoder("utf-8")("replace")
+        out_dec = codecs.getincrementaldecoder("utf-8")("replace")
+        last_heartbeat = time.monotonic()
+
+        try:
+            while True:
+                if self.pending_terminate:
+                    break
+                if self.pending_winch:
+                    self.pending_winch = False
+                    self.rows, self.cols, self.xpix, self.ypix = get_winsize(stdin_fd)
+                    set_winsize(master_fd, self.rows, self.cols, self.xpix, self.ypix)
+                if self.pending_ctrl:
+                    self.pending_ctrl = False
+                    self.process_control_file()
+
+                # Periodically refresh live state JSON (size / foreground cmd / cwd)
+                now = time.monotonic()
+                if now - last_heartbeat >= 2.0:
+                    last_heartbeat = now
+                    self._write_state_json()
+
+                rfds = [master_fd, self.wake_r]
+                if stdin_is_tty:
+                    rfds.append(stdin_fd)
+
+                try:
+                    ready, _, _ = select.select(rfds, [], [], 0.5)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    break
+
+                if self.wake_r in ready:
+                    try:
+                        os.read(self.wake_r, 256)
+                    except OSError:
+                        pass
+
+                if stdin_is_tty and stdin_fd in ready:
+                    try:
+                        data = os.read(stdin_fd, 4096)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        stdin_is_tty = False
+                    else:
+                        try:
+                            os.write(master_fd, data)
+                        except OSError:
+                            break
+                        if self.state == "recording":
+                            self.record_event("i", in_dec.decode(data))
+
+                if master_fd in ready:
+                    try:
+                        data = os.read(master_fd, 8192)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    # Write all bytes faithfully to real terminal
+                    view = memoryview(data)
+                    written = 0
+                    while written < len(data):
+                        try:
+                            n = os.write(stdout_fd, view[written:])
+                            written += n
+                        except InterruptedError:
+                            continue
+                        except OSError:
+                            break
+                    if self.state == "recording":
+                        self.record_event("o", out_dec.decode(data))
+        finally:
+            if old_termios is not None:
+                try:
+                    termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_termios)
+                except OSError:
+                    pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            self.cleanup()
+
+        # Reap child exit code cleanly
+        exit_code = 0
+        try:
+            _, status = os.waitpid(child_pid, 0)
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                exit_code = 128 + os.WTERMSIG(status)
+        except ChildProcessError:
+            pass
+        return exit_code
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Live process-managed PTY recorder for rec-cli")
+    parser.add_argument("--name", default="", help="Optional initial clip name")
+    parser.add_argument("--standby", action="store_true", help="Start in standby passthrough mode (not recording yet)")
+    parser.add_argument("--idle-limit", type=float, default=2.0, help="Idle time limit in seconds")
+    parser.add_argument("cmd", nargs=argparse.REMAINDER, help="Shell/command to run (default: $SHELL)")
+    args = parser.parse_args()
+
+    cmd = args.cmd
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        cmd = [os.environ.get("SHELL", "/bin/sh")]
+
+    session = RecSession(
+        shell_cmd=cmd,
+        initial_state="standby" if args.standby else "recording",
+        name=args.name,
+        idle_limit=args.idle_limit,
+    )
+    return session.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
