@@ -839,9 +839,8 @@ def sample_cursor(abs_t: float):
     wide_burst = (abs_t - recent_wide_t) <= 2.0 and not typing_active
     return cur_nx, cur_ny, typing_active, wide_burst, (cur_bx0, cur_by0, cur_bx1, cur_by1)
 
-# Universal playback profile (main@4.1 for <=1080p, high@5.1 for 4K) + finite silent AAC track
+# Universal playback profile (main for <=1080p, high for 4K) + finite silent AAC track
 v_profile = "high" if (W > 1920 or H > 1920) else "main"
-v_level = "5.1" if (W > 1920 or H > 1920) else "4.1"
 exact_dur = f"{n_out_frames / float(fps):.3f}"
 
 cmd = [
@@ -853,11 +852,9 @@ cmd = [
     "-map", "0:v:0", "-map", "1:a:0",
     "-r", str(fps),
     "-movflags", "+faststart",
-    "-brand", "mp42",
     "-pix_fmt", "yuv420p",
-    "-c:v", "libx264", "-profile:v", v_profile, "-level:v", v_level,
-    "-g", str(fps * 2), "-keyint_min", str(fps), "-sc_threshold", "0",
-    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
+    "-c:v", "libx264", "-profile:v", v_profile,
+    "-g", str(fps * 2),
     "-crf", str(crf), "-preset", "medium",
     "-c:a", "aac", "-b:a", "32k",
     "-shortest",
@@ -1113,10 +1110,10 @@ PYEOF
       GIF_DUR="$(python3 -c "print(f'{max(0.5, float(\"${END}\") - float(\"${START}\")):.3f}')")"
     fi
 
-    # Universal playback profile: main@4.1 for <=1080p, high@5.1 for 1440p/4K + strict 30fps CFR + finite silent AAC
-    V_PROFILE="main"; V_LEVEL="4.1"
+    # Universal playback profile: main for <=1080p, high for 1440p/4K + strict 30fps CFR + finite silent AAC
+    V_PROFILE="main"
     if (( OUT_W > 1920 || OUT_H > 1920 )); then
-      V_PROFILE="high"; V_LEVEL="5.1"
+      V_PROFILE="high"
     fi
 
     if [[ "$USE_FRAME" -eq 1 ]]; then
@@ -1135,11 +1132,9 @@ PYEOF
         -r 30 \
         -t "$GIF_DUR" \
         -movflags +faststart \
-        -brand mp42 \
         -pix_fmt yuv420p \
-        -c:v libx264 -profile:v "$V_PROFILE" -level:v "$V_LEVEL" \
-        -g 60 -keyint_min 30 -sc_threshold 0 \
-        -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+        -c:v libx264 -profile:v "$V_PROFILE" \
+        -g 60 \
         -crf "$CRF" -preset medium \
         -c:a aac -b:a 32k \
         "$TMP_MP4"
@@ -1158,11 +1153,9 @@ PYEOF
         -r 30 \
         -t "$GIF_DUR" \
         -movflags +faststart \
-        -brand mp42 \
         -pix_fmt yuv420p \
-        -c:v libx264 -profile:v "$V_PROFILE" -level:v "$V_LEVEL" \
-        -g 60 -keyint_min 30 -sc_threshold 0 \
-        -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+        -c:v libx264 -profile:v "$V_PROFILE" \
+        -g 60 \
         -crf "$CRF" -preset medium \
         -c:a aac -b:a 32k \
         -vf "fps=30,scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${BG_HEX}" \
