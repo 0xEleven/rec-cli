@@ -335,7 +335,41 @@ class CursorTracker:
         self.rows = max(10, rows)
         self.x = 0
         self.y = 0
-        self.recent_max_x = 0
+        self.in_cmd = False
+        self.cmd_x0 = 0
+        self.cmd_y0 = 0
+        self.cmd_x1 = 0
+        self.cmd_y1 = 0
+
+    def on_input(self, data: str):
+        """Update active multi-line command bounding box from real keyboard input."""
+        if not self.in_cmd:
+            self.in_cmd = True
+            self.cmd_x0 = 0
+            self.cmd_y0 = self.y
+            self.cmd_x1 = self.x
+            self.cmd_y1 = self.y
+        # Enter without backslash continuation finishes the typed command shortly after
+        if "\r" in data or "\n" in data:
+            self.cmd_y1 = max(self.cmd_y1, self.y)
+            self.cmd_x1 = max(self.cmd_x1, self.x)
+
+    def reset_cmd_box(self):
+        self.in_cmd = False
+        self.cmd_x0 = 0
+        self.cmd_y0 = self.y
+        self.cmd_x1 = self.x
+        self.cmd_y1 = self.y
+
+    def _newline(self):
+        if self.y + 1 >= self.rows:
+            # Terminal scrolled up by 1 line -> shift tracked command top up too
+            if self.in_cmd:
+                self.cmd_y0 = max(0, self.cmd_y0 - 1)
+                self.cmd_y1 = max(0, self.cmd_y1 - 1)
+            self.y = self.rows - 1
+        else:
+            self.y += 1
 
     def feed(self, text: str) -> int:
         """Advance virtual cursor and return max column touched in this chunk."""
@@ -343,6 +377,7 @@ class CursorTracker:
         max_col = self.x
         pos = 0
         n = len(text)
+        newlines = 0
         while pos < n:
             ch = text[pos]
             if ch == "\x1b":
@@ -368,6 +403,7 @@ class CursorTracker:
                     elif cmd == "J" and (nums and nums[0] in (2, 3)):
                         self.x = 0
                         self.y = 0
+                        self.reset_cmd_box()
                     pos = m.end()
                     continue
                 pos += 2
@@ -375,7 +411,8 @@ class CursorTracker:
             elif ch == "\r":
                 self.x = 0
             elif ch == "\n":
-                self.y = min(self.rows - 1, self.y + 1)
+                self._newline()
+                newlines += 1
             elif ch == "\b":
                 self.x = max(0, self.x - 1)
             elif ch == "\t":
@@ -383,17 +420,39 @@ class CursorTracker:
             elif ord(ch) >= 32:
                 self.x += 1
                 if self.x >= self.cols:
+                    # Line wrapped while typing or printing
+                    if self.in_cmd:
+                        self.cmd_x1 = self.cols - 1
                     self.x = 0
-                    self.y = min(self.rows - 1, self.y + 1)
+                    self._newline()
                 if self.x > max_col:
                     max_col = self.x
+                if self.in_cmd:
+                    self.cmd_x1 = max(self.cmd_x1, self.x)
+                    self.cmd_y0 = min(self.cmd_y0, self.y)
+                    self.cmd_y1 = max(self.cmd_y1, self.y)
             pos += 1
+        # Large multi-line command output burst resets the previous typed command box
+        if newlines >= 3 and len(text) > 120:
+            self.reset_cmd_box()
         return max_col
+
+    def cmd_box_norm(self) -> tuple[float, float, float, float]:
+        if not self.in_cmd:
+            nx = self.x / max(1, self.cols - 1)
+            ny = self.y / max(1, self.rows - 1)
+            return (0.0, ny, nx, ny)
+        return (
+            round(self.cmd_x0 / max(1, self.cols - 1), 4),
+            round(self.cmd_y0 / max(1, self.rows - 1), 4),
+            round(max(self.cmd_x1, self.x) / max(1, self.cols - 1), 4),
+            round(max(self.cmd_y1, self.y) / max(1, self.rows - 1), 4),
+        )
 
 
 header = {}
 events = []
-cursor_track = []  # [adj_t, nx, ny, span_frac, is_input]
+cursor_track = []  # [adj_t, nx, ny, span_frac, is_input, bx0, by0, bx1, by1]
 raw_prev = 0.0
 adj_t = 0.0
 has_stdin_events = False
@@ -436,23 +495,28 @@ try:
             adj_t += dt / speed
             if etype == "i":
                 has_stdin_events = True
+                tracker.on_input(data)
+                bx0, by0, bx1, by1 = tracker.cmd_box_norm()
                 cursor_track.append([
                     round(adj_t, 3),
                     round(tracker.x / max(1, cols - 1), 4),
                     round(tracker.y / max(1, rows - 1), 4),
                     0.0,
                     1,
+                    bx0, by0, bx1, by1,
                 ])
             elif etype == "o":
                 if len(output_sample) < 60:
                     output_sample.append(data)
                 max_col = tracker.feed(data)
+                bx0, by0, bx1, by1 = tracker.cmd_box_norm()
                 cursor_track.append([
                     round(adj_t, 3),
                     round(tracker.x / max(1, cols - 1), 4),
                     round(tracker.y / max(1, rows - 1), 4),
                     round(max_col / max(1, cols), 4),
                     0,
+                    bx0, by0, bx1, by1,
                 ])
             events.append((t, adj_t, etype, len(data)))
 except Exception:
@@ -755,12 +819,17 @@ track_idx = 0
 last_input_t = -99.0
 recent_wide_t = -99.0
 cur_nx, cur_ny = 0.35, 0.25
+cur_bx0, cur_by0, cur_bx1, cur_by1 = 0.0, 0.15, 0.45, 0.30
 
 def sample_cursor(abs_t: float):
     global track_idx, last_input_t, recent_wide_t, cur_nx, cur_ny
+    global cur_bx0, cur_by0, cur_bx1, cur_by1
     while track_idx < len(track) and track[track_idx][0] <= abs_t:
-        ev_t, nx, ny, span, is_in = track[track_idx]
+        ev = track[track_idx]
+        ev_t, nx, ny, span, is_in = ev[0], ev[1], ev[2], ev[3], ev[4]
         cur_nx, cur_ny = nx, ny
+        if len(ev) >= 9:
+            cur_bx0, cur_by0, cur_bx1, cur_by1 = ev[5], ev[6], ev[7], ev[8]
         if is_in:
             last_input_t = ev_t
         elif span >= 0.62:
@@ -768,17 +837,28 @@ def sample_cursor(abs_t: float):
         track_idx += 1
     typing_active = (abs_t - last_input_t) <= 1.6
     wide_burst = (abs_t - recent_wide_t) <= 2.0 and not typing_active
-    return cur_nx, cur_ny, typing_active, wide_burst
+    return cur_nx, cur_ny, typing_active, wide_burst, (cur_bx0, cur_by0, cur_bx1, cur_by1)
+
+# Universal playback profile (main@4.1 for 1080p, high@5.1 for 4K) + silent AAC track
+v_profile = "high" if (W > 1920 or H > 1920) else "main"
+v_level = "5.1" if (W > 1920 or H > 1920) else "4.1"
 
 cmd = [
     "ffmpeg", "-y", "-loglevel", "error",
     "-f", "rawvideo", "-vcodec", "rawvideo",
     "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps),
     "-i", "pipe:0",
+    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-shortest",
     "-movflags", "+faststart",
+    "-brand", "mp42",
     "-pix_fmt", "yuv420p",
-    "-c:v", "libx264", "-profile:v", "high",
+    "-c:v", "libx264", "-profile:v", v_profile, "-level:v", v_level,
+    "-g", str(fps * 2), "-keyint_min", str(fps), "-sc_threshold", "0",
+    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
     "-crf", str(crf), "-preset", "medium",
+    "-c:a", "aac", "-b:a", "32k",
     out_mp4,
 ]
 proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -791,9 +871,22 @@ try:
             gif_idx += 1
         src_img = raw_frames[gif_idx][2]
 
-        nx, ny, typing_active, wide_burst = sample_cursor(slice_start + t)
+        nx, ny, typing_active, wide_burst, (bx0, by0, bx1, by1) = sample_cursor(slice_start + t)
         raw_x = nx * TW
         raw_y = ny * TH
+
+        # Compute exact bounding box of the ENTIRE active multi-line command (with padding)
+        pad_x_src = TW * 0.08
+        pad_y_src = TH * 0.10
+        cmd_left = max(0.0, bx0 * TW - pad_x_src * 0.5)
+        cmd_right = min(float(TW), max(bx1, nx) * TW + pad_x_src)
+        cmd_top = max(0.0, by0 * TH - pad_y_src)
+        cmd_bot = min(float(TH), max(by1, ny) * TH + pad_y_src)
+        cmd_w = max(TW * 0.25, cmd_right - cmd_left)
+        cmd_h = max(TH * 0.18, cmd_bot - cmd_top)
+
+        # Max zoom that guarantees 100% of the full command (any number of lines!) stays visible
+        cmd_fit_scale = min(IVW / cmd_w, IVH / cmd_h)
 
         # Hysteresis on zoom state so camera never pumps in/out rapidly
         desired_mode = zoom_mode
@@ -808,19 +901,28 @@ try:
             zoom_mode = desired_mode
             last_zoom_switch_t = t
 
-        tgt_scale = follow_scale if zoom_mode == "follow" else fit_scale
-        tgt_x = TW * 0.5 if zoom_mode == "fit" else raw_x
-        tgt_y = raw_y
+        if zoom_mode == "follow":
+            # Never zoom closer than cmd_fit_scale so multi-line / long commands are NEVER cut off!
+            tgt_scale = max(fit_scale, min(follow_scale, cmd_fit_scale))
+            # Center on the full command box (blended gently toward cursor when command is short)
+            box_cx = (cmd_left + cmd_right) * 0.5
+            box_cy = (cmd_top + cmd_bot) * 0.5
+            tgt_x = box_cx
+            tgt_y = box_cy
+        else:
+            tgt_scale = fit_scale
+            tgt_x = TW * 0.5
+            tgt_y = raw_y
 
         # Generous deadzone so individual keystrokes stay rock-steady
         view_w_src = IVW / max(0.05, cam_scale)
         view_h_src = IVH / max(0.05, cam_scale)
-        if zoom_mode == "fit" or abs(tgt_x - anchor_x) > view_w_src * 0.22:
+        if zoom_mode == "fit" or abs(tgt_x - anchor_x) > view_w_src * 0.18:
             anchor_x = tgt_x
-        if abs(tgt_y - anchor_y) > view_h_src * 0.18:
+        if abs(tgt_y - anchor_y) > view_h_src * 0.16:
             anchor_y = tgt_y
 
-        # Smooth critically damped springs (gentle pan omega=2.6, very calm zoom omega=1.6)
+        # Smooth critically damped springs (gentle pan omega=2.6, calm zoom omega=1.6)
         cam_scale, cam_vs = step_spring(cam_scale, cam_vs, tgt_scale, 1.6, dt)
         cam_x, cam_vx = step_spring(cam_x, cam_vx, anchor_x, 2.6, dt)
         cam_y, cam_vy = step_spring(cam_y, cam_vy, anchor_y, 2.4, dt)
@@ -996,6 +1098,12 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
       fi
     fi
 
+    # Universal playback profile: main@4.1 for <=1080p, high@5.1 for 1440p/4K + strict 30fps CFR + silent AAC
+    V_PROFILE="main"; V_LEVEL="4.1"
+    if (( OUT_W > 1920 || OUT_H > 1920 )); then
+      V_PROFILE="high"; V_LEVEL="5.1"
+    fi
+
     if [[ "$USE_FRAME" -eq 1 ]]; then
       PAD_Y=$(( OUT_H / 100 ))
       (( PAD_Y < 14 )) && PAD_Y=14
@@ -1004,16 +1112,21 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
       TERM_Y=$(( WY + TITLE_H + PAD_Y ))
 
       if ffmpeg -y -loglevel error \
-        -loop 1 -i "$FRAME_PNG" \
+        -framerate 30 -loop 1 -i "$FRAME_PNG" \
         -i "$TMP_GIF" \
-        -filter_complex "[1:v]scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:shortest=1[out]" \
-        -map "[out]" \
+        -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+        -filter_complex "[1:v]fps=30,scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:shortest=1[out]" \
+        -map "[out]" -map "2:a:0" \
+        -shortest \
+        -r 30 -fps_mode cfr \
         -movflags +faststart \
+        -brand mp42 \
         -pix_fmt yuv420p \
-        -c:v libx264 \
-        -profile:v high \
-        -crf "$CRF" \
-        -preset medium \
+        -c:v libx264 -profile:v "$V_PROFILE" -level:v "$V_LEVEL" \
+        -g 60 -keyint_min 30 -sc_threshold 0 \
+        -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+        -crf "$CRF" -preset medium \
+        -c:a aac -b:a 32k \
         "$TMP_MP4"
       then
         mv -f "$TMP_MP4" "$OUTPUT"
@@ -1025,13 +1138,19 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
     else
       if ffmpeg -y -loglevel error \
         -i "$TMP_GIF" \
+        -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+        -map "0:v:0" -map "1:a:0" \
+        -shortest \
+        -r 30 -fps_mode cfr \
         -movflags +faststart \
+        -brand mp42 \
         -pix_fmt yuv420p \
-        -c:v libx264 \
-        -profile:v high \
-        -crf "$CRF" \
-        -preset medium \
-        -vf "scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${BG_HEX}" \
+        -c:v libx264 -profile:v "$V_PROFILE" -level:v "$V_LEVEL" \
+        -g 60 -keyint_min 30 -sc_threshold 0 \
+        -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+        -crf "$CRF" -preset medium \
+        -c:a aac -b:a 32k \
+        -vf "fps=30,scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${BG_HEX}" \
         "$TMP_MP4"
       then
         mv -f "$TMP_MP4" "$OUTPUT"
