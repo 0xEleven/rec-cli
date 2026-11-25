@@ -839,18 +839,19 @@ def sample_cursor(abs_t: float):
     wide_burst = (abs_t - recent_wide_t) <= 2.0 and not typing_active
     return cur_nx, cur_ny, typing_active, wide_burst, (cur_bx0, cur_by0, cur_bx1, cur_by1)
 
-# Universal playback profile (main@4.1 for 1080p, high@5.1 for 4K) + silent AAC track
+# Universal playback profile (main@4.1 for <=1080p, high@5.1 for 4K) + finite silent AAC track
 v_profile = "high" if (W > 1920 or H > 1920) else "main"
 v_level = "5.1" if (W > 1920 or H > 1920) else "4.1"
+exact_dur = f"{n_out_frames / float(fps):.3f}"
 
 cmd = [
     "ffmpeg", "-y", "-loglevel", "error",
     "-f", "rawvideo", "-vcodec", "rawvideo",
     "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps),
     "-i", "pipe:0",
-    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-f", "lavfi", "-t", exact_dur, "-i", "anullsrc=r=44100:cl=stereo",
     "-map", "0:v:0", "-map", "1:a:0",
-    "-shortest",
+    "-r", str(fps),
     "-movflags", "+faststart",
     "-brand", "mp42",
     "-pix_fmt", "yuv420p",
@@ -859,6 +860,7 @@ cmd = [
     "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
     "-crf", str(crf), "-preset", "medium",
     "-c:a", "aac", "-b:a", "32k",
+    "-shortest",
     out_mp4,
 ]
 proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -1098,7 +1100,20 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
       fi
     fi
 
-    # Universal playback profile: main@4.1 for <=1080p, high@5.1 for 1440p/4K + strict 30fps CFR + silent AAC
+    # Compute exact GIF duration so static frame & silent AAC inputs are finite (FFmpeg 4.x-9.x safe)
+    GIF_DUR="$(python3 - "$TMP_GIF" <<'PYEOF' 2>/dev/null || echo ""
+import sys
+from PIL import Image, ImageSequence
+im = Image.open(sys.argv[1])
+dur = sum(max(0.02, (f.info.get("duration", 40) or 40) / 1000.0) for f in ImageSequence.Iterator(im))
+print(f"{max(0.5, dur):.3f}")
+PYEOF
+)"
+    if [[ -z "$GIF_DUR" ]]; then
+      GIF_DUR="$(python3 -c "print(f'{max(0.5, float(\"${END}\") - float(\"${START}\")):.3f}')")"
+    fi
+
+    # Universal playback profile: main@4.1 for <=1080p, high@5.1 for 1440p/4K + strict 30fps CFR + finite silent AAC
     V_PROFILE="main"; V_LEVEL="4.1"
     if (( OUT_W > 1920 || OUT_H > 1920 )); then
       V_PROFILE="high"; V_LEVEL="5.1"
@@ -1112,13 +1127,13 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
       TERM_Y=$(( WY + TITLE_H + PAD_Y ))
 
       if ffmpeg -y -loglevel error \
-        -framerate 30 -loop 1 -i "$FRAME_PNG" \
+        -framerate 30 -loop 1 -t "$GIF_DUR" -i "$FRAME_PNG" \
         -i "$TMP_GIF" \
-        -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-        -filter_complex "[1:v]fps=30,scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:shortest=1[out]" \
+        -f lavfi -t "$GIF_DUR" -i "anullsrc=r=44100:cl=stereo" \
+        -filter_complex "[1:v]fps=30,scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:eof_action=pass:repeatlast=1[out]" \
         -map "[out]" -map "2:a:0" \
-        -shortest \
-        -r 30 -fps_mode cfr \
+        -r 30 \
+        -t "$GIF_DUR" \
         -movflags +faststart \
         -brand mp42 \
         -pix_fmt yuv420p \
@@ -1138,10 +1153,10 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
     else
       if ffmpeg -y -loglevel error \
         -i "$TMP_GIF" \
-        -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+        -f lavfi -t "$GIF_DUR" -i "anullsrc=r=44100:cl=stereo" \
         -map "0:v:0" -map "1:a:0" \
-        -shortest \
-        -r 30 -fps_mode cfr \
+        -r 30 \
+        -t "$GIF_DUR" \
         -movflags +faststart \
         -brand mp42 \
         -pix_fmt yuv420p \
@@ -1180,3 +1195,5 @@ done <<< "$PLAN"
 if [[ "$CLEANUP" -eq 1 && "$ALL_OK" -eq 1 ]]; then
   rm -f "$INPUT" "$META_FILE"
 fi
+
+[[ "$ALL_OK" -eq 1 ]] || exit 1
