@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cast2mp4 — Smart terminal .cast -> 1080p MP4 renderer (part of rec-cli)
+# - Default 2x speed, 60fps 1080p H.264 MP4
+# - Max 5 minutes (300s) per video (auto-splits longer sessions into 5-min parts)
+# - Only renders clips/chunks with BOTH real keyboard input AND terminal output
+# - Skips passive/noisy VPN & log-only sessions (openvpn, tail -f, watch, etc.)
+# - Names each video/part after the primary tool/process run (e.g. nmap_20261125-134012.mp4)
+
+CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/config"
+if [[ -f "$CONF_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+fi
+
+AUTO_MODE=0
+CLEANUP=0
+SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
+MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
+IDLE_LIMIT="${REC_IDLE_LIMIT:-${CAST_IDLE_LIMIT:-1.5}}"
+OUT_DIR="${REC_VIDEO_DIR:-${TERM_VIDEO_DIR:-$HOME/Videos/content}}"
+THEME_NAME="${REC_THEME:-tokyo-night}"
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto) AUTO_MODE=1; shift ;;
+    --cleanup) CLEANUP=1; shift ;;
+    --speed|-s) SPEED="$2"; shift 2 ;;
+    --max-secs|-m) MAX_SECS="$2"; shift 2 ;;
+    --out-dir|-o) OUT_DIR="$2"; shift 2 ;;
+    --theme|-t) THEME_NAME="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: cast2mp4 [--auto] [--cleanup] [--speed N] [--max-secs 300] [--theme NAME] <input.cast> [output.mp4]"
+      exit 0
+      ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -lt 1 ]]; then
+  echo "Usage: cast2mp4 [--auto] [--cleanup] [--speed N] <input.cast> [output.mp4]" >&2
+  exit 1
+fi
+
+INPUT="${POSITIONAL[0]}"
+EXPLICIT_OUT="${POSITIONAL[1]:-}"
+if [[ -n "${POSITIONAL[2]:-}" ]]; then
+  SPEED="${POSITIONAL[2]}"
+fi
+
+if [[ ! -f "$INPUT" ]]; then
+  echo "Error: file not found: $INPUT" >&2
+  exit 1
+fi
+
+# Resolve theme palette (bg,fg,color0..color7) + padding hex
+case "$THEME_NAME" in
+  tokyo-night|tokyonight)
+    AGG_THEME="1a1b26,c0caf5,15161e,f7768e,9ece6a,e0af68,7aa2f7,bb9af7,7dcfff,a9b1d6"
+    PAD_COLOR="#1a1b26"
+    ;;
+  dracula)
+    AGG_THEME="282a36,f8f8f2,21222c,ff5555,50fa7b,f1fa8c,bd93f9,ff79c6,8be9fd,f8f8f2"
+    PAD_COLOR="#282a36"
+    ;;
+  catppuccin|catppuccin-mocha)
+    AGG_THEME="1e1e2e,cdd6f4,45475a,f38ba8,a6e3a1,f9e2af,89b4fa,f5c2e7,94e2d5,bac2de"
+    PAD_COLOR="#1e1e2e"
+    ;;
+  gruvbox|gruvbox-dark)
+    AGG_THEME="282828,ebdbb2,282828,cc241d,98971a,d79921,458588,b16286,689d6a,a89984"
+    PAD_COLOR="#282828"
+    ;;
+  nord)
+    AGG_THEME="2e3440,d8dee9,3b4252,bf616a,a3be8c,ebcb8b,81a1c1,b48ead,88c0d0,e5e9f0"
+    PAD_COLOR="#2e3440"
+    ;;
+  *)
+    AGG_THEME="1a1b26,c0caf5,15161e,f7768e,9ece6a,e0af68,7aa2f7,bb9af7,7dcfff,a9b1d6"
+    PAD_COLOR="#1a1b26"
+    ;;
+esac
+
+META_FILE="${INPUT%.cast}.meta"
+mkdir -p "$OUT_DIR"
+
+PLAN="$(python3 - "$INPUT" "$META_FILE" "$IDLE_LIMIT" "$SPEED" "$MAX_SECS" "$AUTO_MODE" <<'PYEOF'
+import json
+import os
+import re
+import shlex
+import sys
+import time
+
+cast_path = sys.argv[1]
+meta_path = sys.argv[2]
+idle_limit = float(sys.argv[3])
+speed = max(0.1, float(sys.argv[4]))
+max_secs = max(10.0, float(sys.argv[5]))
+auto_mode = sys.argv[6] == "1"
+
+WRAPPERS = {
+    "sudo", "doas", "env", "time", "command", "builtin", "nohup", "nice",
+    "ionice", "stdbuf", "timeout", "proxychains", "proxychains4", "rlwrap",
+    "setsid", "strace", "ltrace", "unbuffer", "script",
+}
+
+SKIP_ONLY_CMDS = {
+    "openvpn", "wg-quick", "tail", "journalctl", "watch", "htop", "btop",
+    "top", "dmesg", "vmstat", "iostat", "nload", "iftop",
+}
+
+TRIVIAL_CMDS = {
+    "cd", "ls", "ll", "la", "lt", "eza", "clear", "cls", "pwd", "exit",
+    "logout", "history", "reload", "recs", "echo", "printf", "mkdir", "rmdir",
+    "touch", "export", "unset", "source", ".", "alias", "unalias", "which",
+    "type", "whoami", "id", "date", "uname", "true", "false", "norec",
+    "render-casts", "casts2mp4", "rec", "rec-cli",
+}
+
+INTERPRETERS = {"python", "python3", "python2", "bash", "sh", "zsh", "fish", "ruby", "perl", "node", "php", "go"}
+
+
+def sanitize(name: str) -> str:
+    name = os.path.basename(name.strip())
+    name = re.sub(r"\.(py|sh|rb|pl|js|php|go|exe|elf|bin)$", "", name, flags=re.I)
+    name = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-_")
+    return (name[:32] or "terminal").lower()
+
+
+def extract_tool(cmdline: str) -> tuple[str, bool, bool]:
+    first_seg = re.split(r"\s*(?:&&|\|\||;|\|)\s*", cmdline.strip(), maxsplit=1)[0]
+    try:
+        tokens = shlex.split(first_seg)
+    except ValueError:
+        tokens = first_seg.split()
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            i += 1
+            continue
+        base = os.path.basename(tok)
+        if base in WRAPPERS:
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                flag = tokens[i]
+                i += 1
+                if base == "sudo" and flag in ("-u", "-g", "-p", "-C", "-h", "-r", "-t") and i < len(tokens):
+                    i += 1
+            if base == "timeout" and i < len(tokens) and re.match(r"^[0-9]+[smhd]?$", tokens[i]):
+                i += 1
+            continue
+        break
+
+    if i >= len(tokens):
+        return ("", False, True)
+
+    cmd = os.path.basename(tokens[i])
+    if cmd.startswith("./"):
+        cmd = cmd[2:]
+
+    is_skip = cmd in SKIP_ONLY_CMDS
+    is_trivial = cmd in TRIVIAL_CMDS
+
+    if cmd in INTERPRETERS and i + 1 < len(tokens):
+        for arg in tokens[i + 1:]:
+            if arg.startswith("-"):
+                continue
+            if "." in arg or "/" in arg:
+                script = sanitize(arg)
+                if script and script != cmd:
+                    return (f"{sanitize(cmd)}-{script}"[:32], is_skip, is_trivial)
+            break
+
+    return (sanitize(cmd), is_skip, is_trivial)
+
+
+header = {}
+events = []
+raw_prev = 0.0
+adj_t = 0.0
+has_stdin_events = False
+output_sample = []
+
+try:
+    with open(cast_path, "r", encoding="utf-8", errors="replace") as f:
+        first = f.readline()
+        if not first.strip():
+            sys.exit(0)
+        header = json.loads(first)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(ev, list) or len(ev) < 3:
+                continue
+            t = float(ev[0])
+            etype = ev[1]
+            data = ev[2] if isinstance(ev[2], str) else ""
+            dt = max(0.0, t - raw_prev)
+            raw_prev = t
+            if idle_limit > 0 and dt > idle_limit:
+                dt = idle_limit
+            adj_t += dt / speed
+            if etype == "i":
+                has_stdin_events = True
+            elif etype == "o" and len(output_sample) < 60:
+                output_sample.append(data)
+            events.append((t, adj_t, etype, len(data)))
+except Exception:
+    sys.exit(0)
+
+if not events:
+    sys.exit(0)
+
+total_adj = events[-1][1]
+start_epoch = float(header.get("timestamp") or os.path.getmtime(cast_path))
+stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(start_epoch))
+
+meta_cmds = []
+custom_name = ""
+if os.path.isfile(meta_path):
+    try:
+        with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
+            for line in mf:
+                line = line.rstrip("\n")
+                if "\t" not in line:
+                    continue
+                ts_str, cmdline = line.split("\t", 1)
+                if ts_str == "NAME":
+                    custom_name = sanitize(cmdline)
+                    continue
+                try:
+                    ts = float(ts_str)
+                except ValueError:
+                    continue
+                rel_t = max(0.0, ts - start_epoch)
+                tool, is_skip, is_trivial = extract_tool(cmdline)
+                if tool:
+                    meta_cmds.append((rel_t, tool, is_skip, is_trivial))
+    except Exception:
+        pass
+
+
+def raw_to_adj(raw_sec: float) -> float:
+    best = 0.0
+    for rt, at, _, _ in events:
+        if rt <= raw_sec:
+            best = at
+        else:
+            break
+    return best
+
+
+adj_cmds = [(raw_to_adj(rt), tool, is_skip, is_trivial) for (rt, tool, is_skip, is_trivial) in meta_cmds]
+
+sample_text = "".join(output_sample)
+looks_like_ovpn = ("Initialization Sequence Completed" in sample_text or ("OpenVPN" in sample_text and "TUN/TAP" in sample_text))
+
+if auto_mode:
+    non_trivial_cmds = [c for c in adj_cmds if not c[3]]
+    if non_trivial_cmds and all(c[2] for c in non_trivial_cmds):
+        sys.exit(0)
+    if not adj_cmds and looks_like_ovpn:
+        sys.exit(0)
+
+    total_in = sum(1 for _, _, et, _ in events if et == "i")
+    total_out = sum(1 for _, _, et, _ in events if et == "o")
+    if has_stdin_events:
+        if total_in < 3 or total_out < 5:
+            sys.exit(0)
+    else:
+        if not adj_cmds or total_out < 10:
+            sys.exit(0)
+    if total_adj < 1.0:
+        sys.exit(0)
+
+
+def pick_tool_for_window(w_start: float, w_end: float) -> tuple[str, bool]:
+    if custom_name:
+        return (custom_name, False)
+    in_win = [c for c in adj_cmds if w_start <= c[0] <= w_end]
+    for _, tool, is_skip, is_trivial in in_win:
+        if not is_trivial and not is_skip:
+            return (tool, False)
+    if in_win and all(c[2] or c[3] for c in in_win) and any(c[2] for c in in_win):
+        return ("", True)
+    prior = [c for c in adj_cmds if c[0] < w_start and not c[3]]
+    if prior:
+        last_cmd = prior[-1]
+        if last_cmd[2]:
+            return ("", True)
+        return (last_cmd[1], False)
+    if in_win:
+        return (in_win[0][1], False)
+    if adj_cmds:
+        return (adj_cmds[0][1], False)
+    return ("terminal", False)
+
+
+num_chunks = max(1, int((total_adj + max_secs - 0.001) // max_secs))
+if total_adj <= max_secs:
+    num_chunks = 1
+
+chunks = []
+for idx in range(num_chunks):
+    c_start = idx * max_secs
+    c_end = min(total_adj, (idx + 1) * max_secs)
+    if c_end - c_start < 1.5 and idx > 0:
+        continue
+
+    win_events = [e for e in events if c_start <= e[1] <= c_end]
+    win_in = sum(1 for _, _, et, _ in win_events if et == "i")
+    win_out = sum(1 for _, _, et, _ in win_events if et == "o")
+
+    if auto_mode:
+        if win_out < 4:
+            continue
+        win_has_cmd = any(c_start <= c[0] <= c_end for c in adj_cmds)
+        if has_stdin_events and win_in == 0 and not win_has_cmd and idx > 0:
+            continue
+
+    tool, skip_win = pick_tool_for_window(c_start, c_end)
+    if auto_mode and skip_win:
+        continue
+
+    chunks.append((c_start, c_end, tool or "terminal"))
+
+for i, (s, e, tool) in enumerate(chunks, 1):
+    is_multi = 1 if len(chunks) > 1 else 0
+    print(f"{s:.2f}\t{e:.2f}\t{tool}\t{stamp}\t{i}\t{is_multi}")
+PYEOF
+)"
+
+if [[ -z "$PLAN" ]]; then
+  if [[ "$CLEANUP" -eq 1 ]]; then
+    rm -f "$INPUT" "$META_FILE"
+  fi
+  exit 0
+fi
+
+ALL_OK=1
+
+while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI; do
+  [[ -z "$START" ]] && continue
+
+  if [[ -n "$EXPLICIT_OUT" ]]; then
+    if [[ "$IS_MULTI" -eq 1 ]]; then
+      OUTPUT="${EXPLICIT_OUT%.mp4}_part${PART}.mp4"
+    else
+      OUTPUT="$EXPLICIT_OUT"
+    fi
+  else
+    if [[ "$IS_MULTI" -eq 1 ]]; then
+      OUTPUT="${OUT_DIR}/${TOOL}_${STAMP}_part${PART}.mp4"
+    else
+      OUTPUT="${OUT_DIR}/${TOOL}_${STAMP}.mp4"
+    fi
+    if [[ -e "$OUTPUT" ]]; then
+      OUTPUT="${OUTPUT%.mp4}_$$_${PART}.mp4"
+    fi
+  fi
+
+  mkdir -p "$(dirname "$OUTPUT")"
+  TMP_GIF="$(mktemp --suffix=.gif)"
+  TMP_MP4="${OUTPUT}.tmp.$$.mp4"
+
+  AGG_ARGS=(
+    --quiet
+    --theme "$AGG_THEME"
+    --text-font-family "JetBrainsMono Nerd Font,JetBrains Mono,Fira Code,DejaVu Sans Mono,Liberation Mono"
+    --font-size 22
+    --speed "$SPEED"
+    --fps-cap 60
+    --idle-time-limit "$IDLE_LIMIT"
+  )
+  if [[ "$IS_MULTI" -eq 1 ]]; then
+    AGG_ARGS+=(--select "${START}..${END}")
+  fi
+
+  if agg "${AGG_ARGS[@]}" "$INPUT" "$TMP_GIF" \
+    && ffmpeg -y -loglevel error \
+      -i "$TMP_GIF" \
+      -movflags +faststart \
+      -pix_fmt yuv420p \
+      -c:v libx264 \
+      -crf 18 \
+      -preset medium \
+      -vf "scale=1840:1000:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=${PAD_COLOR}" \
+      "$TMP_MP4"
+  then
+    mv -f "$TMP_MP4" "$OUTPUT"
+    rm -f "$TMP_GIF"
+  else
+    rm -f "$TMP_GIF" "$TMP_MP4"
+    ALL_OK=0
+  fi
+done <<< "$PLAN"
+
+if [[ "$CLEANUP" -eq 1 && "$ALL_OK" -eq 1 ]]; then
+  rm -f "$INPUT" "$META_FILE"
+fi

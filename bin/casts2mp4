@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# casts2mp4 — Batch-convert finished .cast recordings into 5-min max, 2x-speed MP4 clips
+# Part of rec-cli
+
+CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/config"
+if [[ -f "$CONF_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+fi
+
+BG=0
+KEEP=0
+SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
+QUIET=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bg) BG=1; QUIET=1; shift ;;
+    --keep) KEEP=1; shift ;;
+    --quiet|-q) QUIET=1; shift ;;
+    --speed|-s) SPEED="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: casts2mp4 [--bg] [--keep] [--quiet] [--speed <N>]"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ "$BG" -eq 1 ]]; then
+  ARGS=(--quiet --speed "$SPEED")
+  [[ "$KEEP" -eq 1 ]] && ARGS+=(--keep)
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$0" "${ARGS[@]}" </dev/null >/dev/null 2>&1
+  else
+    nohup "$0" "${ARGS[@]}" </dev/null >/dev/null 2>&1 &
+  fi
+  exit 0
+fi
+
+BASE_DIR="${REC_DIR:-${TERM_REC_DIR:-$HOME/Videos/terminal-recordings}}"
+CAST_DIR="$BASE_DIR/casts"
+MP4_DIR="${REC_VIDEO_DIR:-${TERM_VIDEO_DIR:-$HOME/Videos/content}}"
+LOCK_FILE="/tmp/casts2mp4-${USER:-$(id -un)}.lock"
+
+mkdir -p "$CAST_DIR" "$MP4_DIR"
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  exit 0
+fi
+
+log() {
+  [[ "$QUIET" -eq 0 ]] && echo "$@"
+}
+
+is_cast_active() {
+  local f="$1"
+  if command -v fuser >/dev/null 2>&1 && fuser "$f" >/dev/null 2>&1; then
+    return 0
+  fi
+  local bname
+  bname="$(basename "$f")"
+  if pgrep -f "asciinema.*${bname}" >/dev/null 2>&1; then
+    return 0
+  fi
+  local mtime now
+  mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if (( now - mtime < 15 )); then
+    return 0
+  fi
+  return 1
+}
+
+shopt -s nullglob
+processed=0
+skipped_active=0
+
+for cast in "$CAST_DIR"/*.cast; do
+  if is_cast_active "$cast"; then
+    skipped_active=$((skipped_active + 1))
+    continue
+  fi
+
+  base="$(basename "$cast" .cast)"
+  log "Processing ${base}.cast (${SPEED}x, max 5m, input+output only)..."
+  CLEAN_ARGS=(--auto --speed "$SPEED")
+  [[ "$KEEP" -eq 0 ]] && CLEAN_ARGS+=(--cleanup)
+
+  if cast2mp4 "${CLEAN_ARGS[@]}" "$cast" 2>/dev/null; then
+    processed=$((processed + 1))
+  else
+    log "  Warning: failed to process ${base}.cast"
+  fi
+done
+
+for meta in "$CAST_DIR"/*.meta; do
+  [[ ! -f "${meta%.meta}.cast" ]] && rm -f "$meta"
+done
+
+log "Done: ${processed} processed -> ${MP4_DIR}, ${skipped_active} currently active."

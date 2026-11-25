@@ -1,0 +1,8 @@
+dist/
+*.deb
+*.rpm
+*.tar.gz
+*.pkg.tar.*
+*.tmp
+.DS_Store
+__pycache__/

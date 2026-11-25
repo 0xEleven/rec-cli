@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# rec-cli — Smart terminal clip recorder CLI (v1.0.0)
+# Works across Linux distros with Zsh, Bash, and Fish.
+
+VERSION="1.0.0"
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli"
+CONF_FILE="$CONF_DIR/config"
+AUTO_OFF_FLAG="$CONF_DIR/auto-disabled"
+LEGACY_AUTO_OFF="$HOME/.config/term-rec/auto-disabled"
+
+# Load user config if present
+if [[ -f "$CONF_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+fi
+
+REC_DIR="${REC_DIR:-${TERM_REC_DIR:-$HOME/Videos/terminal-recordings}}"
+CAST_DIR="$REC_DIR/casts"
+VIDEO_DIR="${REC_VIDEO_DIR:-${TERM_VIDEO_DIR:-$HOME/Videos/content}}"
+REC_SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
+REC_MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
+REC_TERMINALS="${REC_TERMINALS:-kitty,tabby}"
+REC_THEME="${REC_THEME:-tokyo-night}"
+
+# Locate installed shell integration directory
+find_share_dir() {
+  local script_dir
+  script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  for cand in \
+    "$script_dir/../share/rec-cli" \
+    "$script_dir/.." \
+    "/usr/share/rec-cli" \
+    "/usr/local/share/rec-cli" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/rec-cli"
+  do
+    if [[ -d "$cand/shell" ]]; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_DIM=$'\033[2m'
+C_RED=$'\033[38;2;247;118;142m'
+C_GREEN=$'\033[38;2;158;206;106m'
+C_PURPLE=$'\033[38;2;187;154;247m'
+C_CYAN=$'\033[38;2;125;207;255m'
+C_YELLOW=$'\033[38;2;224;175;104m'
+
+show_help() {
+  cat <<EOF
+${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} — Smart Terminal Clip Recorder for Linux (Zsh, Bash, Fish)
+
+${C_CYAN}Session Control (via shell integration):${C_RESET}
+  ${C_BOLD}rec start [name]${C_RESET}     Start recording this terminal (auto-named by process if omitted)
+  ${C_BOLD}rec stop${C_RESET}             Stop recording & render MP4 in background (keeps tab open)
+  ${C_BOLD}rec cancel${C_RESET}           Stop recording & discard the take (saves nothing)
+  ${C_BOLD}rec status${C_RESET}           Show live recording state, config & clip stats
+
+${C_CYAN}Auto-Record & Configuration:${C_RESET}
+  ${C_BOLD}rec auto on|off${C_RESET}      Toggle auto-recording on new allowed terminal tabs
+  ${C_BOLD}rec config${C_RESET}           Show or set options (speed, max-secs, terminals, video-dir, theme)
+  ${C_BOLD}rec init <shell>${C_RESET}     Print shell integration for zsh, bash, or fish
+  ${C_BOLD}rec doctor${C_RESET}           Check dependencies & print distro install commands
+
+${C_CYAN}Clips & Rendering:${C_RESET}
+  ${C_BOLD}rec list${C_RESET}             List saved MP4 clips in ${VIDEO_DIR}
+  ${C_BOLD}rec render [speed]${C_RESET}   Convert pending finished .cast files now (default: ${REC_SPEED}x)
+  ${C_BOLD}rec open${C_RESET}             Open clips folder in your file manager
+  ${C_BOLD}rec clear [--yes]${C_RESET}    Delete saved MP4 clips and raw casts
+  ${C_BOLD}rec version${C_RESET}          Print version
+EOF
+}
+
+is_auto_disabled() {
+  [[ -f "$AUTO_OFF_FLAG" || -f "$LEGACY_AUTO_OFF" ]]
+}
+
+cmd_init() {
+  local sh="${1:-}"
+  if [[ -z "$sh" ]]; then
+    echo "Usage: rec-cli init <zsh|bash|fish>" >&2
+    exit 1
+  fi
+  local share_dir
+  if ! share_dir="$(find_share_dir)"; then
+    echo "Error: could not locate rec-cli shell scripts directory." >&2
+    exit 1
+  fi
+  case "$sh" in
+    zsh|bash|fish)
+      local file="$share_dir/shell/rec.${sh}"
+      if [[ ! -f "$file" ]]; then
+        echo "Error: missing shell file: $file" >&2
+        exit 1
+      fi
+      cat "$file"
+      ;;
+    *)
+      echo "Unsupported shell '$sh'. Supported: zsh, bash, fish." >&2
+      exit 1
+      ;;
+  esac
+}
+
+cmd_status() {
+  mkdir -p "$CAST_DIR" "$VIDEO_DIR"
+  echo -e "${C_PURPLE}${C_BOLD}=== rec-cli v${VERSION} Status ===${C_RESET}"
+
+  if [[ -n "${ASCIINEMA_REC:-}" || -n "${_TERM_REC_ACTIVE:-}" ]]; then
+    local cast_info=""
+    if [[ -n "${_TERM_REC_CAST:-}" && -f "${_TERM_REC_CAST}" ]]; then
+      local sz
+      sz="$(du -h "${_TERM_REC_CAST}" 2>/dev/null | cut -f1)"
+      cast_info=" (${C_DIM}$(basename "${_TERM_REC_CAST}"), ${sz}${C_RESET})"
+    fi
+    echo -e "  This tab:     ${C_RED}${C_BOLD}● RECORDING${C_RESET}${cast_info}"
+    if [[ -n "${_TERM_REC_META:-}" && -f "${_TERM_REC_META}" ]]; then
+      local cmds
+      cmds="$(awk -F'\t' '$1 != "NAME" {print $2}' "${_TERM_REC_META}" 2>/dev/null | tail -n 3 | paste -sd ', ' -)"
+      [[ -n "$cmds" ]] && echo -e "  Recent cmds:  ${C_CYAN}${cmds}${C_RESET}"
+    fi
+  else
+    echo -e "  This tab:     ${C_DIM}○ Not recording${C_RESET}  ${C_DIM}(run 'rec start' to record)${C_RESET}"
+  fi
+
+  if is_auto_disabled; then
+    echo -e "  Auto-record:  ${C_YELLOW}OFF (manual only)${C_RESET}  ${C_DIM}(run 'rec auto on' to enable)${C_RESET}"
+  else
+    echo -e "  Auto-record:  ${C_GREEN}ON (${REC_TERMINALS})${C_RESET}  ${C_DIM}(run 'rec auto off' for manual)${C_RESET}"
+  fi
+
+  local active_cnt
+  active_cnt="$(pgrep -fc 'asciinema rec' 2>/dev/null || true)"
+  echo -e "  Active panes: ${C_CYAN}${active_cnt:-0}${C_RESET}"
+
+  local mp4_cnt mp4_size
+  mp4_cnt="$(find "$VIDEO_DIR" -maxdepth 1 -name '*.mp4' 2>/dev/null | wc -l)"
+  mp4_size="$(du -sh "$VIDEO_DIR" 2>/dev/null | cut -f1)"
+  echo -e "  Saved clips:  ${C_BOLD}${mp4_cnt}${C_RESET} videos (${mp4_size}) in ${C_CYAN}${VIDEO_DIR}${C_RESET}"
+  echo -e "  Settings:     ${C_DIM}${REC_SPEED}x speed | max $((REC_MAX_SECS / 60))m/clip | theme: ${REC_THEME} | input+output only | ovpn skipped${C_RESET}"
+}
+
+cmd_auto() {
+  mkdir -p "$CONF_DIR"
+  case "${1:-}" in
+    on|enable|1)
+      rm -f "$AUTO_OFF_FLAG" "$LEGACY_AUTO_OFF"
+      echo -e "${C_GREEN}✓ Auto-recording ENABLED${C_RESET} for allowed terminals (${REC_TERMINALS})."
+      ;;
+    off|disable|0)
+      touch "$AUTO_OFF_FLAG"
+      echo -e "${C_YELLOW}✓ Auto-recording DISABLED${C_RESET} — new tabs won't record unless you run ${C_BOLD}rec start${C_RESET}."
+      ;;
+    *)
+      if is_auto_disabled; then
+        echo -e "Auto-record is currently ${C_YELLOW}OFF${C_RESET}. Use 'rec auto on' or 'rec auto off'."
+      else
+        echo -e "Auto-record is currently ${C_GREEN}ON${C_RESET}. Use 'rec auto on' or 'rec auto off'."
+      fi
+      ;;
+  esac
+}
+
+set_config_key() {
+  local key="$1" val="$2"
+  mkdir -p "$CONF_DIR"
+  touch "$CONF_FILE"
+  local tmp
+  tmp="$(mktemp)"
+  grep -v "^${key}=" "$CONF_FILE" > "$tmp" || true
+  printf '%s=%q\n' "$key" "$val" >> "$tmp"
+  mv -f "$tmp" "$CONF_FILE"
+}
+
+cmd_config() {
+  if [[ $# -eq 0 ]]; then
+    echo -e "${C_PURPLE}${C_BOLD}rec-cli configuration${C_RESET} (${C_DIM}${CONF_FILE}${C_RESET}):"
+    echo "  terminals = ${REC_TERMINALS}"
+    echo "  speed     = ${REC_SPEED}x"
+    echo "  max-secs  = ${REC_MAX_SECS}s ($((REC_MAX_SECS / 60)) min)"
+    echo "  video-dir = ${VIDEO_DIR}"
+    echo "  theme     = ${REC_THEME}"
+    echo ""
+    echo -e "${C_DIM}Change any setting with: rec config <key> <value>${C_RESET}"
+    echo -e "${C_DIM}  e.g. rec config terminals kitty,tabby,alacritty${C_RESET}"
+    echo -e "${C_DIM}       rec config terminals all${C_RESET}"
+    echo -e "${C_DIM}       rec config speed 2${C_RESET}"
+    echo -e "${C_DIM}       rec config max-secs 300${C_RESET}"
+    echo -e "${C_DIM}       rec config theme dracula   (tokyo-night|dracula|catppuccin|gruvbox|nord)${C_RESET}"
+    return 0
+  fi
+
+  local key="$1" val="${2:-}"
+  if [[ -z "$val" ]]; then
+    echo "Usage: rec config <terminals|speed|max-secs|video-dir|theme> <value>" >&2
+    exit 1
+  fi
+  case "$key" in
+    terminals) set_config_key REC_TERMINALS "$val" ;;
+    speed)     set_config_key REC_SPEED "$val" ;;
+    max-secs)  set_config_key REC_MAX_SECS "$val" ;;
+    video-dir) set_config_key REC_VIDEO_DIR "$val" ;;
+    theme)     set_config_key REC_THEME "$val" ;;
+    *)
+      echo "Unknown config key: $key (valid: terminals, speed, max-secs, video-dir, theme)" >&2
+      exit 1
+      ;;
+  esac
+  echo -e "${C_GREEN}✓ Updated ${key} = ${val}${C_RESET} (saved to ${CONF_FILE})"
+}
+
+cmd_doctor() {
+  echo -e "${C_PURPLE}${C_BOLD}=== rec-cli Dependency Check ===${C_RESET}"
+  local missing=0
+  for dep in asciinema agg ffmpeg python3 flock setsid; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      echo -e "  ${C_GREEN}✓${C_RESET} ${dep}  ${C_DIM}($(command -v "$dep"))${C_RESET}"
+    else
+      echo -e "  ${C_RED}✗${C_RESET} ${dep}  ${C_YELLOW}(MISSING)${C_RESET}"
+      missing=1
+    fi
+  done
+  echo ""
+  echo -e "  ${C_CYAN}Detected shell:${C_RESET} ${SHELL:-unknown}"
+  echo -e "  ${C_CYAN}Allowed terms:${C_RESET}  ${REC_TERMINALS}"
+  if (( missing == 1 )); then
+    echo ""
+    echo -e "${C_YELLOW}Install missing deps:${C_RESET}"
+    echo "  Debian/Ubuntu/Kali: sudo apt install asciinema ffmpeg python3 util-linux"
+    echo "  Arch/Manjaro:       sudo pacman -S asciinema ffmpeg python util-linux"
+    echo "  Fedora/RHEL:        sudo dnf install asciinema ffmpeg python3 util-linux"
+    echo "  openSUSE:           sudo zypper install asciinema ffmpeg python3 util-linux"
+    echo "  agg (any distro):   https://github.com/asciinema/agg/releases"
+    return 1
+  fi
+  echo -e "${C_GREEN}All dependencies look great!${C_RESET}"
+}
+
+cmd_list() {
+  mkdir -p "$VIDEO_DIR"
+  local count
+  count="$(find "$VIDEO_DIR" -maxdepth 1 -name '*.mp4' 2>/dev/null | wc -l)"
+  if (( count == 0 )); then
+    echo -e "${C_DIM}No clips in ${VIDEO_DIR} yet.${C_RESET}"
+    return 0
+  fi
+  echo -e "${C_PURPLE}${C_BOLD}Clips in ${VIDEO_DIR}:${C_RESET}"
+  ls -lht --color=auto "$VIDEO_DIR"/*.mp4 2>/dev/null | head -n 30
+  echo -e "${C_DIM}Total: ${count} clip(s), $(du -sh "$VIDEO_DIR" | cut -f1)${C_RESET}"
+}
+
+cmd_clear() {
+  local yes=0
+  [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && yes=1
+  if (( yes == 0 )); then
+    printf "Delete all MP4 clips in %s and raw casts? [y/N] " "$VIDEO_DIR"
+    read -r ans
+    [[ "$ans" != [yY]* ]] && { echo "Canceled."; return 0; }
+  fi
+  rm -f "$VIDEO_DIR"/*.mp4 "$CAST_DIR"/*.cast "$CAST_DIR"/*.meta
+  echo -e "${C_GREEN}✓ Cleared all clips and raw casts.${C_RESET}"
+}
+
+cmd_open() {
+  mkdir -p "$VIDEO_DIR"
+  if command -v xdg-open >/dev/null 2>&1; then
+    setsid -f xdg-open "$VIDEO_DIR" </dev/null >/dev/null 2>&1
+    echo -e "Opened ${C_CYAN}${VIDEO_DIR}${C_RESET}"
+  else
+    echo "$VIDEO_DIR"
+  fi
+}
+
+case "${1:-help}" in
+  init) shift; cmd_init "${1:-}" ;;
+  status|st) cmd_status ;;
+  auto) shift; cmd_auto "${1:-}" ;;
+  config|cfg) shift; cmd_config "$@" ;;
+  doctor|check) cmd_doctor ;;
+  list|ls) cmd_list ;;
+  render) shift; casts2mp4 ${1:+--speed "$1"} ;;
+  open) cmd_open ;;
+  clear|clean) shift; cmd_clear "${1:-}" ;;
+  version|-v|--version) echo "rec-cli ${VERSION}" ;;
+  help|-h|--help) show_help ;;
+  start|on|stop|off|cancel|discard)
+    echo "Shell integration required for 'rec $1'." >&2
+    echo "Add one of these to your shell config and reload:" >&2
+    echo '  Zsh:  eval "$(rec-cli init zsh)"' >&2
+    echo '  Bash: eval "$(rec-cli init bash)"' >&2
+    echo '  Fish: rec-cli init fish | source' >&2
+    exit 1
+    ;;
+  *)
+    echo "Unknown subcommand: $1" >&2
+    show_help
+    exit 1
+    ;;
+esac

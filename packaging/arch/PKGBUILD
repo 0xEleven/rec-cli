@@ -1,0 +1,33 @@
+# Maintainer: 0xEleven <0xEleven@users.noreply.github.com>
+pkgname=rec-cli
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Smart terminal clip recorder CLI for Zsh, Bash, and Fish (2x speed, 5-min chunks, process-named MP4s)"
+arch=('any')
+url="https://github.com/0xEleven/rec-cli"
+license=('MIT')
+depends=('bash' 'python' 'asciinema' 'ffmpeg' 'util-linux')
+optdepends=(
+  'asciinema-agg: render .cast files to 1080p MP4 clips (or install agg binary)'
+  'zsh: Zsh shell integration'
+  'fish: Fish shell integration'
+  'starship: live red REC prompt badge'
+)
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/0xEleven/rec-cli/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  install -Dm755 bin/rec-cli    "${pkgdir}/usr/bin/rec-cli"
+  install -Dm755 bin/cast2mp4   "${pkgdir}/usr/bin/cast2mp4"
+  install -Dm755 bin/casts2mp4  "${pkgdir}/usr/bin/casts2mp4"
+
+  install -Dm644 shell/rec.zsh  "${pkgdir}/usr/share/rec-cli/shell/rec.zsh"
+  install -Dm644 shell/rec.bash "${pkgdir}/usr/share/rec-cli/shell/rec.bash"
+  install -Dm644 shell/rec.fish "${pkgdir}/usr/share/rec-cli/shell/rec.fish"
+  install -Dm644 starship/rec-module.toml "${pkgdir}/usr/share/rec-cli/starship/rec-module.toml"
+
+  install -Dm644 LICENSE   "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

@@ -1,0 +1,9 @@
+# Optional Starship prompt badge — add `${custom.rec}` to your format string
+# in ~/.config/starship.toml and paste this module below:
+
+[custom.rec]
+when = 'test -n "$ASCIINEMA_REC"'
+command = 'echo "REC"'
+symbol = "●"
+style = "bg:#f7768e fg:#1a1b26 bold"
+format = '[](#f7768e)[ $symbol $output ]($style)[](#f7768e) '
