@@ -717,7 +717,7 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def _scan_proc_table() -> dict[int, dict]:
-    """Snapshot current user's processes from /proc."""
+    """Snapshot current user's live (non-zombie) processes from /proc."""
     uid = os.getuid()
     procs: dict[int, dict] = {}
     try:
@@ -736,12 +736,17 @@ def _scan_proc_table() -> dict[int, dict]:
                     continue
                 comm = st[lp + 1:rp]
                 fields = st[rp + 2:].split()
+                state_ch = fields[0]
+                if state_ch in ("Z", "X"):
+                    continue
                 ppid = int(fields[1])
+                tty_nr = int(fields[4])
                 with open(f"{entry.path}/cmdline", "rb") as f:
                     parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\x00") if x]
                 procs[pid] = {
                     "pid": pid,
                     "ppid": ppid,
+                    "tty_nr": tty_nr,
                     "comm": comm,
                     "parts": parts,
                 }
@@ -771,11 +776,14 @@ def _read_proc_env_var(pid: int, key: str) -> str:
     return ""
 
 
-def _has_pts_stdin(pid: int) -> bool:
+def _get_pts_path(pid: int) -> str:
     try:
-        return os.readlink(f"/proc/{pid}/fd/0").startswith("/dev/pts/")
+        target = os.readlink(f"/proc/{pid}/fd/0")
+        if target.startswith("/dev/pts/") and not target.endswith("(deleted)"):
+            return target
     except OSError:
-        return False
+        pass
+    return ""
 
 
 def _deepest_fg_cmd(root_pid: int, children_map: dict[int, list[int]], procs: dict[int, dict]) -> str:
@@ -788,13 +796,36 @@ def _deepest_fg_cmd(root_pid: int, children_map: dict[int, list[int]], procs: di
         cur = max(kids)
         visited.add(cur)
     if cur != root_pid and cur in procs:
+        if procs[cur]["comm"] in SHELL_COMMS:
+            return ""
         parts = procs[cur]["parts"]
+        if parts and os.path.basename(parts[0]) in SHELL_COMMS and len(parts) == 1:
+            return ""
         return " ".join(parts)[:80] if parts else procs[cur]["comm"]
     return ""
 
 
+def _mark_shell_ancestors(pid: int, covered: set[int], procs: dict[int, dict]) -> None:
+    """Also cover parent shell(s) that spawned a recorder without `exec` so tabs never duplicate."""
+    cur = pid
+    for _ in range(3):
+        info = procs.get(cur)
+        if not info:
+            break
+        ppid = info["ppid"]
+        pinfo = procs.get(ppid)
+        if not pinfo or pinfo["comm"] not in SHELL_COMMS:
+            break
+        covered.add(ppid)
+        cur = ppid
+
+
 def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
-    """Return (managed_sessions, open_unrecorded_terminals, running_counts_by_terminal)."""
+    """Return (managed_sessions, open_unrecorded_terminals, running_counts_by_terminal).
+
+    Only includes processes attached to a live, currently open terminal window —
+    orphaned/closed-tab processes and parent-shell duplicates are strictly filtered out.
+    """
     procs = _scan_proc_table()
     children_map: dict[int, list[int]] = {}
     for pid, info in procs.items():
@@ -802,6 +833,7 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
 
     managed: list[dict] = []
     covered_pids: set[int] = set()
+    covered_pts: set[str] = set()
     running_counts: dict[str, int] = {}
 
     # 1. Live rec-pty managed sessions
@@ -810,7 +842,7 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 pid = int(data.get("pid", 0))
-                if pid <= 0 or not is_pid_alive(pid):
+                if pid <= 0 or pid not in procs or not is_pid_alive(pid):
                     p.unlink(missing_ok=True)
                     (ACTIVE_DIR / str(pid)).unlink(missing_ok=True)
                     continue
@@ -819,16 +851,23 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
                     data["cast_size"] = os.path.getsize(cast)
                 managed.append(data)
                 covered_pids.add(pid)
+                _mark_shell_ancestors(pid, covered_pids, procs)
+                pts = _get_pts_path(pid)
+                if pts:
+                    covered_pts.add(pts)
                 cpid = int(data.get("child_pid", 0))
                 if cpid > 0:
                     covered_pids.add(cpid)
+                    cpts = _get_pts_path(cpid)
+                    if cpts:
+                        covered_pts.add(cpts)
                 term = (data.get("terminal") or "").lower()
                 if term:
                     running_counts[term] = running_counts.get(term, 0) + 1
             except Exception:
                 continue
 
-    # 2. Legacy pre-v1.3.0 asciinema rec sessions
+    # 2. Legacy pre-v1.3.0 asciinema rec sessions — ONLY if attached to a currently open terminal window
     for pid, info in procs.items():
         if pid in covered_pids:
             continue
@@ -837,50 +876,57 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
             continue
         base0 = os.path.basename(parts[0])
         if ("asciinema" in base0 or any("asciinema" in x for x in parts[:2])) and "rec" in parts[1:4]:
+            term = _detect_ancestor_terminal(pid, procs)
+            pts = _get_pts_path(pid)
+            # Skip orphaned asciinema processes whose terminal window was already closed
+            if not term or not pts:
+                continue
             cast = next((x for x in reversed(parts) if x.endswith(".cast")), "")
             started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
             cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
-            # Find child shell for accurate cwd / terminal
             child_shell = next((k for k in children_map.get(pid, []) if procs.get(k, {}).get("comm") in SHELL_COMMS), 0)
             cwd = _read_proc_cwd(child_shell or pid)
-            term = _detect_ancestor_terminal(pid, procs) or "legacy"
+            fg = _deepest_fg_cmd(child_shell or pid, children_map, procs)
             managed.append({
                 "pid": pid,
                 "child_pid": child_shell,
                 "state": "recording",
-                "name": "legacy-asciinema",
+                "name": "old-tab",
                 "terminal": term,
                 "cast": cast,
                 "meta": "",
                 "cwd": cwd,
-                "fg_cmd": _deepest_fg_cmd(child_shell or pid, children_map, procs) or "asciinema rec (old tab)",
+                "fg_cmd": fg,
                 "last_cmd": "",
                 "started_at": started_at,
                 "cast_size": cast_size,
                 "legacy": True,
             })
             covered_pids.add(pid)
+            covered_pts.add(pts)
+            _mark_shell_ancestors(pid, covered_pids, procs)
             if child_shell:
                 covered_pids.add(child_shell)
-            if term != "legacy":
-                running_counts[term] = running_counts.get(term, 0) + 1
+                cpts = _get_pts_path(child_shell)
+                if cpts:
+                    covered_pts.add(cpts)
+            running_counts[term] = running_counts.get(term, 0) + 1
 
-    # 3. Already-running unrecorded terminal shells (Kitty, Tabby, Alacritty, etc.)
+    # 3. Currently open unrecorded terminal tabs (Kitty, Tabby, Alacritty, etc.)
     open_unrecorded: list[dict] = []
     for pid, info in procs.items():
         if pid in covered_pids:
             continue
-        if info["comm"] not in SHELL_COMMS:
+        if info["comm"] not in SHELL_COMMS or info["comm"] == "sh":
             continue
-        # Skip non-interactive helper shells or shells already inside rec-pty/asciinema
         if _has_ancestor_in(pid, covered_pids, procs):
             continue
-        if not _has_pts_stdin(pid):
+        pts = _get_pts_path(pid)
+        if not pts or pts in covered_pts or info["tty_nr"] == 0:
             continue
         term = _detect_ancestor_terminal(pid, procs)
         if not term:
             continue
-        # Avoid counting nested subshell (parent is also an interactive shell under same terminal)
         parent = procs.get(info["ppid"])
         if parent and parent["comm"] in SHELL_COMMS:
             continue
@@ -898,14 +944,10 @@ def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
             "kitty_sock": kitty_sock,
             "kitty_win": kitty_win,
         })
+        covered_pts.add(pts)
         running_counts[term] = running_counts.get(term, 0) + 1
 
-    # Also count running terminal emulators even if no unrecorded shells matched
-    for pid, info in procs.items():
-        tid = _match_term_proc(info)
-        if tid and tid not in running_counts:
-            running_counts[tid] = 0
-
+    # Only mark a terminal emulator as running if it has at least one live window/tab
     order = {"recording": 0, "paused": 1, "standby": 2}
     managed.sort(key=lambda x: (order.get(x.get("state", "standby"), 2), x.get("pid", 0)))
     open_unrecorded.sort(key=lambda x: (x["terminal"], x["pid"]))

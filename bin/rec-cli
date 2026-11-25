@@ -193,9 +193,17 @@ def is_alive(pid: int) -> bool:
 
 
 def load_legacy_asciinema() -> list[dict]:
-    """Detect pre-v1.3.0 `asciinema rec` wrapper sessions so `rec ps` never hides them."""
+    """Detect live pre-v1.3.0 `asciinema rec` sessions still attached to an open terminal."""
     uid = os.getuid()
-    found = []
+    term_names = {
+        "kitty": "kitty", "tabby": "tabby", "alacritty": "alacritty",
+        "wezterm": "wezterm", "wezterm-gui": "wezterm", "ghostty": "ghostty",
+        "foot": "foot", "konsole": "konsole", "gnome-terminal": "gnome-terminal",
+        "gnome-terminal-": "gnome-terminal", "gnome-terminal-server": "gnome-terminal",
+        "kgx": "gnome-terminal", "xfce4-terminal": "xfce4-terminal",
+        "tilix": "tilix", "terminator": "terminator", "xterm": "xterm",
+    }
+    procs = {}
     try:
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
@@ -204,41 +212,80 @@ def load_legacy_asciinema() -> list[dict]:
             try:
                 if os.stat(entry.path).st_uid != uid:
                     continue
+                with open(f"{entry.path}/stat", "r", encoding="utf-8", errors="replace") as f:
+                    st = f.read()
+                lp, rp = st.find("("), st.rfind(")")
+                if lp == -1 or rp == -1:
+                    continue
+                comm = st[lp + 1:rp]
+                fields = st[rp + 2:].split()
+                if fields[0] in ("Z", "X"):
+                    continue
                 with open(f"{entry.path}/cmdline", "rb") as f:
                     parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\x00") if x]
-                if not parts:
-                    continue
-                joined = " ".join(parts)
-                if "asciinema" not in os.path.basename(parts[0]) and not any("asciinema" in p for p in parts[:2]):
-                    continue
-                if "rec" not in parts[1:4]:
-                    continue
-                cast = next((p for p in reversed(parts) if p.endswith(".cast")), "")
-                started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
-                cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
-                try:
-                    cwd = os.readlink(f"{entry.path}/cwd")
-                except OSError:
-                    cwd = ""
-                found.append({
-                    "pid": pid,
-                    "child_pid": 0,
-                    "state": "recording",
-                    "name": "legacy",
-                    "terminal": "old-tab",
-                    "cast": cast,
-                    "meta": "",
-                    "cwd": cwd,
-                    "fg_cmd": "asciinema rec (old tab — type 'exit' to finish)",
-                    "last_cmd": "",
-                    "started_at": started_at,
-                    "cast_size": cast_size,
-                    "legacy": True,
-                })
+                procs[pid] = {"ppid": int(fields[1]), "comm": comm, "parts": parts}
             except OSError:
                 continue
     except OSError:
-        pass
+        return []
+
+    def ancestor_term(pid: int) -> str:
+        cur = pid
+        for _ in range(7):
+            info = procs.get(cur)
+            if not info or info["ppid"] <= 1 or info["ppid"] == cur:
+                break
+            pinfo = procs.get(info["ppid"])
+            if not pinfo:
+                break
+            c = pinfo["comm"].lower()
+            if c in term_names:
+                return term_names[c]
+            if pinfo["parts"]:
+                b = os.path.basename(pinfo["parts"][0]).lower()
+                if b in term_names:
+                    return term_names[b]
+                if "tabby" in " ".join(pinfo["parts"][:2]).lower():
+                    return "tabby"
+            cur = info["ppid"]
+        return ""
+
+    found = []
+    for pid, info in procs.items():
+        parts = info["parts"]
+        if not parts:
+            continue
+        if ("asciinema" in os.path.basename(parts[0]) or any("asciinema" in p for p in parts[:2])) and "rec" in parts[1:4]:
+            term = ancestor_term(pid)
+            try:
+                pts = os.readlink(f"/proc/{pid}/fd/0")
+            except OSError:
+                pts = ""
+            # Skip orphaned processes from closed windows
+            if not term or not pts.startswith("/dev/pts/") or pts.endswith("(deleted)"):
+                continue
+            cast = next((p for p in reversed(parts) if p.endswith(".cast")), "")
+            started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
+            cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                cwd = ""
+            found.append({
+                "pid": pid,
+                "child_pid": 0,
+                "state": "recording",
+                "name": "old-tab",
+                "terminal": term,
+                "cast": cast,
+                "meta": "",
+                "cwd": cwd,
+                "fg_cmd": "asciinema rec (old tab — type 'exit' to finish)",
+                "last_cmd": "",
+                "started_at": started_at,
+                "cast_size": cast_size,
+                "legacy": True,
+            })
     return found
 
 
