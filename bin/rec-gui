@@ -1737,10 +1737,8 @@ class RecGuiWindow(QMainWindow):
             send_session_cmd(pid, f"mark {label.strip()}")
             self._show_toast("Marker added")
         elif verb == "start":
-            name, ok = QInputDialog.getText(self, f"Record PID {pid}", "Clip name (leave blank to auto-name):")
-            if not ok:
-                return
-            send_session_cmd(pid, f"start {name.strip()}".strip())
+            # Instant 1-click in-place recording on this live terminal (no modal popup)
+            send_session_cmd(pid, "start")
             self._show_toast(f"Recording PID {pid}")
         elif verb == "kill":
             ans = QMessageBox.question(self, "Terminate Session", f"Terminate process PID {pid}?")
@@ -2045,16 +2043,17 @@ class RecGuiWindow(QMainWindow):
         btns.setSpacing(6)
 
         can_remote = bool(o.get("kitty_sock") and o.get("kitty_win"))
-        b_attach = QPushButton("Start Rec" if can_remote else "Copy rec start")
         if can_remote:
+            b_attach = QPushButton("Record")
             b_attach.setObjectName("recBtn")
-        b_attach.clicked.connect(lambda _c=False, info=o: self._attach_open_terminal(info))
-        btns.addWidget(b_attach)
-
-        b_new = QPushButton("Record Here")
-        b_new.setObjectName("primaryBtn")
-        b_new.clicked.connect(lambda _c=False, t=term, c=o.get("cwd", ""): self._launch_recorded_terminal(t, c))
-        btns.addWidget(b_new)
+            b_attach.setToolTip("Start recording inside this existing Kitty tab")
+            b_attach.clicked.connect(lambda _c=False, info=o: self._attach_open_terminal(info))
+            btns.addWidget(b_attach)
+        else:
+            b_copy = QPushButton("Copy rec start")
+            b_copy.setToolTip("Opened before standby hook. Paste 'rec start' in this tab, or reopen it for 1-click in-place recording.")
+            b_copy.clicked.connect(lambda _c=False, info=o: self._attach_open_terminal(info))
+            btns.addWidget(b_copy)
 
         # Tighten card buttons so all controls always fit cleanly without clipping
         for i in range(btns.count()):

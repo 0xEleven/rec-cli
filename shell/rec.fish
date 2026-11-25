@@ -32,6 +32,28 @@ function _rec_load_config
 end
 _rec_load_config
 
+function _rec_detect_terminal
+    if set -q KITTY_WINDOW_ID; or set -q KITTY_PID; or test "$TERM" = "xterm-kitty"
+        echo "kitty"
+    else if test "$TERM_PROGRAM" = "Tabby"
+        echo "tabby"
+    else if set -q ALACRITTY_WINDOW_ID; or set -q ALACRITTY_SOCKET; or test "$TERM" = "alacritty"
+        echo "alacritty"
+    else if test "$TERM_PROGRAM" = "WezTerm"; or set -q WEZTERM_PANE
+        echo "wezterm"
+    else if test "$TERM_PROGRAM" = "ghostty"; or set -q GHOSTTY_RESOURCES_DIR
+        echo "ghostty"
+    else if test "$TERM" = "foot"; or test "$TERM" = "foot-extra"
+        echo "foot"
+    else if set -q KONSOLE_VERSION
+        echo "konsole"
+    else if set -q GNOME_TERMINAL_SCREEN; or set -q VTE_VERSION
+        echo "gnome-terminal"
+    else if begin; set -q DISPLAY; or set -q WAYLAND_DISPLAY; end; and string match -q 'xterm*' -- "$TERM"
+        echo "xterm"
+    end
+end
+
 function _rec_is_allowed_terminal
     set -l allowed "kitty,tabby"
     if set -q REC_TERMINALS
@@ -41,26 +63,7 @@ function _rec_is_allowed_terminal
     if string match -q '*,all,*' -- "$allowed_lc"
         return 0
     end
-
-    set -l cur ""
-    if set -q KITTY_WINDOW_ID; or set -q KITTY_PID; or test "$TERM" = "xterm-kitty"
-        set cur "kitty"
-    else if test "$TERM_PROGRAM" = "Tabby"
-        set cur "tabby"
-    else if set -q ALACRITTY_WINDOW_ID; or set -q ALACRITTY_SOCKET; or test "$TERM" = "alacritty"
-        set cur "alacritty"
-    else if test "$TERM_PROGRAM" = "WezTerm"; or set -q WEZTERM_PANE
-        set cur "wezterm"
-    else if test "$TERM_PROGRAM" = "ghostty"; or set -q GHOSTTY_RESOURCES_DIR
-        set cur "ghostty"
-    else if test "$TERM" = "foot"; or test "$TERM" = "foot-extra"
-        set cur "foot"
-    else if set -q KONSOLE_VERSION
-        set cur "konsole"
-    else if set -q GNOME_TERMINAL_SCREEN; or set -q VTE_VERSION
-        set cur "gnome-terminal"
-    end
-
+    set -l cur (_rec_detect_terminal)
     test -n "$cur"; and string match -q "*,{$cur},*" -- "$allowed_lc"
 end
 
@@ -104,16 +107,14 @@ if set -q _TERM_REC_META
     end
 end
 
-# Auto-wrap allowed terminals with rec-pty
+# Wrap interactive desktop terminals in rec-pty (recording if allowed + auto ON, else silent standby for 1-click in-place recording)
 set -l _rec_auto_off "$HOME/.config/rec-cli/auto-disabled"
 if set -q XDG_CONFIG_HOME
     set _rec_auto_off "$XDG_CONFIG_HOME/rec-cli/auto-disabled"
 end
 
 if status is-interactive
-    and _rec_is_allowed_terminal
-    and not test -f "$_rec_auto_off"
-    and not test -f "$HOME/.config/term-rec/auto-disabled"
+    and test -n "(_rec_detect_terminal)"
     and test "$TERM" != "dumb"
     and not set -q REC_PTY_PID
     and not set -q ASCIINEMA_REC
@@ -126,5 +127,11 @@ if status is-interactive
     if type -q casts2mp4
         casts2mp4 --bg
     end
-    exec rec-pty -- fish
+    if _rec_is_allowed_terminal
+        and not test -f "$_rec_auto_off"
+        and not test -f "$HOME/.config/term-rec/auto-disabled"
+        exec rec-pty -- fish
+    else
+        exec rec-pty --standby -- fish
+    end
 end

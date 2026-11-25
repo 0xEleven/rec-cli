@@ -10,30 +10,34 @@ _rec_load_config() {
 }
 _rec_load_config
 
+_rec_detect_terminal() {
+  if [[ -n "${KITTY_WINDOW_ID:-}" || -n "${KITTY_PID:-}" || "${TERM:-}" == "xterm-kitty" ]]; then
+    echo "kitty"
+  elif [[ "${TERM_PROGRAM:-}" == "Tabby" ]]; then
+    echo "tabby"
+  elif [[ -n "${ALACRITTY_WINDOW_ID:-}" || -n "${ALACRITTY_SOCKET:-}" || "${TERM:-}" == "alacritty" ]]; then
+    echo "alacritty"
+  elif [[ "${TERM_PROGRAM:-}" == "WezTerm" || -n "${WEZTERM_PANE:-}" ]]; then
+    echo "wezterm"
+  elif [[ "${TERM_PROGRAM:-}" == "ghostty" || -n "${GHOSTTY_RESOURCES_DIR:-}" ]]; then
+    echo "ghostty"
+  elif [[ "${TERM:-}" == "foot" || "${TERM:-}" == "foot-extra" ]]; then
+    echo "foot"
+  elif [[ -n "${KONSOLE_VERSION:-}" ]]; then
+    echo "konsole"
+  elif [[ -n "${GNOME_TERMINAL_SCREEN:-}" || -n "${VTE_VERSION:-}" ]]; then
+    echo "gnome-terminal"
+  elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" && "${TERM:-}" == xterm* ]]; then
+    echo "xterm"
+  fi
+}
+
 _rec_is_allowed_terminal() {
   local allowed="${REC_TERMINALS:-kitty,tabby}"
   local allowed_lc="${allowed,,}"
   [[ ",${allowed_lc}," == *",all,"* ]] && return 0
-
-  local cur=""
-  if [[ -n "${KITTY_WINDOW_ID:-}" || -n "${KITTY_PID:-}" || "${TERM:-}" == "xterm-kitty" ]]; then
-    cur="kitty"
-  elif [[ "${TERM_PROGRAM:-}" == "Tabby" ]]; then
-    cur="tabby"
-  elif [[ -n "${ALACRITTY_WINDOW_ID:-}" || -n "${ALACRITTY_SOCKET:-}" || "${TERM:-}" == "alacritty" ]]; then
-    cur="alacritty"
-  elif [[ "${TERM_PROGRAM:-}" == "WezTerm" || -n "${WEZTERM_PANE:-}" ]]; then
-    cur="wezterm"
-  elif [[ "${TERM_PROGRAM:-}" == "ghostty" || -n "${GHOSTTY_RESOURCES_DIR:-}" ]]; then
-    cur="ghostty"
-  elif [[ "${TERM:-}" == "foot" || "${TERM:-}" == "foot-extra" ]]; then
-    cur="foot"
-  elif [[ -n "${KONSOLE_VERSION:-}" ]]; then
-    cur="konsole"
-  elif [[ -n "${GNOME_TERMINAL_SCREEN:-}" || -n "${VTE_VERSION:-}" ]]; then
-    cur="gnome-terminal"
-  fi
-
+  local cur
+  cur="$(_rec_detect_terminal)"
   [[ -n "$cur" && ",${allowed_lc}," == *",${cur},"* ]]
 }
 
@@ -79,10 +83,8 @@ if [[ -n "${_TERM_REC_META:-}" ]]; then
   trap '_rec_bash_preexec' DEBUG
 fi
 
-# Auto-wrap allowed terminals with rec-pty
-if _rec_is_allowed_terminal \
-  && [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/auto-disabled" ]] \
-  && [[ ! -f "$HOME/.config/term-rec/auto-disabled" ]] \
+# Wrap interactive desktop terminals in rec-pty (recording if allowed + auto ON, otherwise silent standby for 1-click in-place recording)
+if [[ -n "$(_rec_detect_terminal)" ]] \
   && [[ $- == *i* ]] \
   && [[ -t 0 && -t 1 ]] \
   && [[ "${TERM:-}" != "dumb" ]] \
@@ -91,5 +93,11 @@ if _rec_is_allowed_terminal \
   && command -v rec-pty >/dev/null 2>&1; then
   mkdir -p "$TERM_REC_DIR/casts" "$TERM_VIDEO_DIR"
   command -v casts2mp4 >/dev/null 2>&1 && casts2mp4 --bg
-  exec rec-pty -- "${SHELL:-bash}"
+  if _rec_is_allowed_terminal \
+    && [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/auto-disabled" ]] \
+    && [[ ! -f "$HOME/.config/term-rec/auto-disabled" ]]; then
+    exec rec-pty -- "${SHELL:-bash}"
+  else
+    exec rec-pty --standby -- "${SHELL:-bash}"
+  fi
 fi
