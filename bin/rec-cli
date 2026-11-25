@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rec-cli — Smart terminal clip recorder CLI (v1.1.0)
+# rec-cli — Terminal clip recorder CLI (v1.2.0)
 # Works across Linux distros with Zsh, Bash, and Fish.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli"
 CONF_FILE="$CONF_DIR/config"
@@ -23,9 +23,66 @@ REC_SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
 REC_MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
 REC_TERMINALS="${REC_TERMINALS:-kitty,tabby}"
 REC_THEME="${REC_THEME:-tokyo-night}"
-REC_RESOLUTION="${REC_RESOLUTION:-4k}"
+REC_RESOLUTION="${REC_RESOLUTION:-auto}"
 REC_FRAME="${REC_FRAME:-on}"
 REC_REDACT="${REC_REDACT:-on}"
+REC_REELS_COPY="${REC_REELS_COPY:-off}"
+
+detect_display_info() {
+  local dims="" w=0 h=0 preset="1080p"
+
+  if [[ -z "$dims" ]] && command -v hyprctl >/dev/null 2>&1; then
+    dims="$(hyprctl monitors 2>/dev/null | grep -oE '[0-9]{3,4}x[0-9]{3,4}@' | head -n 1 | tr -d '@' || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v wlr-randr >/dev/null 2>&1; then
+    dims="$(wlr-randr 2>/dev/null | grep -E 'current' | grep -oE '[0-9]{3,4}x[0-9]{3,4}' | head -n 1 || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v swaymsg >/dev/null 2>&1; then
+    dims="$(swaymsg -t get_outputs 2>/dev/null | python3 -c 'import json,sys; o=[x for x in json.load(sys.stdin) if x.get("active")]; m=o[0]["current_mode"] if o else {}; print(f"{m[\"width\"]}x{m[\"height\"]}") if m else None' 2>/dev/null || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v kscreen-doctor >/dev/null 2>&1; then
+    dims="$(kscreen-doctor -o 2>/dev/null | grep -oE '[0-9]{3,4}x[0-9]{3,4}@[^ ]*\*' | head -n 1 | cut -d@ -f1 || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v xrandr >/dev/null 2>&1; then
+    dims="$(xrandr --current 2>/dev/null | grep '\*' | grep -oE '[0-9]{3,4}x[0-9]{3,4}' | head -n 1 || true)"
+  fi
+  if [[ -z "$dims" ]]; then
+    local best_area=0 f st dir mode cw ch area
+    for f in /sys/class/drm/*/status; do
+      [[ -f "$f" ]] || continue
+      st="$(cat "$f" 2>/dev/null || true)"
+      [[ "$st" == "connected" ]] || continue
+      dir="$(dirname "$f")"
+      mode="$(head -n 1 "$dir/modes" 2>/dev/null || true)"
+      if [[ "$mode" =~ ^([0-9]+)x([0-9]+) ]]; then
+        cw="${BASH_REMATCH[1]}"
+        ch="${BASH_REMATCH[2]}"
+        area=$(( cw * ch ))
+        if (( area > best_area )); then
+          best_area=$area
+          dims="${cw}x${ch}"
+        fi
+      fi
+    done
+  fi
+
+  if [[ "$dims" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    w="${BASH_REMATCH[1]}"
+    h="${BASH_REMATCH[2]}"
+    if (( w >= 3840 || h >= 2160 )); then
+      preset="4k"
+    elif (( w >= 2560 || h >= 1440 )); then
+      preset="1440p"
+    elif (( w >= 1920 || h >= 1080 )); then
+      preset="1080p"
+    else
+      preset="720p"
+    fi
+    echo "${dims} -> ${preset}"
+  else
+    echo "unknown -> 1080p"
+  fi
+}
 
 find_share_dir() {
   local script_dir
@@ -56,32 +113,34 @@ C_YELLOW=$'\033[38;2;224;175;104m'
 
 show_help() {
   cat <<EOF
-${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} — Up-to-4K Terminal Clip Recorder for Linux (Zsh, Bash, Fish)
+${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} - Terminal Clip Recorder for Linux (Zsh, Bash, Fish)
 
 ${C_CYAN}Session Control:${C_RESET}
-  ${C_BOLD}rec start [name]${C_RESET}       Start recording this terminal (auto-named by process if omitted)
-  ${C_BOLD}rec stop${C_RESET}               Stop recording & render MP4 in background (keeps tab open)
-  ${C_BOLD}rec cancel${C_RESET}             Stop recording & discard the take (saves nothing)
-  ${C_BOLD}rec mark <label>${C_RESET}       Drop a YouTube chapter marker during an active recording
-  ${C_BOLD}rec status${C_RESET}             Show live recording state, config & clip stats
+  ${C_BOLD}rec start [name]${C_RESET}          Start recording this terminal (auto-named by process if omitted)
+  ${C_BOLD}rec stop${C_RESET}                  Stop recording & render MP4 in background (keeps tab open)
+  ${C_BOLD}rec cancel${C_RESET}                Stop recording & discard the take (saves nothing)
+  ${C_BOLD}rec mark <label>${C_RESET}          Drop a YouTube chapter marker during an active recording
+  ${C_BOLD}rec status${C_RESET}                Show live recording state, config & clip stats
 
 ${C_CYAN}Content Tools:${C_RESET}
-  ${C_BOLD}rec list${C_RESET}               List saved MP4 clips in ${VIDEO_DIR}
-  ${C_BOLD}rec play [clip|latest]${C_RESET} Preview the latest (or named) clip in your video player
-  ${C_BOLD}rec gif [clip|latest]${C_RESET}  Export a high-quality palette GIF for READMEs / Discord / X
-  ${C_BOLD}rec thumb [clip|latest]${C_RESET} Extract a crisp PNG thumbnail frame from a clip
-  ${C_BOLD}rec trim <clip> <start> <end>${C_RESET} Lossless fast trim (e.g. rec trim latest 00:05 01:20)
-  ${C_BOLD}rec stats${C_RESET}              Show total runtime, disk usage, and top recorded tools
-  ${C_BOLD}rec render [speed]${C_RESET}     Convert pending finished .cast files now (default: ${REC_SPEED}x)
-  ${C_BOLD}rec open${C_RESET}               Open clips folder in your file manager
-  ${C_BOLD}rec clear [--yes]${C_RESET}      Delete saved MP4 clips and raw casts
+  ${C_BOLD}rec list${C_RESET}                  List saved MP4 clips in ${VIDEO_DIR}
+  ${C_BOLD}rec play [clip|latest]${C_RESET}    Preview the latest (or named) clip
+  ${C_BOLD}rec gif [clip|latest]${C_RESET}     Export a palette-optimized GIF for READMEs / Discord / X
+  ${C_BOLD}rec thumb [clip|latest]${C_RESET}   Extract a PNG thumbnail frame from a clip
+  ${C_BOLD}rec trim <clip> <st> <en>${C_RESET} Lossless fast trim (e.g. rec trim latest 00:05 01:20)
+  ${C_BOLD}rec reels <file.cast>${C_RESET}     Render a 9:16 TikTok/Reels cursor-following clip (zero crop)
+  ${C_BOLD}rec stats${C_RESET}                 Show total runtime, disk usage, and top recorded tools
+  ${C_BOLD}rec render [speed]${C_RESET}        Convert pending finished .cast files now
+  ${C_BOLD}rec open${C_RESET}                  Open clips folder in your file manager
+  ${C_BOLD}rec clear [--yes]${C_RESET}         Delete saved MP4 clips and raw casts
 
 ${C_CYAN}Auto-Record & Configuration:${C_RESET}
-  ${C_BOLD}rec auto on|off${C_RESET}        Toggle auto-recording on new allowed terminal tabs
-  ${C_BOLD}rec config [key val]${C_RESET}   Configure resolution (720p|1080p|1440p|4k|vertical), speed, frame, redact, theme, terminals
-  ${C_BOLD}rec init <shell>${C_RESET}       Print shell integration for zsh, bash, or fish
-  ${C_BOLD}rec doctor${C_RESET}             Check dependencies & print distro install commands
-  ${C_BOLD}rec version${C_RESET}            Print version
+  ${C_BOLD}rec auto on|off${C_RESET}           Toggle auto-recording on new allowed terminal tabs
+  ${C_BOLD}rec config auto${C_RESET}           Auto-pick resolution from this device's screen
+  ${C_BOLD}rec config [key val]${C_RESET}      Configure resolution, reels-copy, speed, frame, redact, theme, terminals
+  ${C_BOLD}rec init <shell>${C_RESET}          Print shell integration for zsh, bash, or fish
+  ${C_BOLD}rec doctor${C_RESET}                Check dependencies & display resolution
+  ${C_BOLD}rec version${C_RESET}               Print version
 EOF
 }
 
@@ -161,6 +220,8 @@ cmd_mark() {
 
 cmd_status() {
   mkdir -p "$CAST_DIR" "$VIDEO_DIR"
+  local disp_info
+  disp_info="$(detect_display_info)"
   echo -e "${C_PURPLE}${C_BOLD}=== rec-cli v${VERSION} Status ===${C_RESET}"
 
   if [[ -n "${ASCIINEMA_REC:-}" || -n "${_TERM_REC_ACTIVE:-}" ]]; then
@@ -194,7 +255,8 @@ cmd_status() {
   mp4_cnt="$(find "$VIDEO_DIR" -maxdepth 1 -name '*.mp4' 2>/dev/null | wc -l)"
   mp4_size="$(du -sh "$VIDEO_DIR" 2>/dev/null | cut -f1)"
   echo -e "  Saved clips:  ${C_BOLD}${mp4_cnt}${C_RESET} videos (${mp4_size}) in ${C_CYAN}${VIDEO_DIR}${C_RESET}"
-  echo -e "  Settings:     ${C_DIM}${REC_RESOLUTION} | ${REC_SPEED}x | max $((REC_MAX_SECS / 60))m | frame: ${REC_FRAME} | redact: ${REC_REDACT} | theme: ${REC_THEME}${C_RESET}"
+  echo -e "  Display:      ${C_DIM}${disp_info}${C_RESET}"
+  echo -e "  Settings:     ${C_DIM}res: ${REC_RESOLUTION} | reels-copy: ${REC_REELS_COPY} | ${REC_SPEED}x | max $((REC_MAX_SECS / 60))m | frame: ${REC_FRAME} | redact: ${REC_REDACT} | theme: ${REC_THEME}${C_RESET}"
 }
 
 cmd_auto() {
@@ -206,7 +268,7 @@ cmd_auto() {
       ;;
     off|disable|0)
       touch "$AUTO_OFF_FLAG"
-      echo -e "${C_YELLOW}✓ Auto-recording DISABLED${C_RESET} — new tabs won't record unless you run ${C_BOLD}rec start${C_RESET}."
+      echo -e "${C_YELLOW}✓ Auto-recording DISABLED${C_RESET} - new tabs will only record when you run ${C_BOLD}rec start${C_RESET}."
       ;;
     *)
       if is_auto_disabled; then
@@ -230,32 +292,44 @@ set_config_key() {
 }
 
 cmd_config() {
+  local disp_info
+  disp_info="$(detect_display_info)"
+
   if [[ $# -eq 0 ]]; then
     echo -e "${C_PURPLE}${C_BOLD}rec-cli configuration${C_RESET} (${C_DIM}${CONF_FILE}${C_RESET}):"
-    echo "  resolution = ${REC_RESOLUTION}   (720p | 1080p | 1440p | 4k | vertical)"
+    echo "  resolution = ${REC_RESOLUTION}   (auto | 720p | 1080p | 1440p | 4k | reels | reels-4k)"
+    echo "  detected   = ${disp_info}"
+    echo "  reels-copy = ${REC_REELS_COPY}   (on | off - also export a 9:16 cursor-follow Reels clip)"
     echo "  speed      = ${REC_SPEED}x"
     echo "  max-secs   = ${REC_MAX_SECS}s ($((REC_MAX_SECS / 60)) min)"
-    echo "  frame      = ${REC_FRAME}   (on | off — rounded window frame & titlebar)"
-    echo "  redact     = ${REC_REDACT}   (on | off — auto-scrub API keys/tokens/passwords)"
+    echo "  frame      = ${REC_FRAME}   (on | off)"
+    echo "  redact     = ${REC_REDACT}   (on | off)"
     echo "  theme      = ${REC_THEME}   (tokyo-night | dracula | catppuccin | gruvbox | nord)"
     echo "  terminals  = ${REC_TERMINALS}"
     echo "  video-dir  = ${VIDEO_DIR}"
     echo ""
-    echo -e "${C_DIM}Change any setting with: rec config <key> <value>${C_RESET}"
-    echo -e "${C_DIM}  e.g. rec config resolution 4k${C_RESET}"
-    echo -e "${C_DIM}       rec config resolution vertical   # 1080x1920 for TikTok / Shorts / Reels${C_RESET}"
-    echo -e "${C_DIM}       rec config frame on${C_RESET}"
-    echo -e "${C_DIM}       rec config redact on${C_RESET}"
+    echo -e "${C_DIM}Examples:${C_RESET}"
+    echo -e "${C_DIM}  rec config auto                 # auto-pick resolution from your display${C_RESET}"
+    echo -e "${C_DIM}  rec config resolution reels     # 9:16 cursor-following TikTok/Reels mode${C_RESET}"
+    echo -e "${C_DIM}  rec config reels-copy on        # export both landscape + 9:16 Reels clip${C_RESET}"
+    return 0
+  fi
+
+  # Shorthand: `rec config auto` sets resolution=auto based on running device display
+  if [[ "$1" == "auto" && $# -eq 1 ]]; then
+    set_config_key REC_RESOLUTION "auto"
+    echo -e "${C_GREEN}✓ Resolution set to auto${C_RESET} (detected display: ${C_CYAN}${disp_info}${C_RESET})"
     return 0
   fi
 
   local key="$1" val="${2:-}"
   if [[ -z "$val" ]]; then
-    echo "Usage: rec config <resolution|speed|max-secs|frame|redact|theme|terminals|video-dir> <value>" >&2
+    echo "Usage: rec config <auto | resolution|reels-copy|speed|max-secs|frame|redact|theme|terminals|video-dir> <value>" >&2
     exit 1
   fi
   case "$key" in
     resolution|res) set_config_key REC_RESOLUTION "$val" ;;
+    reels-copy|reels) set_config_key REC_REELS_COPY "$val" ;;
     speed)          set_config_key REC_SPEED "$val" ;;
     max-secs)       set_config_key REC_MAX_SECS "$val" ;;
     frame)          set_config_key REC_FRAME "$val" ;;
@@ -265,11 +339,27 @@ cmd_config() {
     video-dir)      set_config_key REC_VIDEO_DIR "$val" ;;
     *)
       echo "Unknown config key: $key" >&2
-      echo "Valid keys: resolution, speed, max-secs, frame, redact, theme, terminals, video-dir" >&2
+      echo "Valid keys: auto, resolution, reels-copy, speed, max-secs, frame, redact, theme, terminals, video-dir" >&2
       exit 1
       ;;
   esac
   echo -e "${C_GREEN}✓ Updated ${key} = ${val}${C_RESET} (saved to ${CONF_FILE})"
+}
+
+cmd_reels() {
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: rec reels <file.cast> [output.mp4]" >&2
+    echo "Tip: or run 'rec config resolution reels' / 'rec config reels-copy on'" >&2
+    exit 1
+  fi
+  local input="$1"
+  local out="${2:-}"
+  if [[ -n "$out" ]]; then
+    cast2mp4 --res reels "$input" "$out"
+  else
+    cast2mp4 --res reels "$input"
+  fi
+  echo -e "${C_GREEN}✓ Rendered 9:16 cursor-following Reels clip to ${VIDEO_DIR}${C_RESET}"
 }
 
 cmd_play() {
@@ -378,6 +468,8 @@ PYEOF
 }
 
 cmd_doctor() {
+  local disp_info
+  disp_info="$(detect_display_info)"
   echo -e "${C_PURPLE}${C_BOLD}=== rec-cli v${VERSION} Dependency Check ===${C_RESET}"
   local missing=0
   for dep in asciinema agg ffmpeg ffprobe python3 flock setsid; do
@@ -389,11 +481,12 @@ cmd_doctor() {
     fi
   done
   if python3 -c "import PIL" 2>/dev/null; then
-    echo -e "  ${C_GREEN}✓${C_RESET} python3-pil  ${C_DIM}(rounded window frame enabled)${C_RESET}"
+    echo -e "  ${C_GREEN}✓${C_RESET} python3-pil  ${C_DIM}(window frames & Reels cursor-follow enabled)${C_RESET}"
   else
-    echo -e "  ${C_YELLOW}•${C_RESET} python3-pil  ${C_DIM}(optional — install pillow for rounded window frames)${C_RESET}"
+    echo -e "  ${C_YELLOW}•${C_RESET} python3-pil  ${C_DIM}(install pillow for window frames & Reels auto-reframe)${C_RESET}"
   fi
   echo ""
+  echo -e "  ${C_CYAN}Display:${C_RESET}        ${disp_info}"
   echo -e "  ${C_CYAN}Resolution:${C_RESET}     ${REC_RESOLUTION}"
   echo -e "  ${C_CYAN}Detected shell:${C_RESET} ${SHELL:-unknown}"
   echo -e "  ${C_CYAN}Allowed terms:${C_RESET}  ${REC_TERMINALS}"
@@ -451,6 +544,7 @@ case "${1:-help}" in
   status|st) cmd_status ;;
   auto) shift; cmd_auto "${1:-}" ;;
   config|cfg) shift; cmd_config "$@" ;;
+  reels|tiktok|shorts) shift; cmd_reels "$@" ;;
   doctor|check) cmd_doctor ;;
   list|ls) cmd_list ;;
   play|preview) shift; cmd_play "${1:-latest}" ;;

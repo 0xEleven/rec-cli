@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# casts2mp4 — Batch-convert finished .cast recordings into up-to-4K 5-min max MP4 clips
-# Part of rec-cli v1.1.0
+# casts2mp4 — Batch-convert finished .cast recordings into auto/4K/Reels 5-min max MP4 clips
+# Part of rec-cli v1.2.0
 
 CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/config"
 if [[ -f "$CONF_FILE" ]]; then
@@ -13,7 +13,7 @@ fi
 BG=0
 KEEP=0
 SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
-RES="${REC_RESOLUTION:-4k}"
+RES="${REC_RESOLUTION:-auto}"
 QUIET=0
 
 while [[ $# -gt 0 ]]; do

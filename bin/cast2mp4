@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cast2mp4 — Smart terminal .cast -> up to 4K MP4 renderer (part of rec-cli v1.1.0)
-# - Resolution presets: 720p, 1080p, 1440p, 4k (3840x2160), vertical (1080x1920 Shorts/TikTok)
-# - Default 2x speed, 60fps H.264 MP4
+# cast2mp4 — Smart terminal .cast -> auto/4K/Reels MP4 renderer (rec-cli v1.2.0)
+# - Resolution presets: auto (detects display), 720p, 1080p, 1440p, 4k, reels (9:16 cursor-follow), reels-4k
+# - Default 2x speed, 60fps H.264 MP4 (30fps smooth camera pan for reels)
 # - Max 5 minutes (300s) per video (auto-splits longer sessions into 5-min parts)
-# - Only renders clips/chunks with BOTH real keyboard input AND terminal output
-# - Skips passive/noisy VPN & log-only sessions (openvpn, tail -f, watch, etc.)
-# - Automatic secret/token redaction (AWS, GitHub, JWT, API keys, passwords)
-# - Optional sleek macOS-style window frame & titlebar overlay
-# - Exports YouTube chapter markers (.chapters.txt) when `rec mark` is used
-# - Names each video/part after the primary tool/process run (e.g. nmap_20261125-134012.mp4)
+# - Input+output gating & OpenVPN/daemon skip
+# - Automatic secret/token redaction
+# - Sleek macOS-style window frame & titlebar overlay
+# - YouTube chapter markers (.chapters.txt) via `rec mark`
+# - Cursor-following auto-reframe for TikTok / Instagram Reels / YouTube Shorts without cropping
 
 CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/config"
 if [[ -f "$CONF_FILE" ]]; then
@@ -25,9 +24,10 @@ MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
 IDLE_LIMIT="${REC_IDLE_LIMIT:-${CAST_IDLE_LIMIT:-1.5}}"
 OUT_DIR="${REC_VIDEO_DIR:-${TERM_VIDEO_DIR:-$HOME/Videos/content}}"
 THEME_NAME="${REC_THEME:-tokyo-night}"
-RESOLUTION="${REC_RESOLUTION:-4k}"
+RESOLUTION="${REC_RESOLUTION:-auto}"
 FRAME_MODE="${REC_FRAME:-on}"
 REDACT_MODE="${REC_REDACT:-on}"
+REELS_COPY="${REC_REELS_COPY:-off}"
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -43,17 +43,19 @@ while [[ $# -gt 0 ]]; do
     --no-frame) FRAME_MODE="off"; shift ;;
     --redact) REDACT_MODE="on"; shift ;;
     --no-redact) REDACT_MODE="off"; shift ;;
+    --reels-copy) REELS_COPY="on"; shift ;;
     -h|--help)
       cat <<EOF
 Usage: cast2mp4 [options] <input.cast> [output.mp4] [speed]
-  --res, -r RES    720p | 1080p | 1440p | 4k (default) | vertical (9:16)
-  --speed, -s N    Playback speed multiplier (default: 2)
-  --max-secs N     Max seconds per clip before splitting (default: 300)
-  --theme NAME     tokyo-night | dracula | catppuccin | gruvbox | nord
+  --res, -r RES          auto | 720p | 1080p | 1440p | 4k | reels | reels-4k | vertical
+  --speed, -s N          Playback speed multiplier (default: 2)
+  --max-secs N           Max seconds per clip before splitting (default: 300)
+  --theme NAME           tokyo-night | dracula | catppuccin | gruvbox | nord
   --frame/--no-frame     Toggle rounded window frame overlay (default: on)
   --redact/--no-redact   Toggle secret/token redaction (default: on)
-  --auto           Apply input+output gating, OpenVPN skip & process naming
-  --cleanup        Delete source .cast + .meta after successful render
+  --reels-copy           Also export a 9:16 cursor-following Reels/TikTok version
+  --auto                 Apply input+output gating, OpenVPN skip & process naming
+  --cleanup              Delete source .cast + .meta after successful render
 EOF
       exit 0
       ;;
@@ -77,8 +79,72 @@ if [[ ! -f "$INPUT" ]]; then
   exit 1
 fi
 
-# Resolve resolution preset -> canvas size, native crisp agg font size, padding, CRF
+# Auto-detect running display resolution (Wayland -> X11 -> Linux DRM sysfs -> fallback 1080p)
+detect_screen_preset() {
+  local dims="" w=0 h=0
+
+  # 1. Wayland compositors
+  if [[ -z "$dims" ]] && command -v hyprctl >/dev/null 2>&1; then
+    dims="$(hyprctl monitors 2>/dev/null | grep -oE '[0-9]{3,4}x[0-9]{3,4}@' | head -n 1 | tr -d '@' || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v wlr-randr >/dev/null 2>&1; then
+    dims="$(wlr-randr 2>/dev/null | grep -E 'current' | grep -oE '[0-9]{3,4}x[0-9]{3,4}' | head -n 1 || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v swaymsg >/dev/null 2>&1; then
+    dims="$(swaymsg -t get_outputs 2>/dev/null | python3 -c 'import json,sys; o=[x for x in json.load(sys.stdin) if x.get("active")]; m=o[0]["current_mode"] if o else {}; print(f"{m[\"width\"]}x{m[\"height\"]}") if m else None' 2>/dev/null || true)"
+  fi
+  if [[ -z "$dims" ]] && command -v kscreen-doctor >/dev/null 2>&1; then
+    dims="$(kscreen-doctor -o 2>/dev/null | grep -oE '[0-9]{3,4}x[0-9]{3,4}@[^ ]*\*' | head -n 1 | cut -d@ -f1 || true)"
+  fi
+  # 2. X11 / XWayland
+  if [[ -z "$dims" ]] && command -v xrandr >/dev/null 2>&1; then
+    dims="$(xrandr --current 2>/dev/null | grep '\*' | grep -oE '[0-9]{3,4}x[0-9]{3,4}' | head -n 1 || true)"
+  fi
+  # 3. Linux kernel DRM sysfs (works everywhere, even headless/TTY)
+  if [[ -z "$dims" ]]; then
+    local best_area=0 f st dir mode cw ch area
+    for f in /sys/class/drm/*/status; do
+      [[ -f "$f" ]] || continue
+      st="$(cat "$f" 2>/dev/null || true)"
+      [[ "$st" == "connected" ]] || continue
+      dir="$(dirname "$f")"
+      mode="$(head -n 1 "$dir/modes" 2>/dev/null || true)"
+      if [[ "$mode" =~ ^([0-9]+)x([0-9]+) ]]; then
+        cw="${BASH_REMATCH[1]}"
+        ch="${BASH_REMATCH[2]}"
+        area=$(( cw * ch ))
+        if (( area > best_area )); then
+          best_area=$area
+          dims="${cw}x${ch}"
+        fi
+      fi
+    done
+  fi
+
+  if [[ "$dims" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    w="${BASH_REMATCH[1]}"
+    h="${BASH_REMATCH[2]}"
+  fi
+
+  if (( w >= 3840 || h >= 2160 )); then
+    echo "4k"
+  elif (( w >= 2560 || h >= 1440 )); then
+    echo "1440p"
+  elif (( w >= 1920 || h >= 1080 )); then
+    echo "1080p"
+  elif (( w > 0 )); then
+    echo "720p"
+  else
+    echo "1080p"
+  fi
+}
+
 RES_LC="${RESOLUTION,,}"
+if [[ "$RES_LC" == "auto" ]]; then
+  RES_LC="$(detect_screen_preset)"
+fi
+
+IS_REELS=0
 case "$RES_LC" in
   720p|hd)
     OUT_W=1280; OUT_H=720; FONT_SIZE=16; INNER_W=1180; INNER_H=620; TITLE_H=34; CRF=18
@@ -92,11 +158,14 @@ case "$RES_LC" in
   4k|2160p|uhd)
     OUT_W=3840; OUT_H=2160; FONT_SIZE=44; INNER_W=3560; INNER_H=1890; TITLE_H=78; CRF=16
     ;;
-  vertical|shorts|tiktok|reels|9:16)
-    OUT_W=1080; OUT_H=1920; FONT_SIZE=24; INNER_W=980; INNER_H=1720; TITLE_H=46; CRF=18
+  reels|tiktok|shorts|vertical|9:16)
+    IS_REELS=1; OUT_W=1080; OUT_H=1920; FONT_SIZE=28; INNER_W=1000; INNER_H=1660; TITLE_H=52; CRF=18
+    ;;
+  reels-4k|tiktok-4k|shorts-4k|vertical-4k)
+    IS_REELS=1; OUT_W=2160; OUT_H=3840; FONT_SIZE=44; INNER_W=2000; INNER_H=3320; TITLE_H=96; CRF=16
     ;;
   *)
-    echo "Unknown resolution '$RESOLUTION' (use: 720p, 1080p, 1440p, 4k, vertical)" >&2
+    echo "Unknown resolution '$RESOLUTION' (use: auto, 720p, 1080p, 1440p, 4k, reels, reels-4k)" >&2
     exit 1
     ;;
 esac
@@ -140,7 +209,7 @@ if [[ "${REDACT_MODE,,}" != "off" && "${REDACT_MODE,,}" != "0" && "${REDACT_MODE
   RENDER_CAST="$WORK_DIR/redacted.cast"
 fi
 
-# Analyze cast + meta sidecar (and optionally write secret-redacted cast copy + chapter maps)
+# Analyze cast + meta sidecar (redaction, input+output gate, OpenVPN skip, chapters, cursor track)
 PLAN="$(python3 - "$INPUT" "$META_FILE" "$IDLE_LIMIT" "$SPEED" "$MAX_SECS" "$AUTO_MODE" "$RENDER_CAST" "$WORK_DIR" <<'PYEOF'
 import json
 import os
@@ -254,8 +323,77 @@ def extract_tool(cmdline: str) -> tuple[str, bool, bool]:
     return (sanitize(cmd), is_skip, is_trivial)
 
 
+# Lightweight VT100 cursor & active-width tracker for smooth Reels auto-reframe
+CSI_RE = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
+OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+ESC_OTHER_RE = re.compile(r"\x1b[^\[\]]")
+
+
+class CursorTracker:
+    def __init__(self, cols: int, rows: int):
+        self.cols = max(20, cols)
+        self.rows = max(10, rows)
+        self.x = 0
+        self.y = 0
+        self.recent_max_x = 0
+
+    def feed(self, text: str) -> int:
+        """Advance virtual cursor and return max column touched in this chunk."""
+        text = OSC_RE.sub("", text)
+        max_col = self.x
+        pos = 0
+        n = len(text)
+        while pos < n:
+            ch = text[pos]
+            if ch == "\x1b":
+                m = CSI_RE.match(text, pos)
+                if m:
+                    params_str, cmd = m.group(1), m.group(2)
+                    nums = [int(p) for p in params_str.lstrip("?").split(";") if p.isdigit()]
+                    p1 = nums[0] if nums else 1
+                    p2 = nums[1] if len(nums) > 1 else 1
+                    if cmd in ("H", "f"):
+                        self.y = max(0, min(self.rows - 1, p1 - 1))
+                        self.x = max(0, min(self.cols - 1, p2 - 1))
+                    elif cmd == "A":
+                        self.y = max(0, self.y - p1)
+                    elif cmd == "B":
+                        self.y = min(self.rows - 1, self.y + p1)
+                    elif cmd == "C":
+                        self.x = min(self.cols - 1, self.x + p1)
+                    elif cmd == "D":
+                        self.x = max(0, self.x - p1)
+                    elif cmd == "G":
+                        self.x = max(0, min(self.cols - 1, p1 - 1))
+                    elif cmd == "J" and (nums and nums[0] in (2, 3)):
+                        self.x = 0
+                        self.y = 0
+                    pos = m.end()
+                    continue
+                pos += 2
+                continue
+            elif ch == "\r":
+                self.x = 0
+            elif ch == "\n":
+                self.y = min(self.rows - 1, self.y + 1)
+            elif ch == "\b":
+                self.x = max(0, self.x - 1)
+            elif ch == "\t":
+                self.x = min(self.cols - 1, ((self.x // 8) + 1) * 8)
+            elif ord(ch) >= 32:
+                self.x += 1
+                if self.x >= self.cols:
+                    self.x = 0
+                    self.y = min(self.rows - 1, self.y + 1)
+                if self.x > max_col:
+                    max_col = self.x
+            pos += 1
+        return max_col
+
+
 header = {}
 events = []
+cursor_track = []  # [adj_t, nx, ny, span_frac, is_input]
 raw_prev = 0.0
 adj_t = 0.0
 has_stdin_events = False
@@ -270,6 +408,10 @@ try:
         header = json.loads(first)
         if out_f:
             out_f.write(first)
+        cols = int(header.get("width") or 100)
+        rows = int(header.get("height") or 30)
+        tracker = CursorTracker(cols, rows)
+
         for line in f:
             stripped = line.strip()
             if not stripped:
@@ -294,8 +436,24 @@ try:
             adj_t += dt / speed
             if etype == "i":
                 has_stdin_events = True
-            elif etype == "o" and len(output_sample) < 60:
-                output_sample.append(data)
+                cursor_track.append([
+                    round(adj_t, 3),
+                    round(tracker.x / max(1, cols - 1), 4),
+                    round(tracker.y / max(1, rows - 1), 4),
+                    0.0,
+                    1,
+                ])
+            elif etype == "o":
+                if len(output_sample) < 60:
+                    output_sample.append(data)
+                max_col = tracker.feed(data)
+                cursor_track.append([
+                    round(adj_t, 3),
+                    round(tracker.x / max(1, cols - 1), 4),
+                    round(tracker.y / max(1, rows - 1), 4),
+                    round(max_col / max(1, cols), 4),
+                    0,
+                ])
             events.append((t, adj_t, etype, len(data)))
 except Exception:
     sys.exit(0)
@@ -306,12 +464,17 @@ finally:
 if not events:
     sys.exit(0)
 
+# Save cursor track JSON for Reels auto-reframe camera
+track_path = os.path.join(work_dir, "cursor_track.json")
+with open(track_path, "w", encoding="utf-8") as tf:
+    json.dump({"cols": header.get("width", 100), "rows": header.get("height", 30), "track": cursor_track}, tf)
+
 total_adj = events[-1][1]
 start_epoch = float(header.get("timestamp") or os.path.getmtime(cast_path))
 stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(start_epoch))
 
 meta_cmds = []
-meta_marks = []  # list of (rel_raw_sec, label)
+meta_marks = []
 custom_name = ""
 if os.path.isfile(meta_path):
     try:
@@ -438,7 +601,6 @@ def fmt_chapter_ts(sec: float) -> str:
 
 for i, (s, e, tool) in enumerate(chunks, 1):
     is_multi = 1 if len(chunks) > 1 else 0
-    # Write YouTube chapters file for this chunk if user dropped `rec mark` markers
     chunk_marks = [(mt - s, lbl) for (mt, lbl) in adj_marks if s <= mt <= e]
     chap_file = ""
     if chunk_marks:
@@ -457,6 +619,250 @@ if [[ -z "$PLAN" ]]; then
   fi
   exit 0
 fi
+
+# Render a smooth 9:16 TikTok/Reels cursor-following auto-reframe MP4 (zero hard cropping!)
+render_reels_follow() {
+  local gif_path="$1" out_mp4="$2" tool="$3" slice_start="$4" rw="$5" rh="$6" rcrf="$7"
+  python3 - "$gif_path" "$WORK_DIR/cursor_track.json" "$out_mp4" "$tool" "$slice_start" "$rw" "$rh" "$rcrf" "$BG_HEX" "$CANVAS_TOP" "$CANVAS_BOT" "$ACCENT_HEX" "$FG_HEX" <<'PYEOF'
+import json
+import math
+import subprocess
+import sys
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence
+
+gif_path = sys.argv[1]
+track_path = sys.argv[2]
+out_mp4 = sys.argv[3]
+tool = sys.argv[4]
+slice_start = float(sys.argv[5])
+W, H = int(sys.argv[6]), int(sys.argv[7])
+crf = sys.argv[8]
+bg_hex, top_hex, bot_hex, acc_hex, fg_hex = sys.argv[9:14]
+
+def h2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+bg_c, top_c, bot_c, acc_c, fg_c = map(h2rgb, (bg_hex, top_hex, bot_hex, acc_hex, fg_hex))
+
+with open(track_path, "r", encoding="utf-8") as f:
+    track_data = json.load(f)
+track = track_data.get("track", [])
+
+# Decode GIF frames & cumulative timestamps
+gif = Image.open(gif_path)
+raw_frames = []
+cur_t = 0.0
+for frame in ImageSequence.Iterator(gif):
+    dur = max(0.02, (frame.info.get("duration", 40) or 40) / 1000.0)
+    raw_frames.append((cur_t, dur, frame.convert("RGB")))
+    cur_t += dur
+total_dur = max(0.1, cur_t)
+
+if not raw_frames:
+    sys.exit(1)
+
+TW, TH = raw_frames[0][2].size
+
+# Build sleek 9:16 backdrop with top "> tool ●" header & rounded terminal viewport mask
+base = Image.new("RGBA", (W, H))
+grad = Image.new("RGBA", (1, H))
+gd = ImageDraw.Draw(grad)
+for y in range(H):
+    u = y / max(1, H - 1)
+    gd.point((0, y), fill=(
+        int(top_c[0] + (bot_c[0] - top_c[0]) * u),
+        int(top_c[1] + (bot_c[1] - top_c[1]) * u),
+        int(top_c[2] + (bot_c[2] - top_c[2]) * u),
+        255,
+    ))
+base.paste(grad.resize((W, H), Image.Resampling.BILINEAR), (0, 0))
+
+margin_x = int(W * 0.04)
+top_safe = int(H * 0.085)
+bot_safe = int(H * 0.085)
+title_h = int(H * 0.032)
+VW = W - margin_x * 2
+VH = H - top_safe - bot_safe - title_h
+VX = margin_x
+VY = top_safe + title_h
+radius = max(18, W // 48)
+
+# Soft drop shadow behind card
+shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+sd = ImageDraw.Draw(shadow)
+sd.rounded_rectangle([VX, top_safe + 10, VX + VW, VY + VH + 10], radius=radius, fill=(0, 0, 0, 150))
+shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(16, W // 50)))
+base = Image.alpha_composite(base, shadow)
+
+# Card shell + titlebar + minimal "> tool ●" badge
+card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+cd = ImageDraw.Draw(card)
+bw = max(2, W // 540)
+cd.rounded_rectangle([VX, top_safe, VX + VW, VY + VH], radius=radius, fill=bg_c + (255,), outline=acc_c + (165,), width=bw)
+cd.line([VX + bw, VY, VX + VW - bw, VY], fill=acc_c + (55,), width=max(1, bw // 2))
+
+dot_r = max(6, title_h // 6)
+dot_cy = top_safe + title_h // 2
+dot_x0 = VX + int(title_h * 0.55)
+for idx, col in enumerate(((247, 118, 142, 255), (224, 175, 104, 255), (158, 206, 106, 255))):
+    cx = dot_x0 + idx * int(dot_r * 3.1)
+    cd.ellipse([cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r], fill=col)
+
+font = None
+for fp in (
+    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
+):
+    try:
+        font = ImageFont.truetype(fp, max(16, int(title_h * 0.44)))
+        break
+    except Exception:
+        pass
+if font is None:
+    font = ImageFont.load_default()
+
+label = f"> {tool}"
+bbox = cd.textbbox((0, 0), label, font=font)
+tw_lbl, th_lbl = bbox[2] - bbox[0], bbox[3] - bbox[1]
+lx = VX + (VW - tw_lbl) // 2 - int(dot_r * 1.4)
+ly = top_safe + (title_h - th_lbl) // 2 - bbox[1] // 2
+cd.text((lx, ly), label, fill=fg_c + (220,), font=font)
+rx = lx + tw_lbl + int(dot_r * 2.1)
+cd.ellipse([rx - dot_r, dot_cy - dot_r, rx + dot_r, dot_cy + dot_r], fill=(247, 118, 142, 255))
+
+base_rgb = Image.alpha_composite(base, card).convert("RGB")
+
+# Inner viewport fits strictly inside the rounded card's border
+IVW = VW - bw * 2
+IVH = VH - bw * 2
+
+# Camera physics:
+# - fit_scale fits 100% of terminal width cleanly with ZERO cropped characters.
+# - follow_scale zooms in comfortably (~1.72x fit_scale) to follow the cursor while typing.
+# - Wide output bursts smoothly ease back to fit_scale so wide tables (like nmap) are never cut off!
+fit_scale = min(IVW / max(1, TW), IVH / max(1, TH))
+follow_scale = min(fit_scale * 1.72, (IVH * 0.92) / max(1, TH) * 1.35)
+if follow_scale < fit_scale:
+    follow_scale = fit_scale
+
+fps = 30
+dt = 1.0 / fps
+n_out_frames = max(1, int(math.ceil(total_dur * fps)))
+
+# Camera state in source-terminal pixel space
+cam_x = TW * 0.35
+cam_y = TH * 0.25
+cam_scale = fit_scale
+
+# Pre-index cursor lookup
+track_idx = 0
+last_input_t = -99.0
+recent_wide_t = -99.0
+cur_nx, cur_ny = 0.25, 0.20
+
+def sample_cursor(abs_t: float):
+    global track_idx, last_input_t, recent_wide_t, cur_nx, cur_ny
+    while track_idx < len(track) and track[track_idx][0] <= abs_t:
+        ev_t, nx, ny, span, is_in = track[track_idx]
+        cur_nx, cur_ny = nx, ny
+        if is_in:
+            last_input_t = ev_t
+        elif span >= 0.58:
+            recent_wide_t = ev_t
+        track_idx += 1
+    typing_active = (abs_t - last_input_t) <= 0.95
+    wide_burst = (abs_t - recent_wide_t) <= 1.25 and not typing_active
+    return cur_nx, cur_ny, typing_active, wide_burst
+
+cmd = [
+    "ffmpeg", "-y", "-loglevel", "error",
+    "-f", "rawvideo", "-vcodec", "rawvideo",
+    "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(fps),
+    "-i", "pipe:0",
+    "-movflags", "+faststart",
+    "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-profile:v", "high",
+    "-crf", str(crf), "-preset", "medium",
+    out_mp4,
+]
+proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+gif_idx = 0
+try:
+    for f_i in range(n_out_frames):
+        t = f_i * dt
+        while gif_idx + 1 < len(raw_frames) and raw_frames[gif_idx + 1][0] <= t:
+            gif_idx += 1
+        src_img = raw_frames[gif_idx][2]
+
+        nx, ny, typing_active, wide_burst = sample_cursor(slice_start + t)
+        tgt_x = nx * TW
+        tgt_y = ny * TH
+
+        # Smoothly zoom in when typing/focused; pull out to full width on wide output (zero crop!)
+        if wide_burst:
+            tgt_scale = fit_scale
+            tgt_x = TW * 0.5
+        elif typing_active:
+            tgt_scale = follow_scale
+        else:
+            tgt_scale = fit_scale + (follow_scale - fit_scale) * 0.45
+
+        # Critically-damped smooth glide with subtle horizontal deadzone
+        alpha_s = 1.0 - math.exp(-dt * 4.0)
+        alpha_p = 1.0 - math.exp(-dt * 6.5)
+        cam_scale += (tgt_scale - cam_scale) * alpha_s
+
+        # Soft deadzone so single characters don't micro-shake the camera
+        view_w_src = IVW / max(0.05, cam_scale)
+        view_h_src = IVH / max(0.05, cam_scale)
+        if abs(tgt_x - cam_x) > view_w_src * 0.10 or wide_burst:
+            cam_x += (tgt_x - cam_x) * alpha_p
+        if abs(tgt_y - cam_y) > view_h_src * 0.08:
+            cam_y += (tgt_y - cam_y) * alpha_p
+
+        # Render scaled terminal cleanly inside (IVW x IVH) without ever cropping off edges unexpectedly
+        scaled_w = max(2, int(round(TW * cam_scale)))
+        scaled_h = max(2, int(round(TH * cam_scale)))
+        scaled = src_img.resize((scaled_w, scaled_h), Image.Resampling.BILINEAR)
+
+        viewport = Image.new("RGB", (IVW, IVH), bg_c)
+        if scaled_w <= IVW:
+            paste_x = (IVW - scaled_w) // 2
+            crop_x0 = 0
+            crop_w = scaled_w
+        else:
+            cx_px = cam_x * cam_scale
+            crop_x0 = int(max(0, min(scaled_w - IVW, cx_px - IVW * 0.5)))
+            paste_x = 0
+            crop_w = IVW
+
+        if scaled_h <= IVH:
+            paste_y = (IVH - scaled_h) // 2
+            crop_y0 = 0
+            crop_h = scaled_h
+        else:
+            cy_px = cam_y * cam_scale
+            crop_y0 = int(max(0, min(scaled_h - IVH, cy_px - IVH * 0.5)))
+            paste_y = 0
+            crop_h = IVH
+
+        region = scaled.crop((crop_x0, crop_y0, crop_x0 + crop_w, crop_y0 + crop_h))
+        viewport.paste(region, (paste_x, paste_y))
+
+        frame_out = base_rgb.copy()
+        frame_out.paste(viewport, (VX + bw, VY + bw))
+        proc.stdin.write(frame_out.tobytes())
+finally:
+    if proc.stdin:
+        proc.stdin.close()
+    rc = proc.wait()
+    if rc != 0:
+        sys.exit(rc)
+PYEOF
+}
 
 # Helper: generate crisp rounded macOS-style window frame backdrop PNG via PIL (if installed)
 make_frame_png() {
@@ -477,16 +883,17 @@ def h2rgb(h):
 
 top_c, bot_c, bg_c, acc_c, fg_c = map(h2rgb, (top_hex, bot_hex, bg_hex, acc_hex, fg_hex))
 
-# Smooth vertical gradient backdrop
 img = Image.new("RGBA", (W, H))
 grad = Image.new("RGBA", (1, H))
 gd = ImageDraw.Draw(grad)
 for y in range(H):
     t = y / max(1, H - 1)
-    r = int(top_c[0] + (bot_c[0] - top_c[0]) * t)
-    g = int(top_c[1] + (bot_c[1] - top_c[1]) * t)
-    b = int(top_c[2] + (bot_c[2] - top_c[2]) * t)
-    gd.point((0, y), fill=(r, g, b, 255))
+    gd.point((0, y), fill=(
+        int(top_c[0] + (bot_c[0] - top_c[0]) * t),
+        int(top_c[1] + (bot_c[1] - top_c[1]) * t),
+        int(top_c[2] + (bot_c[2] - top_c[2]) * t),
+        255,
+    ))
 img.paste(grad.resize((W, H), Image.Resampling.BILINEAR), (0, 0))
 
 pad_x = max(16, W // 120)
@@ -497,7 +904,6 @@ wx = (W - win_w) // 2
 wy = (H - win_h) // 2
 radius = max(14, W // 140)
 
-# Soft drop shadow
 shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 sd = ImageDraw.Draw(shadow)
 sh_off = max(8, H // 140)
@@ -505,7 +911,6 @@ sd.rounded_rectangle([wx, wy + sh_off, wx + win_w, wy + win_h + sh_off], radius=
 shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(14, W // 90)))
 img = Image.alpha_composite(img, shadow)
 
-# Main rounded terminal card + subtle accent border
 card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 cd = ImageDraw.Draw(card)
 border_w = max(2, W // 1200)
@@ -517,11 +922,9 @@ cd.rounded_rectangle(
     width=border_w,
 )
 
-# Subtle titlebar separator line
 sep_y = wy + TH
 cd.line([wx + border_w, sep_y, wx + win_w - border_w, sep_y], fill=acc_c + (45,), width=max(1, border_w // 2))
 
-# macOS-style traffic light dots
 dot_r = max(5, TH // 6)
 dot_cy = wy + TH // 2
 dot_x0 = wx + max(20, TH // 2)
@@ -530,7 +933,6 @@ for idx, col in enumerate(((247, 118, 142, 255), (224, 175, 104, 255), (158, 206
     cx = dot_x0 + idx * dot_gap
     cd.ellipse([cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r], fill=col)
 
-# Centered title text
 font = None
 for fp in (
     "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
@@ -545,10 +947,14 @@ for fp in (
 if font is None:
     font = ImageFont.load_default()
 
-label = f"{title}  •  rec-cli"
+label = f"> {title}"
 bbox = cd.textbbox((0, 0), label, font=font)
 tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-cd.text((wx + (win_w - tw) // 2, wy + (TH - th) // 2 - bbox[1] // 2), label, fill=fg_c + (185,), font=font)
+lx = wx + (win_w - tw) // 2 - int(dot_r * 1.2)
+ly = wy + (TH - th) // 2 - bbox[1] // 2
+cd.text((lx, ly), label, fill=fg_c + (200,), font=font)
+rx = lx + tw + int(dot_r * 2.0)
+cd.ellipse([rx - dot_r, dot_cy - dot_r, rx + dot_r, dot_cy + dot_r], fill=(247, 118, 142, 255))
 
 img = Image.alpha_composite(img, card).convert("RGB")
 img.save(out_png, "PNG")
@@ -600,35 +1006,8 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
     continue
   fi
 
-  FRAME_PNG="$WORK_DIR/frame_${PART}.png"
-  USE_FRAME=0
-  if [[ "${FRAME_MODE,,}" != "off" && "${FRAME_MODE,,}" != "0" && "${FRAME_MODE,,}" != "false" ]]; then
-    if make_frame_png "$FRAME_PNG" "$TOOL"; then
-      USE_FRAME=1
-    fi
-  fi
-
-  if [[ "$USE_FRAME" -eq 1 ]]; then
-    # Composite scaled terminal neatly inside the rounded window below the titlebar
-    PAD_Y=$(( OUT_H / 100 ))
-    (( PAD_Y < 14 )) && PAD_Y=14
-    WIN_H=$(( INNER_H + TITLE_H + PAD_Y * 2 ))
-    WY=$(( (OUT_H - WIN_H) / 2 ))
-    TERM_Y=$(( WY + TITLE_H + PAD_Y ))
-
-    if ffmpeg -y -loglevel error \
-      -loop 1 -i "$FRAME_PNG" \
-      -i "$TMP_GIF" \
-      -filter_complex "[1:v]scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:shortest=1[out]" \
-      -map "[out]" \
-      -movflags +faststart \
-      -pix_fmt yuv420p \
-      -c:v libx264 \
-      -profile:v high \
-      -crf "$CRF" \
-      -preset medium \
-      "$TMP_MP4"
-    then
+  if [[ "$IS_REELS" -eq 1 ]]; then
+    if render_reels_follow "$TMP_GIF" "$TMP_MP4" "$TOOL" "$START" "$OUT_W" "$OUT_H" "$CRF"; then
       mv -f "$TMP_MP4" "$OUTPUT"
       [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
     else
@@ -636,26 +1015,74 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
       ALL_OK=0
     fi
   else
-    if ffmpeg -y -loglevel error \
-      -i "$TMP_GIF" \
-      -movflags +faststart \
-      -pix_fmt yuv420p \
-      -c:v libx264 \
-      -profile:v high \
-      -crf "$CRF" \
-      -preset medium \
-      -vf "scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${BG_HEX}" \
-      "$TMP_MP4"
-    then
-      mv -f "$TMP_MP4" "$OUTPUT"
-      [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+    FRAME_PNG="$WORK_DIR/frame_${PART}.png"
+    USE_FRAME=0
+    if [[ "${FRAME_MODE,,}" != "off" && "${FRAME_MODE,,}" != "0" && "${FRAME_MODE,,}" != "false" ]]; then
+      if make_frame_png "$FRAME_PNG" "$TOOL"; then
+        USE_FRAME=1
+      fi
+    fi
+
+    if [[ "$USE_FRAME" -eq 1 ]]; then
+      PAD_Y=$(( OUT_H / 100 ))
+      (( PAD_Y < 14 )) && PAD_Y=14
+      WIN_H=$(( INNER_H + TITLE_H + PAD_Y * 2 ))
+      WY=$(( (OUT_H - WIN_H) / 2 ))
+      TERM_Y=$(( WY + TITLE_H + PAD_Y ))
+
+      if ffmpeg -y -loglevel error \
+        -loop 1 -i "$FRAME_PNG" \
+        -i "$TMP_GIF" \
+        -filter_complex "[1:v]scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:shortest=1[out]" \
+        -map "[out]" \
+        -movflags +faststart \
+        -pix_fmt yuv420p \
+        -c:v libx264 \
+        -profile:v high \
+        -crf "$CRF" \
+        -preset medium \
+        "$TMP_MP4"
+      then
+        mv -f "$TMP_MP4" "$OUTPUT"
+        [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+      else
+        rm -f "$TMP_MP4"
+        ALL_OK=0
+      fi
     else
-      rm -f "$TMP_MP4"
-      ALL_OK=0
+      if ffmpeg -y -loglevel error \
+        -i "$TMP_GIF" \
+        -movflags +faststart \
+        -pix_fmt yuv420p \
+        -c:v libx264 \
+        -profile:v high \
+        -crf "$CRF" \
+        -preset medium \
+        -vf "scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${BG_HEX}" \
+        "$TMP_MP4"
+      then
+        mv -f "$TMP_MP4" "$OUTPUT"
+        [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+      else
+        rm -f "$TMP_MP4"
+        ALL_OK=0
+      fi
+    fi
+    rm -f "$FRAME_PNG"
+
+    # Optional automatic companion 9:16 TikTok/Reels cursor-following export
+    if [[ "${REELS_COPY,,}" == "on" || "${REELS_COPY,,}" == "1" || "${REELS_COPY,,}" == "true" ]]; then
+      REELS_OUT="${OUTPUT%.mp4}_reels.mp4"
+      TMP_REELS="${REELS_OUT}.tmp.$$.mp4"
+      if render_reels_follow "$TMP_GIF" "$TMP_REELS" "$TOOL" "$START" 1080 1920 18; then
+        mv -f "$TMP_REELS" "$REELS_OUT"
+      else
+        rm -f "$TMP_REELS"
+      fi
     fi
   fi
 
-  rm -f "$TMP_GIF" "$FRAME_PNG"
+  rm -f "$TMP_GIF"
 done <<< "$PLAN"
 
 if [[ "$CLEANUP" -eq 1 && "$ALL_OK" -eq 1 ]]; then

@@ -4,7 +4,7 @@ umask 022
 
 # Build a Debian/Ubuntu/Kali/Mint/Pop!_OS .deb package for rec-cli
 
-VERSION="${VERSION:-1.1.0}"
+VERSION="${VERSION:-1.2.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"

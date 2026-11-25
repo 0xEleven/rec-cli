@@ -1,6 +1,6 @@
 # Maintainer: 0xEleven <0xEleven@users.noreply.github.com>
 pkgname=rec-cli
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="Smart terminal clip recorder CLI for Zsh, Bash, and Fish (2x speed, 5-min chunks, process-named MP4s)"
 arch=('any')
