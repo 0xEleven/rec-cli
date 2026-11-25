@@ -6,7 +6,7 @@ set -euo pipefail
 #           Fedora, RHEL, Rocky, Alma, CentOS, openSUSE, Alpine, Void, Gentoo
 # Shells:   Zsh, Bash, Fish
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PREFIX="${PREFIX:-$HOME/.local}"
 INSTALL_DEPS=1
 CONFIGURE_SHELLS=1

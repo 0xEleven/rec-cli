@@ -4,7 +4,7 @@ umask 022
 
 # Build a Debian/Ubuntu/Kali/Mint/Pop!_OS .deb package for rec-cli
 
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.1.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
@@ -36,7 +36,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: bash, python3, asciinema, ffmpeg, util-linux
-Recommends: zsh | fish
+Recommends: zsh | fish, python3-pil
 Maintainer: 0xEleven <0xEleven@users.noreply.github.com>
 Homepage: https://github.com/0xEleven/rec-cli
 Description: Smart terminal clip recorder CLI for Zsh, Bash, and Fish

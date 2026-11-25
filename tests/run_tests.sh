@@ -26,13 +26,13 @@ if command -v fish >/dev/null 2>&1; then
 fi
 
 echo "=== 2. rec-cli init & CLI commands ==="
-rec-cli version | grep -q "rec-cli "
+rec-cli version | grep -q "rec-cli 1.1.0"
 rec-cli init zsh  | grep -q "_rec_is_allowed_terminal"
 rec-cli init bash | grep -q "_rec_bash_preexec"
 rec-cli init fish | grep -q "_rec_fish_preexec"
 echo "PASS: rec-cli init works for zsh, bash, fish"
 
-echo "=== 3. End-to-end cast2mp4 filtering, naming & 5-min split ==="
+echo "=== 3. End-to-end 4K, vertical, redaction, chapters, gif/thumb/trim & split ==="
 if ! command -v agg >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
   echo "SKIP: agg or ffmpeg not installed in this environment (syntax + init tests passed)"
   exit 0
@@ -41,7 +41,9 @@ fi
 TDIR="$(mktemp -d)"
 OUT="$TDIR/out"
 OUT2="$TDIR/out2"
-mkdir -p "$OUT" "$OUT2"
+OUT4K="$TDIR/out4k"
+OUTV="$TDIR/outv"
+mkdir -p "$OUT" "$OUT2" "$OUT4K" "$OUTV"
 trap 'rm -rf "$TDIR"' EXIT
 
 python3 - "$TDIR" <<'PYEOF'
@@ -55,8 +57,8 @@ def write_cast(name, events, meta_lines):
         for ev in events:
             f.write(json.dumps(ev) + "\n")
     with open(os.path.join(tdir, f"{name}.meta"), "w") as f:
-        for k, v in meta_lines:
-            f.write(f"{k}\t{v}\n")
+        for row in meta_lines:
+            f.write("\t".join(row) + "\n")
 
 # OpenVPN-only pane -> must skip
 ovpn_evs = [[0.1, "i", "s"], [0.2, "i", "u"], [0.3, "i", "\r"]] + [
@@ -68,24 +70,32 @@ write_cast("ovpn", ovpn_evs, [(f"{base_ts + 0.3:.3f}", "sudo openvpn htb.ovpn")]
 out_evs = [[0.5 + i * 0.5, "o", f"background log {i}\r\n"] for i in range(15)]
 write_cast("outonly", out_evs, [])
 
-# Real nmap session -> must name nmap_*.mp4
+# Real nmap session with secret + chapter marker
 nmap_evs = [
     [0.2, "i", "n"], [0.4, "i", "m"], [0.6, "i", "a"], [0.8, "i", "p"], [1.0, "i", "\r"],
     [1.2, "o", "$ sudo nmap -sC -sV 10.10.11.42\r\n"],
     [2.0, "o", "22/tcp open ssh\r\n"],
-    [3.0, "o", "80/tcp open http\r\n"],
-    [4.0, "o", "Nmap done\r\n"],
-    [5.0, "o", "$ \r\n"],
+    [3.0, "o", "export AWS_KEY=AKIAIOSFODNN7EXAMPLE PASSWORD=SuperSecret123\r\n"],
+    [4.0, "o", "80/tcp open http\r\n"],
+    [5.0, "o", "Nmap done\r\n"],
+    [6.0, "o", "$ \r\n"],
 ]
 write_cast("nmap_sess", nmap_evs, [
     (f"{base_ts + 0.1:.3f}", "cd ~/htb"),
     (f"{base_ts + 0.2:.3f}", "ls"),
     (f"{base_ts + 1.0:.3f}", "sudo nmap -sC -sV 10.10.11.42"),
+    ("MARK", f"{base_ts + 3.5:.3f}", "found web port"),
 ])
 
-# Custom named clip -> must name htb-foothold_*.mp4
-write_cast("custom_sess", nmap_evs, [
+# Custom named clip (4K test)
+write_cast("custom_4k", nmap_evs, [
     ("NAME", "htb-foothold"),
+    (f"{base_ts + 1.0:.3f}", "sudo nmap -sC -sV 10.10.11.42"),
+])
+
+# Vertical Shorts/TikTok test
+write_cast("vert_test", nmap_evs, [
+    ("NAME", "short-clip"),
     (f"{base_ts + 1.0:.3f}", "sudo nmap -sC -sV 10.10.11.42"),
 ])
 
@@ -105,25 +115,52 @@ write_cast("split_sess", split_evs, [
 ])
 PYEOF
 
-cast2mp4 --auto --cleanup --out-dir "$OUT" "$TDIR/ovpn.cast"
+cast2mp4 --auto --cleanup --res 1080p --out-dir "$OUT" "$TDIR/ovpn.cast"
 [[ ! -f "$TDIR/ovpn.cast" && $(ls "$OUT" | wc -l) -eq 0 ]]
 echo "PASS: OpenVPN pane skipped & cleaned"
 
-cast2mp4 --auto --cleanup --out-dir "$OUT" "$TDIR/outonly.cast"
+cast2mp4 --auto --cleanup --res 1080p --out-dir "$OUT" "$TDIR/outonly.cast"
 [[ ! -f "$TDIR/outonly.cast" && $(ls "$OUT" | wc -l) -eq 0 ]]
 echo "PASS: Output-only pane skipped & cleaned"
 
-cast2mp4 --auto --cleanup --out-dir "$OUT" "$TDIR/nmap_sess.cast"
-ls "$OUT"/nmap_*.mp4 >/dev/null
-echo "PASS: Auto-named after nmap"
+cast2mp4 --auto --cleanup --res 1080p --out-dir "$OUT" "$TDIR/nmap_sess.cast"
+NMAP_MP4="$(ls "$OUT"/nmap_*.mp4)"
+[[ -s "$NMAP_MP4" ]]
+[[ -s "${NMAP_MP4%.mp4}.chapters.txt" ]] && grep -q "found web port" "${NMAP_MP4%.mp4}.chapters.txt"
+echo "PASS: Auto-named after nmap + YouTube chapters exported"
 
-cast2mp4 --auto --cleanup --out-dir "$OUT" "$TDIR/custom_sess.cast"
-ls "$OUT"/htb-foothold_*.mp4 >/dev/null
-echo "PASS: Custom clip name respected"
+# Native 4K UHD verification (3840x2160)
+cast2mp4 --auto --cleanup --res 4k --out-dir "$OUT4K" "$TDIR/custom_4k.cast"
+CLIP_4K="$(ls "$OUT4K"/htb-foothold_*.mp4)"
+if command -v ffprobe >/dev/null 2>&1; then
+  DIMS_4K="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$CLIP_4K")"
+  [[ "$DIMS_4K" == "3840x2160" ]] || { echo "FAIL: expected 3840x2160, got $DIMS_4K" >&2; exit 1; }
+  echo "PASS: Native 4K UHD verified ($DIMS_4K) + custom name"
+fi
 
-cast2mp4 --auto --cleanup --max-secs 10 --out-dir "$OUT2" "$TDIR/split_sess.cast"
+# Vertical Shorts/TikTok verification (1080x1920)
+cast2mp4 --auto --cleanup --res vertical --out-dir "$OUTV" "$TDIR/vert_test.cast"
+CLIP_V="$(ls "$OUTV"/short-clip_*.mp4)"
+if command -v ffprobe >/dev/null 2>&1; then
+  DIMS_V="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$CLIP_V")"
+  [[ "$DIMS_V" == "1080x1920" ]] || { echo "FAIL: expected 1080x1920, got $DIMS_V" >&2; exit 1; }
+  echo "PASS: Vertical 9:16 verified ($DIMS_V)"
+fi
+
+# Multi-part split
+cast2mp4 --auto --cleanup --res 720p --max-secs 10 --out-dir "$OUT2" "$TDIR/split_sess.cast"
 ls "$OUT2"/nmap_*_part1.mp4 >/dev/null && ls "$OUT2"/ffuf_*_part2.mp4 >/dev/null
 echo "PASS: Multi-part split named per chunk (nmap part1 + ffuf part2)"
 
+# Test rec-cli thumb, gif, trim, stats
+REC_VIDEO_DIR="$OUT" rec-cli thumb latest >/dev/null
+[[ -s "${NMAP_MP4%.mp4}.png" ]]
+REC_VIDEO_DIR="$OUT" rec-cli gif latest 640 >/dev/null
+[[ -s "${NMAP_MP4%.mp4}.gif" ]]
+REC_VIDEO_DIR="$OUT" rec-cli trim latest 00:00 00:02 >/dev/null
+[[ -s "${NMAP_MP4%.mp4}_trimmed.mp4" ]]
+REC_VIDEO_DIR="$OUT" rec-cli stats | grep -q "Total clips:"
+echo "PASS: rec thumb, gif, trim, stats all verified"
+
 echo ""
-echo "ALL TESTS PASSED!"
+echo "ALL v1.1.0 TESTS PASSED!"

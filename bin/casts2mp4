@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# casts2mp4 — Batch-convert finished .cast recordings into 5-min max, 2x-speed MP4 clips
-# Part of rec-cli
+# casts2mp4 — Batch-convert finished .cast recordings into up-to-4K 5-min max MP4 clips
+# Part of rec-cli v1.1.0
 
 CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/config"
 if [[ -f "$CONF_FILE" ]]; then
@@ -13,6 +13,7 @@ fi
 BG=0
 KEEP=0
 SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
+RES="${REC_RESOLUTION:-4k}"
 QUIET=0
 
 while [[ $# -gt 0 ]]; do
@@ -21,8 +22,9 @@ while [[ $# -gt 0 ]]; do
     --keep) KEEP=1; shift ;;
     --quiet|-q) QUIET=1; shift ;;
     --speed|-s) SPEED="$2"; shift 2 ;;
+    --res|--resolution|-r) RES="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: casts2mp4 [--bg] [--keep] [--quiet] [--speed <N>]"
+      echo "Usage: casts2mp4 [--bg] [--keep] [--quiet] [--speed <N>] [--res 720p|1080p|1440p|4k|vertical]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -30,7 +32,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$BG" -eq 1 ]]; then
-  ARGS=(--quiet --speed "$SPEED")
+  ARGS=(--quiet --speed "$SPEED" --res "$RES")
   [[ "$KEEP" -eq 1 ]] && ARGS+=(--keep)
   if command -v setsid >/dev/null 2>&1; then
     setsid -f "$0" "${ARGS[@]}" </dev/null >/dev/null 2>&1
@@ -86,8 +88,8 @@ for cast in "$CAST_DIR"/*.cast; do
   fi
 
   base="$(basename "$cast" .cast)"
-  log "Processing ${base}.cast (${SPEED}x, max 5m, input+output only)..."
-  CLEAN_ARGS=(--auto --speed "$SPEED")
+  log "Processing ${base}.cast (${RES}, ${SPEED}x, max 5m, input+output only)..."
+  CLEAN_ARGS=(--auto --speed "$SPEED" --res "$RES")
   [[ "$KEEP" -eq 0 ]] && CLEAN_ARGS+=(--cleanup)
 
   if cast2mp4 "${CLEAN_ARGS[@]}" "$cast" 2>/dev/null; then

@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rec-cli — Smart terminal clip recorder CLI (v1.0.0)
+# rec-cli — Smart terminal clip recorder CLI (v1.1.0)
 # Works across Linux distros with Zsh, Bash, and Fish.
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli"
 CONF_FILE="$CONF_DIR/config"
 AUTO_OFF_FLAG="$CONF_DIR/auto-disabled"
 LEGACY_AUTO_OFF="$HOME/.config/term-rec/auto-disabled"
 
-# Load user config if present
 if [[ -f "$CONF_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$CONF_FILE"
@@ -24,8 +23,10 @@ REC_SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
 REC_MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
 REC_TERMINALS="${REC_TERMINALS:-kitty,tabby}"
 REC_THEME="${REC_THEME:-tokyo-night}"
+REC_RESOLUTION="${REC_RESOLUTION:-4k}"
+REC_FRAME="${REC_FRAME:-on}"
+REC_REDACT="${REC_REDACT:-on}"
 
-# Locate installed shell integration directory
 find_share_dir() {
   local script_dir
   script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -55,31 +56,67 @@ C_YELLOW=$'\033[38;2;224;175;104m'
 
 show_help() {
   cat <<EOF
-${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} — Smart Terminal Clip Recorder for Linux (Zsh, Bash, Fish)
+${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} — Up-to-4K Terminal Clip Recorder for Linux (Zsh, Bash, Fish)
 
-${C_CYAN}Session Control (via shell integration):${C_RESET}
-  ${C_BOLD}rec start [name]${C_RESET}     Start recording this terminal (auto-named by process if omitted)
-  ${C_BOLD}rec stop${C_RESET}             Stop recording & render MP4 in background (keeps tab open)
-  ${C_BOLD}rec cancel${C_RESET}           Stop recording & discard the take (saves nothing)
-  ${C_BOLD}rec status${C_RESET}           Show live recording state, config & clip stats
+${C_CYAN}Session Control:${C_RESET}
+  ${C_BOLD}rec start [name]${C_RESET}       Start recording this terminal (auto-named by process if omitted)
+  ${C_BOLD}rec stop${C_RESET}               Stop recording & render MP4 in background (keeps tab open)
+  ${C_BOLD}rec cancel${C_RESET}             Stop recording & discard the take (saves nothing)
+  ${C_BOLD}rec mark <label>${C_RESET}       Drop a YouTube chapter marker during an active recording
+  ${C_BOLD}rec status${C_RESET}             Show live recording state, config & clip stats
+
+${C_CYAN}Content Tools:${C_RESET}
+  ${C_BOLD}rec list${C_RESET}               List saved MP4 clips in ${VIDEO_DIR}
+  ${C_BOLD}rec play [clip|latest]${C_RESET} Preview the latest (or named) clip in your video player
+  ${C_BOLD}rec gif [clip|latest]${C_RESET}  Export a high-quality palette GIF for READMEs / Discord / X
+  ${C_BOLD}rec thumb [clip|latest]${C_RESET} Extract a crisp PNG thumbnail frame from a clip
+  ${C_BOLD}rec trim <clip> <start> <end>${C_RESET} Lossless fast trim (e.g. rec trim latest 00:05 01:20)
+  ${C_BOLD}rec stats${C_RESET}              Show total runtime, disk usage, and top recorded tools
+  ${C_BOLD}rec render [speed]${C_RESET}     Convert pending finished .cast files now (default: ${REC_SPEED}x)
+  ${C_BOLD}rec open${C_RESET}               Open clips folder in your file manager
+  ${C_BOLD}rec clear [--yes]${C_RESET}      Delete saved MP4 clips and raw casts
 
 ${C_CYAN}Auto-Record & Configuration:${C_RESET}
-  ${C_BOLD}rec auto on|off${C_RESET}      Toggle auto-recording on new allowed terminal tabs
-  ${C_BOLD}rec config${C_RESET}           Show or set options (speed, max-secs, terminals, video-dir, theme)
-  ${C_BOLD}rec init <shell>${C_RESET}     Print shell integration for zsh, bash, or fish
-  ${C_BOLD}rec doctor${C_RESET}           Check dependencies & print distro install commands
-
-${C_CYAN}Clips & Rendering:${C_RESET}
-  ${C_BOLD}rec list${C_RESET}             List saved MP4 clips in ${VIDEO_DIR}
-  ${C_BOLD}rec render [speed]${C_RESET}   Convert pending finished .cast files now (default: ${REC_SPEED}x)
-  ${C_BOLD}rec open${C_RESET}             Open clips folder in your file manager
-  ${C_BOLD}rec clear [--yes]${C_RESET}    Delete saved MP4 clips and raw casts
-  ${C_BOLD}rec version${C_RESET}          Print version
+  ${C_BOLD}rec auto on|off${C_RESET}        Toggle auto-recording on new allowed terminal tabs
+  ${C_BOLD}rec config [key val]${C_RESET}   Configure resolution (720p|1080p|1440p|4k|vertical), speed, frame, redact, theme, terminals
+  ${C_BOLD}rec init <shell>${C_RESET}       Print shell integration for zsh, bash, or fish
+  ${C_BOLD}rec doctor${C_RESET}             Check dependencies & print distro install commands
+  ${C_BOLD}rec version${C_RESET}            Print version
 EOF
 }
 
 is_auto_disabled() {
   [[ -f "$AUTO_OFF_FLAG" || -f "$LEGACY_AUTO_OFF" ]]
+}
+
+resolve_clip() {
+  local arg="${1:-latest}"
+  if [[ "$arg" == "latest" || -z "$arg" ]]; then
+    local latest
+    latest="$(ls -t "$VIDEO_DIR"/*.mp4 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$latest" ]]; then
+      echo "No MP4 clips found in $VIDEO_DIR" >&2
+      return 1
+    fi
+    echo "$latest"
+    return 0
+  fi
+  if [[ -f "$arg" ]]; then
+    echo "$arg"
+    return 0
+  fi
+  if [[ -f "$VIDEO_DIR/$arg" ]]; then
+    echo "$VIDEO_DIR/$arg"
+    return 0
+  fi
+  local match
+  match="$(ls -t "$VIDEO_DIR"/*"${arg}"*.mp4 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$match" ]]; then
+    echo "$match"
+    return 0
+  fi
+  echo "Clip not found: $arg" >&2
+  return 1
 }
 
 cmd_init() {
@@ -96,10 +133,7 @@ cmd_init() {
   case "$sh" in
     zsh|bash|fish)
       local file="$share_dir/shell/rec.${sh}"
-      if [[ ! -f "$file" ]]; then
-        echo "Error: missing shell file: $file" >&2
-        exit 1
-      fi
+      [[ -f "$file" ]] || { echo "Error: missing shell file: $file" >&2; exit 1; }
       cat "$file"
       ;;
     *)
@@ -107,6 +141,22 @@ cmd_init() {
       exit 1
       ;;
   esac
+}
+
+cmd_mark() {
+  local label="${*:-}"
+  if [[ -z "$label" ]]; then
+    echo "Usage: rec mark <chapter label>" >&2
+    exit 1
+  fi
+  if [[ -z "${_TERM_REC_META:-}" ]]; then
+    echo "Not currently recording in this terminal. Run 'rec start' first." >&2
+    exit 1
+  fi
+  local ts
+  ts="$(date +%s.%3N 2>/dev/null || date +%s)"
+  printf 'MARK\t%s\t%s\n' "$ts" "$label" >> "$_TERM_REC_META"
+  echo -e "${C_PURPLE}◆ Chapter marker added:${C_RESET} ${C_BOLD}${label}${C_RESET}"
 }
 
 cmd_status() {
@@ -123,7 +173,7 @@ cmd_status() {
     echo -e "  This tab:     ${C_RED}${C_BOLD}● RECORDING${C_RESET}${cast_info}"
     if [[ -n "${_TERM_REC_META:-}" && -f "${_TERM_REC_META}" ]]; then
       local cmds
-      cmds="$(awk -F'\t' '$1 != "NAME" {print $2}' "${_TERM_REC_META}" 2>/dev/null | tail -n 3 | paste -sd ', ' -)"
+      cmds="$(awk -F'\t' '$1 != "NAME" && $1 != "MARK" {print $2}' "${_TERM_REC_META}" 2>/dev/null | tail -n 3 | paste -sd ', ' -)"
       [[ -n "$cmds" ]] && echo -e "  Recent cmds:  ${C_CYAN}${cmds}${C_RESET}"
     fi
   else
@@ -144,7 +194,7 @@ cmd_status() {
   mp4_cnt="$(find "$VIDEO_DIR" -maxdepth 1 -name '*.mp4' 2>/dev/null | wc -l)"
   mp4_size="$(du -sh "$VIDEO_DIR" 2>/dev/null | cut -f1)"
   echo -e "  Saved clips:  ${C_BOLD}${mp4_cnt}${C_RESET} videos (${mp4_size}) in ${C_CYAN}${VIDEO_DIR}${C_RESET}"
-  echo -e "  Settings:     ${C_DIM}${REC_SPEED}x speed | max $((REC_MAX_SECS / 60))m/clip | theme: ${REC_THEME} | input+output only | ovpn skipped${C_RESET}"
+  echo -e "  Settings:     ${C_DIM}${REC_RESOLUTION} | ${REC_SPEED}x | max $((REC_MAX_SECS / 60))m | frame: ${REC_FRAME} | redact: ${REC_REDACT} | theme: ${REC_THEME}${C_RESET}"
 }
 
 cmd_auto() {
@@ -182,61 +232,178 @@ set_config_key() {
 cmd_config() {
   if [[ $# -eq 0 ]]; then
     echo -e "${C_PURPLE}${C_BOLD}rec-cli configuration${C_RESET} (${C_DIM}${CONF_FILE}${C_RESET}):"
-    echo "  terminals = ${REC_TERMINALS}"
-    echo "  speed     = ${REC_SPEED}x"
-    echo "  max-secs  = ${REC_MAX_SECS}s ($((REC_MAX_SECS / 60)) min)"
-    echo "  video-dir = ${VIDEO_DIR}"
-    echo "  theme     = ${REC_THEME}"
+    echo "  resolution = ${REC_RESOLUTION}   (720p | 1080p | 1440p | 4k | vertical)"
+    echo "  speed      = ${REC_SPEED}x"
+    echo "  max-secs   = ${REC_MAX_SECS}s ($((REC_MAX_SECS / 60)) min)"
+    echo "  frame      = ${REC_FRAME}   (on | off — rounded window frame & titlebar)"
+    echo "  redact     = ${REC_REDACT}   (on | off — auto-scrub API keys/tokens/passwords)"
+    echo "  theme      = ${REC_THEME}   (tokyo-night | dracula | catppuccin | gruvbox | nord)"
+    echo "  terminals  = ${REC_TERMINALS}"
+    echo "  video-dir  = ${VIDEO_DIR}"
     echo ""
     echo -e "${C_DIM}Change any setting with: rec config <key> <value>${C_RESET}"
-    echo -e "${C_DIM}  e.g. rec config terminals kitty,tabby,alacritty${C_RESET}"
-    echo -e "${C_DIM}       rec config terminals all${C_RESET}"
-    echo -e "${C_DIM}       rec config speed 2${C_RESET}"
-    echo -e "${C_DIM}       rec config max-secs 300${C_RESET}"
-    echo -e "${C_DIM}       rec config theme dracula   (tokyo-night|dracula|catppuccin|gruvbox|nord)${C_RESET}"
+    echo -e "${C_DIM}  e.g. rec config resolution 4k${C_RESET}"
+    echo -e "${C_DIM}       rec config resolution vertical   # 1080x1920 for TikTok / Shorts / Reels${C_RESET}"
+    echo -e "${C_DIM}       rec config frame on${C_RESET}"
+    echo -e "${C_DIM}       rec config redact on${C_RESET}"
     return 0
   fi
 
   local key="$1" val="${2:-}"
   if [[ -z "$val" ]]; then
-    echo "Usage: rec config <terminals|speed|max-secs|video-dir|theme> <value>" >&2
+    echo "Usage: rec config <resolution|speed|max-secs|frame|redact|theme|terminals|video-dir> <value>" >&2
     exit 1
   fi
   case "$key" in
-    terminals) set_config_key REC_TERMINALS "$val" ;;
-    speed)     set_config_key REC_SPEED "$val" ;;
-    max-secs)  set_config_key REC_MAX_SECS "$val" ;;
-    video-dir) set_config_key REC_VIDEO_DIR "$val" ;;
-    theme)     set_config_key REC_THEME "$val" ;;
+    resolution|res) set_config_key REC_RESOLUTION "$val" ;;
+    speed)          set_config_key REC_SPEED "$val" ;;
+    max-secs)       set_config_key REC_MAX_SECS "$val" ;;
+    frame)          set_config_key REC_FRAME "$val" ;;
+    redact)         set_config_key REC_REDACT "$val" ;;
+    theme)          set_config_key REC_THEME "$val" ;;
+    terminals)      set_config_key REC_TERMINALS "$val" ;;
+    video-dir)      set_config_key REC_VIDEO_DIR "$val" ;;
     *)
-      echo "Unknown config key: $key (valid: terminals, speed, max-secs, video-dir, theme)" >&2
+      echo "Unknown config key: $key" >&2
+      echo "Valid keys: resolution, speed, max-secs, frame, redact, theme, terminals, video-dir" >&2
       exit 1
       ;;
   esac
   echo -e "${C_GREEN}✓ Updated ${key} = ${val}${C_RESET} (saved to ${CONF_FILE})"
 }
 
+cmd_play() {
+  local clip
+  clip="$(resolve_clip "${1:-latest}")" || exit 1
+  echo -e "${C_CYAN}Playing:${C_RESET} $(basename "$clip")"
+  if command -v mpv >/dev/null 2>&1; then
+    setsid -f mpv "$clip" </dev/null >/dev/null 2>&1
+  elif command -v vlc >/dev/null 2>&1; then
+    setsid -f vlc "$clip" </dev/null >/dev/null 2>&1
+  elif command -v xdg-open >/dev/null 2>&1; then
+    setsid -f xdg-open "$clip" </dev/null >/dev/null 2>&1
+  else
+    echo "No player found (mpv/vlc/xdg-open). File: $clip"
+  fi
+}
+
+cmd_gif() {
+  local clip out width
+  clip="$(resolve_clip "${1:-latest}")" || exit 1
+  width="${2:-1280}"
+  out="${clip%.mp4}.gif"
+  echo -e "${C_CYAN}Exporting optimized GIF (${width}px wide):${C_RESET} $(basename "$out")..."
+  ffmpeg -y -loglevel error -i "$clip" \
+    -vf "fps=20,scale=${width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3" \
+    "$out"
+  echo -e "${C_GREEN}✓ Saved GIF:${C_RESET} ${out} ($(du -h "$out" | cut -f1))"
+}
+
+cmd_thumb() {
+  local clip out dur seek
+  clip="$(resolve_clip "${1:-latest}")" || exit 1
+  out="${clip%.mp4}.png"
+  dur="2"
+  if command -v ffprobe >/dev/null 2>&1; then
+    dur="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$clip" 2>/dev/null || echo 2)"
+  fi
+  seek="$(python3 -c "print(f'{max(0.5, float(\"${dur}\") * 0.65):.2f}')" 2>/dev/null || echo 1)"
+  ffmpeg -y -loglevel error -ss "$seek" -i "$clip" -frames:v 1 -q:v 2 "$out"
+  echo -e "${C_GREEN}✓ Saved thumbnail:${C_RESET} ${out} ($(du -h "$out" | cut -f1))"
+}
+
+cmd_trim() {
+  if [[ $# -lt 3 ]]; then
+    echo "Usage: rec trim <clip|latest> <start> <end>" >&2
+    echo "Example: rec trim latest 00:05 01:30" >&2
+    exit 1
+  fi
+  local clip start end out
+  clip="$(resolve_clip "$1")" || exit 1
+  start="$2"
+  end="$3"
+  out="${clip%.mp4}_trimmed.mp4"
+  ffmpeg -y -loglevel error -ss "$start" -to "$end" -i "$clip" -c copy -movflags +faststart "$out"
+  echo -e "${C_GREEN}✓ Saved trimmed clip:${C_RESET} ${out} ($(du -h "$out" | cut -f1))"
+}
+
+cmd_stats() {
+  mkdir -p "$VIDEO_DIR"
+  python3 - "$VIDEO_DIR" <<'PYEOF'
+import collections, glob, os, subprocess, sys
+
+vdir = sys.argv[1]
+mp4s = sorted(glob.glob(os.path.join(vdir, "*.mp4")))
+if not mp4s:
+    print(f"No clips in {vdir} yet.")
+    sys.exit(0)
+
+total_bytes = sum(os.path.getsize(p) for p in mp4s)
+total_secs = 0.0
+tools = collections.Counter()
+
+for p in mp4s:
+    base = os.path.basename(p)
+    tool = base.split("_", 1)[0]
+    tools[tool] += 1
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", p],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        total_secs += float(out)
+    except Exception:
+        pass
+
+def fmt_size(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+mins, secs = divmod(int(total_secs), 60)
+hrs, mins = divmod(mins, 60)
+dur_str = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+
+print("\033[38;2;187;154;247m\033[1m=== rec-cli Library Stats ===\033[0m")
+print(f"  Folder:         {vdir}")
+print(f"  Total clips:    {len(mp4s)}")
+print(f"  Total runtime:  {dur_str}")
+print(f"  Disk usage:     {fmt_size(total_bytes)}")
+print("  Top tools:")
+for tool, cnt in tools.most_common(8):
+    print(f"    • {tool}: {cnt} clip(s)")
+PYEOF
+}
+
 cmd_doctor() {
-  echo -e "${C_PURPLE}${C_BOLD}=== rec-cli Dependency Check ===${C_RESET}"
+  echo -e "${C_PURPLE}${C_BOLD}=== rec-cli v${VERSION} Dependency Check ===${C_RESET}"
   local missing=0
-  for dep in asciinema agg ffmpeg python3 flock setsid; do
+  for dep in asciinema agg ffmpeg ffprobe python3 flock setsid; do
     if command -v "$dep" >/dev/null 2>&1; then
       echo -e "  ${C_GREEN}✓${C_RESET} ${dep}  ${C_DIM}($(command -v "$dep"))${C_RESET}"
     else
       echo -e "  ${C_RED}✗${C_RESET} ${dep}  ${C_YELLOW}(MISSING)${C_RESET}"
-      missing=1
+      [[ "$dep" != "ffprobe" ]] && missing=1
     fi
   done
+  if python3 -c "import PIL" 2>/dev/null; then
+    echo -e "  ${C_GREEN}✓${C_RESET} python3-pil  ${C_DIM}(rounded window frame enabled)${C_RESET}"
+  else
+    echo -e "  ${C_YELLOW}•${C_RESET} python3-pil  ${C_DIM}(optional — install pillow for rounded window frames)${C_RESET}"
+  fi
   echo ""
+  echo -e "  ${C_CYAN}Resolution:${C_RESET}     ${REC_RESOLUTION}"
   echo -e "  ${C_CYAN}Detected shell:${C_RESET} ${SHELL:-unknown}"
   echo -e "  ${C_CYAN}Allowed terms:${C_RESET}  ${REC_TERMINALS}"
   if (( missing == 1 )); then
     echo ""
     echo -e "${C_YELLOW}Install missing deps:${C_RESET}"
-    echo "  Debian/Ubuntu/Kali: sudo apt install asciinema ffmpeg python3 util-linux"
-    echo "  Arch/Manjaro:       sudo pacman -S asciinema ffmpeg python util-linux"
-    echo "  Fedora/RHEL:        sudo dnf install asciinema ffmpeg python3 util-linux"
-    echo "  openSUSE:           sudo zypper install asciinema ffmpeg python3 util-linux"
+    echo "  Debian/Ubuntu/Kali: sudo apt install asciinema ffmpeg python3 python3-pil util-linux"
+    echo "  Arch/Manjaro:       sudo pacman -S asciinema ffmpeg python python-pillow util-linux"
+    echo "  Fedora/RHEL:        sudo dnf install asciinema ffmpeg python3 python3-pillow util-linux"
+    echo "  openSUSE:           sudo zypper install asciinema ffmpeg python3 python3-Pillow util-linux"
     echo "  agg (any distro):   https://github.com/asciinema/agg/releases"
     return 1
   fi
@@ -260,11 +427,11 @@ cmd_clear() {
   local yes=0
   [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && yes=1
   if (( yes == 0 )); then
-    printf "Delete all MP4 clips in %s and raw casts? [y/N] " "$VIDEO_DIR"
+    printf "Delete all MP4/GIF/PNG/chapter files in %s and raw casts? [y/N] " "$VIDEO_DIR"
     read -r ans
     [[ "$ans" != [yY]* ]] && { echo "Canceled."; return 0; }
   fi
-  rm -f "$VIDEO_DIR"/*.mp4 "$CAST_DIR"/*.cast "$CAST_DIR"/*.meta
+  rm -f "$VIDEO_DIR"/*.mp4 "$VIDEO_DIR"/*.gif "$VIDEO_DIR"/*.png "$VIDEO_DIR"/*.chapters.txt "$CAST_DIR"/*.cast "$CAST_DIR"/*.meta
   echo -e "${C_GREEN}✓ Cleared all clips and raw casts.${C_RESET}"
 }
 
@@ -280,11 +447,17 @@ cmd_open() {
 
 case "${1:-help}" in
   init) shift; cmd_init "${1:-}" ;;
+  mark|chapter) shift; cmd_mark "$@" ;;
   status|st) cmd_status ;;
   auto) shift; cmd_auto "${1:-}" ;;
   config|cfg) shift; cmd_config "$@" ;;
   doctor|check) cmd_doctor ;;
   list|ls) cmd_list ;;
+  play|preview) shift; cmd_play "${1:-latest}" ;;
+  gif) shift; cmd_gif "${1:-latest}" "${2:-1280}" ;;
+  thumb|thumbnail) shift; cmd_thumb "${1:-latest}" ;;
+  trim) shift; cmd_trim "$@" ;;
+  stats) cmd_stats ;;
   render) shift; casts2mp4 ${1:+--speed "$1"} ;;
   open) cmd_open ;;
   clear|clean) shift; cmd_clear "${1:-}" ;;

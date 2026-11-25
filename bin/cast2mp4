@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cast2mp4 — Smart terminal .cast -> 1080p MP4 renderer (part of rec-cli)
-# - Default 2x speed, 60fps 1080p H.264 MP4
+# cast2mp4 — Smart terminal .cast -> up to 4K MP4 renderer (part of rec-cli v1.1.0)
+# - Resolution presets: 720p, 1080p, 1440p, 4k (3840x2160), vertical (1080x1920 Shorts/TikTok)
+# - Default 2x speed, 60fps H.264 MP4
 # - Max 5 minutes (300s) per video (auto-splits longer sessions into 5-min parts)
 # - Only renders clips/chunks with BOTH real keyboard input AND terminal output
 # - Skips passive/noisy VPN & log-only sessions (openvpn, tail -f, watch, etc.)
+# - Automatic secret/token redaction (AWS, GitHub, JWT, API keys, passwords)
+# - Optional sleek macOS-style window frame & titlebar overlay
+# - Exports YouTube chapter markers (.chapters.txt) when `rec mark` is used
 # - Names each video/part after the primary tool/process run (e.g. nmap_20261125-134012.mp4)
 
 CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/config"
@@ -21,6 +25,9 @@ MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
 IDLE_LIMIT="${REC_IDLE_LIMIT:-${CAST_IDLE_LIMIT:-1.5}}"
 OUT_DIR="${REC_VIDEO_DIR:-${TERM_VIDEO_DIR:-$HOME/Videos/content}}"
 THEME_NAME="${REC_THEME:-tokyo-night}"
+RESOLUTION="${REC_RESOLUTION:-4k}"
+FRAME_MODE="${REC_FRAME:-on}"
+REDACT_MODE="${REC_REDACT:-on}"
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -31,8 +38,23 @@ while [[ $# -gt 0 ]]; do
     --max-secs|-m) MAX_SECS="$2"; shift 2 ;;
     --out-dir|-o) OUT_DIR="$2"; shift 2 ;;
     --theme|-t) THEME_NAME="$2"; shift 2 ;;
+    --res|--resolution|-r) RESOLUTION="$2"; shift 2 ;;
+    --frame) FRAME_MODE="on"; shift ;;
+    --no-frame) FRAME_MODE="off"; shift ;;
+    --redact) REDACT_MODE="on"; shift ;;
+    --no-redact) REDACT_MODE="off"; shift ;;
     -h|--help)
-      echo "Usage: cast2mp4 [--auto] [--cleanup] [--speed N] [--max-secs 300] [--theme NAME] <input.cast> [output.mp4]"
+      cat <<EOF
+Usage: cast2mp4 [options] <input.cast> [output.mp4] [speed]
+  --res, -r RES    720p | 1080p | 1440p | 4k (default) | vertical (9:16)
+  --speed, -s N    Playback speed multiplier (default: 2)
+  --max-secs N     Max seconds per clip before splitting (default: 300)
+  --theme NAME     tokyo-night | dracula | catppuccin | gruvbox | nord
+  --frame/--no-frame     Toggle rounded window frame overlay (default: on)
+  --redact/--no-redact   Toggle secret/token redaction (default: on)
+  --auto           Apply input+output gating, OpenVPN skip & process naming
+  --cleanup        Delete source .cast + .meta after successful render
+EOF
       exit 0
       ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -40,7 +62,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#POSITIONAL[@]} -lt 1 ]]; then
-  echo "Usage: cast2mp4 [--auto] [--cleanup] [--speed N] <input.cast> [output.mp4]" >&2
+  echo "Usage: cast2mp4 [options] <input.cast> [output.mp4]" >&2
   exit 1
 fi
 
@@ -55,38 +77,71 @@ if [[ ! -f "$INPUT" ]]; then
   exit 1
 fi
 
-# Resolve theme palette (bg,fg,color0..color7) + padding hex
-case "$THEME_NAME" in
+# Resolve resolution preset -> canvas size, native crisp agg font size, padding, CRF
+RES_LC="${RESOLUTION,,}"
+case "$RES_LC" in
+  720p|hd)
+    OUT_W=1280; OUT_H=720; FONT_SIZE=16; INNER_W=1180; INNER_H=620; TITLE_H=34; CRF=18
+    ;;
+  1080p|fhd)
+    OUT_W=1920; OUT_H=1080; FONT_SIZE=22; INNER_W=1780; INNER_H=940; TITLE_H=44; CRF=18
+    ;;
+  1440p|2k|qhd)
+    OUT_W=2560; OUT_H=1440; FONT_SIZE=30; INNER_W=2380; INNER_H=1260; TITLE_H=56; CRF=17
+    ;;
+  4k|2160p|uhd)
+    OUT_W=3840; OUT_H=2160; FONT_SIZE=44; INNER_W=3560; INNER_H=1890; TITLE_H=78; CRF=16
+    ;;
+  vertical|shorts|tiktok|reels|9:16)
+    OUT_W=1080; OUT_H=1920; FONT_SIZE=24; INNER_W=980; INNER_H=1720; TITLE_H=46; CRF=18
+    ;;
+  *)
+    echo "Unknown resolution '$RESOLUTION' (use: 720p, 1080p, 1440p, 4k, vertical)" >&2
+    exit 1
+    ;;
+esac
+
+# Resolve theme palette (bg,fg,color0..color7) + backdrop/border accents
+case "${THEME_NAME,,}" in
   tokyo-night|tokyonight)
     AGG_THEME="1a1b26,c0caf5,15161e,f7768e,9ece6a,e0af68,7aa2f7,bb9af7,7dcfff,a9b1d6"
-    PAD_COLOR="#1a1b26"
+    BG_HEX="#1a1b26"; CANVAS_TOP="#16161e"; CANVAS_BOT="#1f2335"; ACCENT_HEX="#bb9af7"; FG_HEX="#c0caf5"
     ;;
   dracula)
     AGG_THEME="282a36,f8f8f2,21222c,ff5555,50fa7b,f1fa8c,bd93f9,ff79c6,8be9fd,f8f8f2"
-    PAD_COLOR="#282a36"
+    BG_HEX="#282a36"; CANVAS_TOP="#1e1f29"; CANVAS_BOT="#303344"; ACCENT_HEX="#bd93f9"; FG_HEX="#f8f8f2"
     ;;
   catppuccin|catppuccin-mocha)
     AGG_THEME="1e1e2e,cdd6f4,45475a,f38ba8,a6e3a1,f9e2af,89b4fa,f5c2e7,94e2d5,bac2de"
-    PAD_COLOR="#1e1e2e"
+    BG_HEX="#1e1e2e"; CANVAS_TOP="#181825"; CANVAS_BOT="#26263a"; ACCENT_HEX="#cba6f7"; FG_HEX="#cdd6f4"
     ;;
   gruvbox|gruvbox-dark)
     AGG_THEME="282828,ebdbb2,282828,cc241d,98971a,d79921,458588,b16286,689d6a,a89984"
-    PAD_COLOR="#282828"
+    BG_HEX="#282828"; CANVAS_TOP="#1d2021"; CANVAS_BOT="#32302f"; ACCENT_HEX="#fabd2f"; FG_HEX="#ebdbb2"
     ;;
   nord)
     AGG_THEME="2e3440,d8dee9,3b4252,bf616a,a3be8c,ebcb8b,81a1c1,b48ead,88c0d0,e5e9f0"
-    PAD_COLOR="#2e3440"
+    BG_HEX="#2e3440"; CANVAS_TOP="#242933"; CANVAS_BOT="#3b4252"; ACCENT_HEX="#88c0d0"; FG_HEX="#eceff4"
     ;;
   *)
     AGG_THEME="1a1b26,c0caf5,15161e,f7768e,9ece6a,e0af68,7aa2f7,bb9af7,7dcfff,a9b1d6"
-    PAD_COLOR="#1a1b26"
+    BG_HEX="#1a1b26"; CANVAS_TOP="#16161e"; CANVAS_BOT="#1f2335"; ACCENT_HEX="#bb9af7"; FG_HEX="#c0caf5"
     ;;
 esac
 
 META_FILE="${INPUT%.cast}.meta"
 mkdir -p "$OUT_DIR"
 
-PLAN="$(python3 - "$INPUT" "$META_FILE" "$IDLE_LIMIT" "$SPEED" "$MAX_SECS" "$AUTO_MODE" <<'PYEOF'
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+RENDER_CAST="$INPUT"
+if [[ "${REDACT_MODE,,}" != "off" && "${REDACT_MODE,,}" != "0" && "${REDACT_MODE,,}" != "false" ]]; then
+  RENDER_CAST="$WORK_DIR/redacted.cast"
+fi
+
+# Analyze cast + meta sidecar (and optionally write secret-redacted cast copy + chapter maps)
+PLAN="$(python3 - "$INPUT" "$META_FILE" "$IDLE_LIMIT" "$SPEED" "$MAX_SECS" "$AUTO_MODE" "$RENDER_CAST" "$WORK_DIR" <<'PYEOF'
 import json
 import os
 import re
@@ -100,6 +155,9 @@ idle_limit = float(sys.argv[3])
 speed = max(0.1, float(sys.argv[4]))
 max_secs = max(10.0, float(sys.argv[5]))
 auto_mode = sys.argv[6] == "1"
+render_cast_path = sys.argv[7]
+work_dir = sys.argv[8]
+do_redact = (render_cast_path != cast_path)
 
 WRAPPERS = {
     "sudo", "doas", "env", "time", "command", "builtin", "nohup", "nice",
@@ -121,6 +179,23 @@ TRIVIAL_CMDS = {
 }
 
 INTERPRETERS = {"python", "python3", "python2", "bash", "sh", "zsh", "fish", "ruby", "perl", "node", "php", "go"}
+
+SECRET_PATTERNS = [
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_KEY]"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "[REDACTED_GH_TOKEN]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED_GH_TOKEN]"),
+    (re.compile(r"\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,}\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "[REDACTED_JWT]"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]{20,}", re.I), r"\1[REDACTED_TOKEN]"),
+    (re.compile(r"((?:PASSWORD|PASSWD|API_KEY|APIKEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_TOKEN)\s*[=:]\s*['\"]?)([^\s'\"\r\n;]{4,})", re.I), r"\1[REDACTED]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+]
+
+
+def redact_text(s: str) -> str:
+    for pat, repl in SECRET_PATTERNS:
+        s = pat.sub(repl, s)
+    return s
 
 
 def sanitize(name: str) -> str:
@@ -186,18 +261,21 @@ adj_t = 0.0
 has_stdin_events = False
 output_sample = []
 
+out_f = open(render_cast_path, "w", encoding="utf-8") if do_redact else None
 try:
     with open(cast_path, "r", encoding="utf-8", errors="replace") as f:
         first = f.readline()
         if not first.strip():
             sys.exit(0)
         header = json.loads(first)
+        if out_f:
+            out_f.write(first)
         for line in f:
-            line = line.strip()
-            if not line:
+            stripped = line.strip()
+            if not stripped:
                 continue
             try:
-                ev = json.loads(line)
+                ev = json.loads(stripped)
             except Exception:
                 continue
             if not isinstance(ev, list) or len(ev) < 3:
@@ -205,6 +283,10 @@ try:
             t = float(ev[0])
             etype = ev[1]
             data = ev[2] if isinstance(ev[2], str) else ""
+            if do_redact and data:
+                data = redact_text(data)
+            if out_f:
+                out_f.write(json.dumps([t, etype, data]) + "\n")
             dt = max(0.0, t - raw_prev)
             raw_prev = t
             if idle_limit > 0 and dt > idle_limit:
@@ -217,6 +299,9 @@ try:
             events.append((t, adj_t, etype, len(data)))
 except Exception:
     sys.exit(0)
+finally:
+    if out_f:
+        out_f.close()
 
 if not events:
     sys.exit(0)
@@ -226,24 +311,32 @@ start_epoch = float(header.get("timestamp") or os.path.getmtime(cast_path))
 stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(start_epoch))
 
 meta_cmds = []
+meta_marks = []  # list of (rel_raw_sec, label)
 custom_name = ""
 if os.path.isfile(meta_path):
     try:
         with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
             for line in mf:
                 line = line.rstrip("\n")
-                if "\t" not in line:
+                parts = line.split("\t")
+                if len(parts) < 2:
                     continue
-                ts_str, cmdline = line.split("\t", 1)
-                if ts_str == "NAME":
-                    custom_name = sanitize(cmdline)
+                if parts[0] == "NAME":
+                    custom_name = sanitize(parts[1])
+                    continue
+                if parts[0] == "MARK" and len(parts) >= 3:
+                    try:
+                        mts = float(parts[1])
+                        meta_marks.append((max(0.0, mts - start_epoch), parts[2].strip()))
+                    except ValueError:
+                        pass
                     continue
                 try:
-                    ts = float(ts_str)
+                    ts = float(parts[0])
                 except ValueError:
                     continue
                 rel_t = max(0.0, ts - start_epoch)
-                tool, is_skip, is_trivial = extract_tool(cmdline)
+                tool, is_skip, is_trivial = extract_tool(parts[1])
                 if tool:
                     meta_cmds.append((rel_t, tool, is_skip, is_trivial))
     except Exception:
@@ -261,6 +354,7 @@ def raw_to_adj(raw_sec: float) -> float:
 
 
 adj_cmds = [(raw_to_adj(rt), tool, is_skip, is_trivial) for (rt, tool, is_skip, is_trivial) in meta_cmds]
+adj_marks = [(raw_to_adj(rt), label) for (rt, label) in meta_marks if label]
 
 sample_text = "".join(output_sample)
 looks_like_ovpn = ("Initialization Sequence Completed" in sample_text or ("OpenVPN" in sample_text and "TUN/TAP" in sample_text))
@@ -334,9 +428,26 @@ for idx in range(num_chunks):
 
     chunks.append((c_start, c_end, tool or "terminal"))
 
+
+def fmt_chapter_ts(sec: float) -> str:
+    s = max(0, int(sec))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
 for i, (s, e, tool) in enumerate(chunks, 1):
     is_multi = 1 if len(chunks) > 1 else 0
-    print(f"{s:.2f}\t{e:.2f}\t{tool}\t{stamp}\t{i}\t{is_multi}")
+    # Write YouTube chapters file for this chunk if user dropped `rec mark` markers
+    chunk_marks = [(mt - s, lbl) for (mt, lbl) in adj_marks if s <= mt <= e]
+    chap_file = ""
+    if chunk_marks:
+        chap_file = os.path.join(work_dir, f"chapters_{i}.txt")
+        with open(chap_file, "w", encoding="utf-8") as cf:
+            cf.write(f"00:00 {tool}\n")
+            for rel_sec, lbl in chunk_marks:
+                cf.write(f"{fmt_chapter_ts(rel_sec)} {lbl}\n")
+    print(f"{s:.2f}\t{e:.2f}\t{tool}\t{stamp}\t{i}\t{is_multi}\t{chap_file}")
 PYEOF
 )"
 
@@ -347,9 +458,106 @@ if [[ -z "$PLAN" ]]; then
   exit 0
 fi
 
+# Helper: generate crisp rounded macOS-style window frame backdrop PNG via PIL (if installed)
+make_frame_png() {
+  local out_png="$1" title="$2"
+  python3 - "$out_png" "$OUT_W" "$OUT_H" "$INNER_W" "$INNER_H" "$TITLE_H" "$BG_HEX" "$CANVAS_TOP" "$CANVAS_BOT" "$ACCENT_HEX" "$FG_HEX" "$title" <<'PYEOF' 2>/dev/null || return 1
+import sys
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+out_png = sys.argv[1]
+W, H = int(sys.argv[2]), int(sys.argv[3])
+IW, IH, TH = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+bg_hex, top_hex, bot_hex, acc_hex, fg_hex = sys.argv[7:12]
+title = sys.argv[12]
+
+def h2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+top_c, bot_c, bg_c, acc_c, fg_c = map(h2rgb, (top_hex, bot_hex, bg_hex, acc_hex, fg_hex))
+
+# Smooth vertical gradient backdrop
+img = Image.new("RGBA", (W, H))
+grad = Image.new("RGBA", (1, H))
+gd = ImageDraw.Draw(grad)
+for y in range(H):
+    t = y / max(1, H - 1)
+    r = int(top_c[0] + (bot_c[0] - top_c[0]) * t)
+    g = int(top_c[1] + (bot_c[1] - top_c[1]) * t)
+    b = int(top_c[2] + (bot_c[2] - top_c[2]) * t)
+    gd.point((0, y), fill=(r, g, b, 255))
+img.paste(grad.resize((W, H), Image.Resampling.BILINEAR), (0, 0))
+
+pad_x = max(16, W // 120)
+pad_y = max(14, H // 100)
+win_w = IW + pad_x * 2
+win_h = IH + TH + pad_y * 2
+wx = (W - win_w) // 2
+wy = (H - win_h) // 2
+radius = max(14, W // 140)
+
+# Soft drop shadow
+shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+sd = ImageDraw.Draw(shadow)
+sh_off = max(8, H // 140)
+sd.rounded_rectangle([wx, wy + sh_off, wx + win_w, wy + win_h + sh_off], radius=radius, fill=(0, 0, 0, 145))
+shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(14, W // 90)))
+img = Image.alpha_composite(img, shadow)
+
+# Main rounded terminal card + subtle accent border
+card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+cd = ImageDraw.Draw(card)
+border_w = max(2, W // 1200)
+cd.rounded_rectangle(
+    [wx, wy, wx + win_w, wy + win_h],
+    radius=radius,
+    fill=bg_c + (255,),
+    outline=acc_c + (155,),
+    width=border_w,
+)
+
+# Subtle titlebar separator line
+sep_y = wy + TH
+cd.line([wx + border_w, sep_y, wx + win_w - border_w, sep_y], fill=acc_c + (45,), width=max(1, border_w // 2))
+
+# macOS-style traffic light dots
+dot_r = max(5, TH // 6)
+dot_cy = wy + TH // 2
+dot_x0 = wx + max(20, TH // 2)
+dot_gap = int(dot_r * 3.1)
+for idx, col in enumerate(((247, 118, 142, 255), (224, 175, 104, 255), (158, 206, 106, 255))):
+    cx = dot_x0 + idx * dot_gap
+    cd.ellipse([cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r], fill=col)
+
+# Centered title text
+font = None
+for fp in (
+    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
+):
+    try:
+        font = ImageFont.truetype(fp, max(13, int(TH * 0.42)))
+        break
+    except Exception:
+        pass
+if font is None:
+    font = ImageFont.load_default()
+
+label = f"{title}  •  rec-cli"
+bbox = cd.textbbox((0, 0), label, font=font)
+tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+cd.text((wx + (win_w - tw) // 2, wy + (TH - th) // 2 - bbox[1] // 2), label, fill=fg_c + (185,), font=font)
+
+img = Image.alpha_composite(img, card).convert("RGB")
+img.save(out_png, "PNG")
+PYEOF
+}
+
 ALL_OK=1
 
-while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI; do
+while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
   [[ -z "$START" ]] && continue
 
   if [[ -n "$EXPLICIT_OUT" ]]; then
@@ -370,14 +578,14 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI; do
   fi
 
   mkdir -p "$(dirname "$OUTPUT")"
-  TMP_GIF="$(mktemp --suffix=.gif)"
+  TMP_GIF="$WORK_DIR/part_${PART}.gif"
   TMP_MP4="${OUTPUT}.tmp.$$.mp4"
 
   AGG_ARGS=(
     --quiet
     --theme "$AGG_THEME"
     --text-font-family "JetBrainsMono Nerd Font,JetBrains Mono,Fira Code,DejaVu Sans Mono,Liberation Mono"
-    --font-size 22
+    --font-size "$FONT_SIZE"
     --speed "$SPEED"
     --fps-cap 60
     --idle-time-limit "$IDLE_LIMIT"
@@ -386,23 +594,68 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI; do
     AGG_ARGS+=(--select "${START}..${END}")
   fi
 
-  if agg "${AGG_ARGS[@]}" "$INPUT" "$TMP_GIF" \
-    && ffmpeg -y -loglevel error \
+  if ! agg "${AGG_ARGS[@]}" "$RENDER_CAST" "$TMP_GIF"; then
+    rm -f "$TMP_GIF"
+    ALL_OK=0
+    continue
+  fi
+
+  FRAME_PNG="$WORK_DIR/frame_${PART}.png"
+  USE_FRAME=0
+  if [[ "${FRAME_MODE,,}" != "off" && "${FRAME_MODE,,}" != "0" && "${FRAME_MODE,,}" != "false" ]]; then
+    if make_frame_png "$FRAME_PNG" "$TOOL"; then
+      USE_FRAME=1
+    fi
+  fi
+
+  if [[ "$USE_FRAME" -eq 1 ]]; then
+    # Composite scaled terminal neatly inside the rounded window below the titlebar
+    PAD_Y=$(( OUT_H / 100 ))
+    (( PAD_Y < 14 )) && PAD_Y=14
+    WIN_H=$(( INNER_H + TITLE_H + PAD_Y * 2 ))
+    WY=$(( (OUT_H - WIN_H) / 2 ))
+    TERM_Y=$(( WY + TITLE_H + PAD_Y ))
+
+    if ffmpeg -y -loglevel error \
+      -loop 1 -i "$FRAME_PNG" \
+      -i "$TMP_GIF" \
+      -filter_complex "[1:v]scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos[term];[0:v][term]overlay=(W-w)/2:${TERM_Y}+(${INNER_H}-h)/2:shortest=1[out]" \
+      -map "[out]" \
+      -movflags +faststart \
+      -pix_fmt yuv420p \
+      -c:v libx264 \
+      -profile:v high \
+      -crf "$CRF" \
+      -preset medium \
+      "$TMP_MP4"
+    then
+      mv -f "$TMP_MP4" "$OUTPUT"
+      [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+    else
+      rm -f "$TMP_MP4"
+      ALL_OK=0
+    fi
+  else
+    if ffmpeg -y -loglevel error \
       -i "$TMP_GIF" \
       -movflags +faststart \
       -pix_fmt yuv420p \
       -c:v libx264 \
-      -crf 18 \
+      -profile:v high \
+      -crf "$CRF" \
       -preset medium \
-      -vf "scale=1840:1000:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=${PAD_COLOR}" \
+      -vf "scale=${INNER_W}:${INNER_H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:color=${BG_HEX}" \
       "$TMP_MP4"
-  then
-    mv -f "$TMP_MP4" "$OUTPUT"
-    rm -f "$TMP_GIF"
-  else
-    rm -f "$TMP_GIF" "$TMP_MP4"
-    ALL_OK=0
+    then
+      mv -f "$TMP_MP4" "$OUTPUT"
+      [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+    else
+      rm -f "$TMP_MP4"
+      ALL_OK=0
+    fi
   fi
+
+  rm -f "$TMP_GIF" "$FRAME_PNG"
 done <<< "$PLAN"
 
 if [[ "$CLEANUP" -eq 1 && "$ALL_OK" -eq 1 ]]; then
