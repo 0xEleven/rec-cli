@@ -1,5 +1,5 @@
 Name:           rec-cli
-Version:        1.3.0
+Version:        1.4.0
 Release:        1%{?dist}
 Summary:        Smart terminal clip recorder CLI for Zsh, Bash, and Fish
 License:        MIT
@@ -26,12 +26,15 @@ or process you ran.
 %install
 install -Dm755 bin/rec-cli    %{buildroot}%{_bindir}/rec-cli
 install -Dm755 bin/rec-pty    %{buildroot}%{_bindir}/rec-pty
+install -Dm755 bin/rec-gui    %{buildroot}%{_bindir}/rec-gui
 install -Dm755 bin/cast2mp4   %{buildroot}%{_bindir}/cast2mp4
 install -Dm755 bin/casts2mp4  %{buildroot}%{_bindir}/casts2mp4
 install -Dm644 shell/rec.zsh  %{buildroot}%{_datadir}/rec-cli/shell/rec.zsh
 install -Dm644 shell/rec.bash %{buildroot}%{_datadir}/rec-cli/shell/rec.bash
 install -Dm644 shell/rec.fish %{buildroot}%{_datadir}/rec-cli/shell/rec.fish
 install -Dm644 starship/rec-module.toml %{buildroot}%{_datadir}/rec-cli/starship/rec-module.toml
+install -Dm644 packaging/desktop/rec-cli.desktop %{buildroot}%{_datadir}/applications/rec-cli.desktop
+install -Dm644 assets/logo.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/rec-cli.svg
 
 %post
 echo ""
@@ -48,9 +51,12 @@ echo ""
 %doc README.md
 %{_bindir}/rec-cli
 %{_bindir}/rec-pty
+%{_bindir}/rec-gui
 %{_bindir}/cast2mp4
 %{_bindir}/casts2mp4
 %{_datadir}/rec-cli/
+%{_datadir}/applications/rec-cli.desktop
+%{_datadir}/icons/hicolor/scalable/apps/rec-cli.svg
 
 %changelog
 * Wed Nov 25 2026 0xEleven <0xEleven@users.noreply.github.com> - 1.0.0-1

@@ -16,6 +16,7 @@
 
 ## What it does
 
+- Desktop GUI (`rec gui` or app launcher) built with Qt6 (`PyQt6`/`PySide6`/`PyQt5`), featuring Dark & Light mode, a visual terminal picker, live PID session controls, instant settings, and a clips library browser.
 - Manage parallel recordings like processes (`rec ps`): start, stop, pause, resume, cancel, or drop chapter markers on ANY recording by PID or name from ANY other terminal, even while SSHed into a remote machine, without dropping your SSH session.
 - Records terminal sessions into MP4 videos at `auto` (detects your screen resolution automatically), `720p`, `1080p`, `1440p`, `4k`, `reels` (9:16 cursor-following auto-reframe), or `reels-4k`.
 - Auto-reframe for TikTok, Instagram Reels, and YouTube Shorts tracks your cursor with smooth critically-damped springs and automatically fits full multi-line commands and wide output (like `nmap` tables) so nothing gets cropped.
@@ -44,7 +45,7 @@ cd rec-cli
 Download the `.deb` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo apt install ./rec-cli_1.3.0_all.deb
+sudo apt install ./rec-cli_1.4.0_all.deb
 ```
 
 ### Fedora / RHEL / Rocky / Alma / openSUSE
@@ -52,9 +53,9 @@ sudo apt install ./rec-cli_1.3.0_all.deb
 Download the `.rpm` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo dnf install ./rec-cli-1.3.0-1.noarch.rpm
+sudo dnf install ./rec-cli-1.4.0-1.noarch.rpm
 # openSUSE
-sudo zypper install ./rec-cli-1.3.0-1.noarch.rpm
+sudo zypper install ./rec-cli-1.4.0-1.noarch.rpm
 ```
 
 ### Arch / Manjaro / EndeavourOS
@@ -77,6 +78,7 @@ Optional Starship `● REC` prompt badge: paste [starship/rec-module.toml](stars
 
 | Command | Action |
 | --- | --- |
+| `rec gui` | Open the Qt desktop GUI (Dark/Light mode, terminal selector, live PID controls, clips library) |
 | `rec ps` | List all live recording sessions with PID, state (`REC`/`PAUSED`/`STANDBY`), name, elapsed time, size, and running command |
 | `rec start [name]` | Start recording this terminal, or run `rec start <pid> [name]` to start a fresh clip on another live session |
 | `rec stop [pid\|name\|all]` | Stop and render MP4 without closing the tab or dropping SSH |

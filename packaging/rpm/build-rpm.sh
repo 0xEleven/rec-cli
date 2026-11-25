@@ -4,7 +4,7 @@ umask 022
 
 # Build a Fedora/RHEL/Rocky/Alma/openSUSE .rpm package for rec-cli
 
-VERSION="${VERSION:-1.3.0}"
+VERSION="${VERSION:-1.4.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
@@ -15,7 +15,7 @@ mkdir -p "$TOPDIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,TMP,rpmdb}
 
 SRC_STAGE="$TOPDIR/rec-cli-${VERSION}"
 mkdir -p "$SRC_STAGE"
-cp -r "$REPO_ROOT/bin" "$REPO_ROOT/shell" "$REPO_ROOT/starship" "$REPO_ROOT/README.md" "$REPO_ROOT/LICENSE" "$SRC_STAGE/"
+cp -r "$REPO_ROOT/bin" "$REPO_ROOT/shell" "$REPO_ROOT/starship" "$REPO_ROOT/assets" "$REPO_ROOT/packaging" "$REPO_ROOT/README.md" "$REPO_ROOT/LICENSE" "$SRC_STAGE/"
 tar -czf "$TOPDIR/SOURCES/rec-cli-${VERSION}.tar.gz" -C "$TOPDIR" "rec-cli-${VERSION}"
 
 sed "s/^Version:.*/Version:        ${VERSION}/" "$SCRIPT_DIR/rec-cli.spec" > "$TOPDIR/SPECS/rec-cli.spec"

@@ -6,7 +6,7 @@ set -euo pipefail
 #           Fedora, RHEL, Rocky, Alma, CentOS, openSUSE, Alpine, Void, Gentoo
 # Shells:   Zsh, Bash, Fish
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 PREFIX="${PREFIX:-$HOME/.local}"
 INSTALL_DEPS=1
 CONFIGURE_SHELLS=1
@@ -106,10 +106,13 @@ install_deps() {
 install_files() {
   local bin_dir="$PREFIX/bin"
   local share_dir="$PREFIX/share/rec-cli"
-  mkdir -p "$bin_dir" "$share_dir/shell" "$share_dir/starship"
+  local apps_dir="$PREFIX/share/applications"
+  local icons_dir="$PREFIX/share/icons/hicolor/scalable/apps"
+  mkdir -p "$bin_dir" "$share_dir/shell" "$share_dir/starship" "$apps_dir" "$icons_dir"
 
   install -m 755 "$REPO_ROOT/bin/rec-cli"   "$bin_dir/rec-cli"
   install -m 755 "$REPO_ROOT/bin/rec-pty"   "$bin_dir/rec-pty"
+  install -m 755 "$REPO_ROOT/bin/rec-gui"   "$bin_dir/rec-gui"
   install -m 755 "$REPO_ROOT/bin/cast2mp4"  "$bin_dir/cast2mp4"
   install -m 755 "$REPO_ROOT/bin/casts2mp4" "$bin_dir/casts2mp4"
 
@@ -117,6 +120,8 @@ install_files() {
   install -m 644 "$REPO_ROOT/shell/rec.bash" "$share_dir/shell/rec.bash"
   install -m 644 "$REPO_ROOT/shell/rec.fish" "$share_dir/shell/rec.fish"
   install -m 644 "$REPO_ROOT/starship/rec-module.toml" "$share_dir/starship/rec-module.toml"
+  install -m 644 "$REPO_ROOT/packaging/desktop/rec-cli.desktop" "$apps_dir/rec-cli.desktop"
+  install -m 644 "$REPO_ROOT/assets/logo.svg" "$icons_dir/rec-cli.svg"
 
   echo -e "${C_GREEN}✓ Installed binaries to ${bin_dir}${C_RESET}"
   echo -e "${C_GREEN}✓ Installed shell integrations to ${share_dir}/shell${C_RESET}"

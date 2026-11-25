@@ -25,14 +25,18 @@ if command -v fish >/dev/null 2>&1; then
   echo "PASS: fish syntax OK"
 fi
 
-echo "=== 2. rec-cli init & CLI commands ==="
-python3 -m py_compile "$REPO_ROOT/bin/rec-pty"
-rec-cli version | grep -q "rec-cli 1.3.0"
+echo "=== 2. rec-cli init, rec-pty & rec-gui checks ==="
+python3 -m py_compile "$REPO_ROOT/bin/rec-pty" "$REPO_ROOT/bin/rec-gui"
+rec-cli version | grep -q "rec-cli 1.4.0"
 rec-cli init zsh  | grep -q "_rec_is_allowed_terminal"
 rec-cli init bash | grep -q "_rec_bash_preexec"
 rec-cli init fish | grep -q "_rec_fish_preexec"
 XDG_CONFIG_HOME="$(mktemp -d)" rec-cli config auto | grep -q "Resolution set to auto"
-echo "PASS: rec-pty compile, rec-cli init & config auto work for zsh, bash, fish"
+if python3 -c "import PyQt6" 2>/dev/null || python3 -c "import PySide6" 2>/dev/null || python3 -c "import PyQt5" 2>/dev/null; then
+  QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME="" XDG_CURRENT_DESKTOP="" GNOME_DESKTOP_SESSION_ID="" XDG_CONFIG_HOME="$(mktemp -d)" "$REPO_ROOT/bin/rec-gui" --smoke-test | grep -q "SMOKE_OK"
+  echo "PASS: rec-gui Qt smoke test (dark/light theme toggle + UI init) OK"
+fi
+echo "PASS: rec-pty/rec-gui compile, rec-cli init & config auto work for zsh, bash, fish"
 
 echo "=== 2b. Live process-manager test (rec-pty + rec ps/pause/resume/mark/stop/start/cancel/kill) ==="
 RT_TEST="$(mktemp -d)"
@@ -195,4 +199,4 @@ REC_VIDEO_DIR="$OUT" rec-cli stats | grep -q "Total clips:"
 echo "PASS: rec thumb, gif, trim, stats all verified"
 
 echo ""
-echo "ALL v1.3.0 TESTS PASSED!"
+echo "ALL v1.4.0 TESTS PASSED!"

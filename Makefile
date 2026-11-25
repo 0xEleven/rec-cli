@@ -1,4 +1,4 @@
-VERSION ?= 1.3.0
+VERSION ?= 1.4.0
 PREFIX  ?= $(HOME)/.local
 
 .PHONY: install uninstall deb rpm tarball packages test lint clean
@@ -18,7 +18,7 @@ rpm:
 tarball:
 	mkdir -p dist
 	tar --transform "s,^,rec-cli-$(VERSION)/," -czf "dist/rec-cli-$(VERSION).tar.gz" \
-		bin shell starship scripts packaging LICENSE README.md Makefile
+		bin shell starship scripts packaging assets LICENSE README.md Makefile
 
 packages: deb rpm tarball
 
