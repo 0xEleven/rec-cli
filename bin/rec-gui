@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""rec-gui — Modern Qt desktop manager for rec-cli v1.4.0.
+"""rec-gui — Native Qt6 desktop manager for rec-cli.
 
-Features:
-- Live process manager (view/pause/resume/mark/stop/start/cancel/kill parallel sessions & SSH panes)
-- Visual terminal picker (toggle Kitty, Tabby, Alacritty, WezTerm, Ghostty, Foot, Konsole, GNOME Terminal, or All)
-- Instant-save settings (auto/4K/Reels resolution, speed, max length, theme, window frame, secret redaction, Reels copy)
-- Clips library browser (filter, play, export GIF, extract thumbnail, open folder, delete)
-- Clean Dark & Light themes with 1-click toggle
+Clean monochrome Dark & Light UI with real-time detection of:
+- Active rec-pty sessions (recording / paused / standby)
+- Legacy pre-v1.3.0 asciinema tabs
+- Already-running terminal tabs (Kitty, Tabby, Alacritty, WezTerm, Ghostty, etc.)
+- Visual terminal auto-record picker, recording settings, and clips library
 """
 
 from __future__ import annotations
@@ -21,40 +20,39 @@ import sys
 import time
 from pathlib import Path
 
-# Prevent Qt from loading GTK3/GNOME platform theme plugins during headless/offscreen runs
+# Prevent Qt from loading GTK3/GNOME platform themes in headless/offscreen runs
 if "--smoke-test" in sys.argv or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ["QT_QPA_PLATFORMTHEME"] = ""
     os.environ["XDG_CURRENT_DESKTOP"] = ""
     os.environ["GNOME_DESKTOP_SESSION_ID"] = ""
 
-# Support PyQt6 -> PySide6 -> PyQt5 gracefully across distros
 QT_BINDING = None
 try:
-    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal, QSize, QRectF
-    from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal, QSize, QRectF, QPointF
+    from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QCursor
     from PyQt6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+        QApplication, QComboBox, QFileDialog, QFrame, QGridLayout,
         QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
         QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
     )
     QT_BINDING = "PyQt6"
 except ImportError:
     try:
-        from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF
-        from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+        from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF, QPointF
+        from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QCursor
         from PySide6.QtWidgets import (
-            QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+            QApplication, QComboBox, QFileDialog, QFrame, QGridLayout,
             QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
             QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
         )
         QT_BINDING = "PySide6"
     except ImportError:
         try:
-            from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal, QSize, QRectF
-            from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+            from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal, QSize, QRectF, QPointF
+            from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QCursor
             from PyQt5.QtWidgets import (
-                QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+                QApplication, QComboBox, QFileDialog, QFrame, QGridLayout,
                 QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
                 QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
             )
@@ -84,58 +82,314 @@ TERMINALS = [
     ("kitty", "Kitty", ("kitty",)),
     ("tabby", "Tabby", ("tabby",)),
     ("alacritty", "Alacritty", ("alacritty",)),
-    ("wezterm", "WezTerm", ("wezterm",)),
+    ("wezterm", "WezTerm", ("wezterm", "wezterm-gui")),
     ("ghostty", "Ghostty", ("ghostty",)),
     ("foot", "Foot", ("foot",)),
     ("konsole", "Konsole", ("konsole",)),
-    ("gnome-terminal", "GNOME Terminal", ("gnome-terminal", "kgx")),
+    ("gnome-terminal", "GNOME Terminal", ("gnome-terminal", "gnome-terminal-server", "kgx")),
 ]
 
-# Clean, calm, high-contrast palettes (no neon slop)
+PROC_TERM_MAP = {
+    "kitty": "kitty",
+    "tabby": "tabby",
+    "alacritty": "alacritty",
+    "wezterm": "wezterm",
+    "wezterm-gui": "wezterm",
+    "ghostty": "ghostty",
+    "foot": "foot",
+    "konsole": "konsole",
+    "gnome-terminal": "gnome-terminal",
+    "gnome-terminal-": "gnome-terminal",
+    "gnome-terminal-server": "gnome-terminal",
+    "kgx": "gnome-terminal",
+    "xfce4-terminal": "xfce4-terminal",
+    "tilix": "tilix",
+    "terminator": "terminator",
+    "xterm": "xterm",
+    "urxvt": "urxvt",
+    "st": "st",
+}
+
+SHELL_COMMS = {"zsh", "bash", "fish", "sh", "nu", "elvish", "tcsh", "ksh"}
+
+# True neutral monochrome palettes — red reserved strictly for recording state
 THEMES = {
     "dark": {
-        "bg": "#111218",
-        "surface": "#181a23",
-        "surface_alt": "#1f2230",
-        "surface_hover": "#252938",
-        "border": "#2a2e3f",
-        "border_strong": "#3a4058",
-        "text": "#e4e7f2",
-        "text_muted": "#8e95b0",
-        "text_dim": "#636a85",
-        "accent": "#8b7cf6",
-        "accent_hover": "#9d90f8",
-        "accent_soft": "rgba(139, 124, 246, 0.16)",
-        "danger": "#f0657a",
-        "danger_soft": "rgba(240, 101, 122, 0.15)",
-        "warn": "#e5b567",
-        "warn_soft": "rgba(229, 181, 103, 0.16)",
-        "success": "#7ec699",
-        "success_soft": "rgba(126, 198, 153, 0.16)",
-        "btn_text": "#ffffff",
+        "bg": "#0c0c0e",
+        "sidebar": "#111114",
+        "surface": "#16161a",
+        "surface_alt": "#1d1d22",
+        "surface_hover": "#25252c",
+        "border": "#24242a",
+        "border_strong": "#34343d",
+        "text": "#f2f2f5",
+        "text_muted": "#92929e",
+        "text_dim": "#5c5c68",
+        "primary_bg": "#f2f2f5",
+        "primary_hover": "#ffffff",
+        "primary_fg": "#0c0c0e",
+        "rec": "#e5484d",
+        "rec_hover": "#f0565b",
+        "rec_soft": "rgba(229, 72, 77, 0.14)",
+        "warn": "#e5a000",
+        "warn_soft": "rgba(229, 160, 0, 0.14)",
+        "ok": "#30a46c",
+        "ok_soft": "rgba(48, 164, 108, 0.14)",
+        "track_off": "#2c2c34",
+        "track_on": "#f2f2f5",
+        "thumb_off": "#8e8e9a",
+        "thumb_on": "#0c0c0e",
+        "nav_active": "#1e1e24",
     },
     "light": {
-        "bg": "#f6f7fa",
+        "bg": "#f5f5f7",
+        "sidebar": "#ededf0",
         "surface": "#ffffff",
-        "surface_alt": "#f0f2f7",
-        "surface_hover": "#e7eaf2",
-        "border": "#e1e5ef",
-        "border_strong": "#cbd2e1",
-        "text": "#171923",
-        "text_muted": "#5a6278",
-        "text_dim": "#8790a8",
-        "accent": "#6355e0",
-        "accent_hover": "#5446d1",
-        "accent_soft": "rgba(99, 85, 224, 0.10)",
-        "danger": "#dc3b55",
-        "danger_soft": "rgba(220, 59, 85, 0.11)",
-        "warn": "#c57f17",
-        "warn_soft": "rgba(197, 127, 23, 0.12)",
-        "success": "#1f8a5b",
-        "success_soft": "rgba(31, 138, 91, 0.12)",
-        "btn_text": "#ffffff",
+        "surface_alt": "#f3f3f6",
+        "surface_hover": "#e8e8ee",
+        "border": "#e2e2e8",
+        "border_strong": "#ccccd6",
+        "text": "#111115",
+        "text_muted": "#5e5e6b",
+        "text_dim": "#8e8e9c",
+        "primary_bg": "#141418",
+        "primary_hover": "#26262e",
+        "primary_fg": "#ffffff",
+        "rec": "#dc353b",
+        "rec_hover": "#c52b31",
+        "rec_soft": "rgba(220, 53, 59, 0.11)",
+        "warn": "#b4690e",
+        "warn_soft": "rgba(180, 105, 14, 0.12)",
+        "ok": "#18794e",
+        "ok_soft": "rgba(24, 121, 78, 0.11)",
+        "track_off": "#d2d2dc",
+        "track_on": "#141418",
+        "thumb_off": "#ffffff",
+        "thumb_on": "#ffffff",
+        "nav_active": "#ffffff",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Custom-painted native controls (crisp vectors, no broken QSS hacks)
+# ---------------------------------------------------------------------------
+
+class ToggleSwitch(QWidget):
+    """Crisp pill toggle switch with custom-painted track and thumb."""
+    toggled = Signal(bool)
+
+    def __init__(self, checked: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._checked = checked
+        self._mode = "dark"
+        self._accent_red = False
+        self.setFixedSize(36, 20)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def set_theme(self, mode: str, accent_red: bool = False) -> None:
+        self._mode = mode
+        self._accent_red = accent_red
+        self.update()
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, val: bool) -> None:
+        val = bool(val)
+        if self._checked != val:
+            self._checked = val
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self.update()
+            self.toggled.emit(self._checked)
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, _event):
+        t = THEMES["light" if self._mode == "light" else "dark"]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        r = h / 2.0
+        enabled = self.isEnabled()
+
+        if self._checked:
+            track_col = QColor(t["rec"] if self._accent_red else t["track_on"])
+            thumb_col = QColor("#ffffff" if self._accent_red else t["thumb_on"])
+        else:
+            track_col = QColor(t["track_off"])
+            thumb_col = QColor(t["thumb_off"])
+
+        if not enabled:
+            track_col.setAlpha(110)
+            thumb_col.setAlpha(160)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track_col)
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+
+        pad = 3.0
+        d = h - pad * 2
+        x = (w - pad - d) if self._checked else pad
+        p.setBrush(thumb_col)
+        p.drawEllipse(QRectF(x, pad, d, d))
+        p.end()
+
+
+class ElidedLabel(QLabel):
+    """Single-line QLabel that cleanly elides overflowing text instead of widening layouts."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(text, parent)
+        self._full_text = text
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self.setToolTip(text)
+        self._apply_elide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self):
+        fm = self.fontMetrics()
+        w = max(40, self.width() - 2)
+        super().setText(fm.elidedText(self._full_text, Qt.TextElideMode.ElideRight, w))
+
+
+class CleanComboBox(QComboBox):
+    """QComboBox with a crisp custom-painted dropdown chevron."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._mode = "dark"
+
+    def set_theme(self, mode: str) -> None:
+        self._mode = mode
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        t = THEMES["light" if self._mode == "light" else "dark"]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx = self.width() - 16
+        cy = self.height() / 2.0
+        path = QPainterPath()
+        path.moveTo(cx - 4, cy - 2)
+        path.lineTo(cx, cy + 2.5)
+        path.lineTo(cx + 4, cy - 2)
+        pen = QPen(QColor(t["text_muted"]), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.end()
+
+
+def make_logo_pixmap(size: int = 26, dark: bool = True) -> QPixmap:
+    """Minimal `> ●` vector mark."""
+    w = int(size * 1.48)
+    h = size
+    pm = QPixmap(w, h)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    bg = QColor("#18181d") if dark else QColor("#141418")
+    border = QColor("#2c2c34") if dark else QColor("#24242c")
+    p.setBrush(bg)
+    p.setPen(QPen(border, 1.2))
+    p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), h * 0.25, h * 0.25)
+
+    path = QPainterPath()
+    path.moveTo(w * 0.24, h * 0.30)
+    path.lineTo(w * 0.43, h * 0.50)
+    path.lineTo(w * 0.24, h * 0.70)
+    pen = QPen(QColor("#f2f2f5"), max(2.0, h * 0.095))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(path)
+
+    r = h * 0.145
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#e5484d"))
+    p.drawEllipse(QRectF(w * 0.69 - r, h * 0.50 - r, r * 2, r * 2))
+    p.end()
+    return pm
+
+
+def make_nav_icon(kind: str, color_hex: str, size: int = 16) -> QIcon:
+    """Minimal 1.5px stroke icons for sidebar navigation."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color_hex), 1.5)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind == "sessions":
+        # Circle with inner dot (record / live)
+        p.drawEllipse(QRectF(2.5, 2.5, 11, 11))
+        p.setBrush(QColor(color_hex))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QRectF(6, 6, 4, 4))
+    elif kind == "terminals":
+        # Terminal box with >_
+        p.drawRoundedRect(QRectF(2, 2.5, 12, 11), 2.5, 2.5)
+        path = QPainterPath()
+        path.moveTo(4.8, 6.2)
+        path.lineTo(7.2, 8.2)
+        path.lineTo(4.8, 10.2)
+        p.drawPath(path)
+        p.drawLine(QPointF(8.6, 10.2), QPointF(11.2, 10.2))
+    elif kind == "clips":
+        # Play triangle inside frame
+        p.drawRoundedRect(QRectF(2, 3, 12, 10), 2.5, 2.5)
+        tri = QPainterPath()
+        tri.moveTo(6.6, 5.8)
+        tri.lineTo(10.4, 8.0)
+        tri.lineTo(6.6, 10.2)
+        tri.closeSubpath()
+        p.setBrush(QColor(color_hex))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPath(tri)
+    elif kind == "settings":
+        # Minimal 2 horizontal sliders
+        p.drawLine(QPointF(2.5, 5.5), QPointF(13.5, 5.5))
+        p.drawLine(QPointF(2.5, 10.5), QPointF(13.5, 10.5))
+        p.setBrush(QColor(color_hex))
+        p.drawEllipse(QRectF(4.8, 3.8, 3.4, 3.4))
+        p.drawEllipse(QRectF(8.2, 8.8, 3.4, 3.4))
+    elif kind == "sun":
+        p.drawEllipse(QRectF(5.5, 5.5, 5, 5))
+        for dx, dy in ((0, -5), (0, 5), (-5, 0), (5, 0), (-3.5, -3.5), (3.5, 3.5), (-3.5, 3.5), (3.5, -3.5)):
+            p.drawLine(QPointF(8 + dx * 0.72, 8 + dy * 0.72), QPointF(8 + dx, 8 + dy))
+    elif kind == "moon":
+        path = QPainterPath()
+        path.addEllipse(QRectF(3, 2.5, 10, 10.5))
+        cut = QPainterPath()
+        cut.addEllipse(QRectF(6.8, 1.8, 8.5, 8.5))
+        crescent = path.subtracted(cut)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color_hex))
+        p.drawPath(crescent)
+
+    p.end()
+    return QIcon(pm)
 
 
 def build_stylesheet(mode: str) -> str:
@@ -151,6 +405,23 @@ def build_stylesheet(mode: str) -> str:
         color: {t['text']};
         background: transparent;
     }}
+    QLabel#pageTitle {{
+        color: {t['text']};
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: -0.4px;
+    }}
+    QLabel#sectionLabel {{
+        color: {t['text_dim']};
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.7px;
+    }}
+    QLabel#rowTitle {{
+        color: {t['text']};
+        font-size: 13px;
+        font-weight: 600;
+    }}
     QLabel#muted {{
         color: {t['text_muted']};
         font-size: 12px;
@@ -159,99 +430,130 @@ def build_stylesheet(mode: str) -> str:
         color: {t['text_dim']};
         font-size: 11px;
     }}
-    QLabel#sectionTitle {{
-        color: {t['text']};
-        font-size: 14px;
-        font-weight: 600;
-        letter-spacing: -0.2px;
-    }}
     QLabel#appTitle {{
         color: {t['text']};
-        font-size: 15px;
+        font-size: 14px;
         font-weight: 700;
-        letter-spacing: -0.3px;
+        letter-spacing: -0.2px;
     }}
-    QLabel#monoBadge {{
+    QLabel#monoTag {{
         font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code", monospace;
         font-size: 11px;
         color: {t['text_muted']};
         background-color: {t['surface_alt']};
         border: 1px solid {t['border']};
         border-radius: 5px;
-        padding: 2px 6px;
+        padding: 1px 6px;
     }}
-    QLabel#recPill {{
+    QLabel#recBadge {{
         font-size: 11px;
         font-weight: 600;
-        color: {t['danger']};
-        background-color: {t['danger_soft']};
-        border-radius: 10px;
-        padding: 3px 10px;
+        color: {t['rec']};
+        background-color: {t['rec_soft']};
+        border-radius: 5px;
+        padding: 2px 7px;
     }}
-    QLabel#pausedPill {{
+    QLabel#pausedBadge {{
         font-size: 11px;
         font-weight: 600;
         color: {t['warn']};
         background-color: {t['warn_soft']};
-        border-radius: 10px;
-        padding: 3px 10px;
+        border-radius: 5px;
+        padding: 2px 7px;
     }}
-    QLabel#idlePill {{
+    QLabel#okBadge {{
         font-size: 11px;
         font-weight: 600;
+        color: {t['ok']};
+        background-color: {t['ok_soft']};
+        border-radius: 5px;
+        padding: 2px 7px;
+    }}
+    QLabel#neutralBadge {{
+        font-size: 11px;
+        font-weight: 500;
         color: {t['text_muted']};
         background-color: {t['surface_alt']};
-        border-radius: 10px;
-        padding: 3px 10px;
+        border: 1px solid {t['border']};
+        border-radius: 5px;
+        padding: 2px 7px;
     }}
-    QLabel#savedPill {{
+    QLabel#toastPill {{
         font-size: 11px;
         font-weight: 600;
-        color: {t['success']};
-        background-color: {t['success_soft']};
-        border-radius: 10px;
-        padding: 3px 10px;
+        color: {t['ok']};
+        background-color: {t['ok_soft']};
+        border-radius: 6px;
+        padding: 3px 9px;
     }}
-    QFrame#topBar {{
-        background-color: {t['surface']};
-        border-bottom: 1px solid {t['border']};
+    QFrame#sidebar {{
+        background-color: {t['sidebar']};
+        border-right: 1px solid {t['border']};
     }}
-    QFrame#navBar {{
-        background-color: {t['surface']};
-        border-bottom: 1px solid {t['border']};
+    QFrame#divider {{
+        background-color: {t['border']};
+        max-height: 1px;
+        min-height: 1px;
     }}
-    QFrame#card {{
+    QFrame#panel {{
         background-color: {t['surface']};
         border: 1px solid {t['border']};
-        border-radius: 12px;
+        border-radius: 10px;
     }}
-    QFrame#cardActive {{
+    QFrame#panelRec {{
         background-color: {t['surface']};
-        border: 1px solid {t['accent']};
-        border-radius: 12px;
+        border: 1px solid {t['rec']};
+        border-radius: 10px;
     }}
-    QPushButton#navBtn {{
+    QFrame#segWrap {{
+        background-color: {t['surface_alt']};
+        border: 1px solid {t['border']};
+        border-radius: 8px;
+    }}
+    QPushButton#navItem {{
         background: transparent;
         color: {t['text_muted']};
         border: none;
-        border-bottom: 2px solid transparent;
-        padding: 10px 16px;
+        border-radius: 7px;
+        padding: 8px 10px;
+        text-align: left;
         font-size: 13px;
+        font-weight: 500;
+    }}
+    QPushButton#navItem:hover {{
+        background-color: {t['surface_hover']};
+        color: {t['text']};
+    }}
+    QPushButton#navItem[active="true"] {{
+        background-color: {t['nav_active']};
+        color: {t['text']};
         font-weight: 600;
+        border: 1px solid {t['border']};
     }}
-    QPushButton#navBtn:hover {{
+    QPushButton#segBtn {{
+        background: transparent;
+        color: {t['text_muted']};
+        border: none;
+        border-radius: 6px;
+        padding: 5px 8px;
+        font-size: 12px;
+        font-weight: 500;
+    }}
+    QPushButton#segBtn:hover {{
         color: {t['text']};
     }}
-    QPushButton#navBtn[active="true"] {{
+    QPushButton#segBtn[active="true"] {{
+        background-color: {t['surface']};
         color: {t['text']};
-        border-bottom: 2px solid {t['accent']};
+        font-weight: 600;
+        border: 1px solid {t['border']};
     }}
     QPushButton {{
         background-color: {t['surface_alt']};
         color: {t['text']};
         border: 1px solid {t['border']};
-        border-radius: 8px;
-        padding: 6px 12px;
+        border-radius: 7px;
+        padding: 6px 11px;
         font-size: 12px;
         font-weight: 500;
     }}
@@ -264,84 +566,65 @@ def build_stylesheet(mode: str) -> str:
         border-color: {t['border']};
     }}
     QPushButton#primaryBtn {{
-        background-color: {t['accent']};
-        color: {t['btn_text']};
-        border: 1px solid {t['accent']};
+        background-color: {t['primary_bg']};
+        color: {t['primary_fg']};
+        border: 1px solid {t['primary_bg']};
         font-weight: 600;
     }}
     QPushButton#primaryBtn:hover {{
-        background-color: {t['accent_hover']};
-        border-color: {t['accent_hover']};
+        background-color: {t['primary_hover']};
+        border-color: {t['primary_hover']};
+    }}
+    QPushButton#recBtn {{
+        background-color: {t['rec']};
+        color: #ffffff;
+        border: 1px solid {t['rec']};
+        font-weight: 600;
+    }}
+    QPushButton#recBtn:hover {{
+        background-color: {t['rec_hover']};
+        border-color: {t['rec_hover']};
     }}
     QPushButton#dangerBtn {{
-        background-color: {t['danger_soft']};
-        color: {t['danger']};
+        background-color: {t['rec_soft']};
+        color: {t['rec']};
         border: 1px solid transparent;
         font-weight: 600;
     }}
     QPushButton#dangerBtn:hover {{
-        background-color: {t['danger']};
+        background-color: {t['rec']};
         color: #ffffff;
-    }}
-    QPushButton#termChip {{
-        background-color: {t['surface']};
-        color: {t['text_muted']};
-        border: 1px solid {t['border']};
-        border-radius: 10px;
-        padding: 10px 14px;
-        text-align: left;
-        font-size: 13px;
-        font-weight: 500;
-    }}
-    QPushButton#termChip:hover {{
-        background-color: {t['surface_alt']};
-        border-color: {t['border_strong']};
-        color: {t['text']};
-    }}
-    QPushButton#termChip[selected="true"] {{
-        background-color: {t['accent_soft']};
-        color: {t['text']};
-        border: 1.5px solid {t['accent']};
-        font-weight: 600;
     }}
     QLineEdit, QComboBox {{
         background-color: {t['surface_alt']};
         color: {t['text']};
         border: 1px solid {t['border']};
-        border-radius: 8px;
-        padding: 7px 10px;
+        border-radius: 7px;
+        padding: 6px 10px;
         font-size: 13px;
     }}
+    QComboBox {{
+        padding-right: 28px;
+    }}
     QLineEdit:focus, QComboBox:focus {{
-        border-color: {t['accent']};
+        border-color: {t['border_strong']};
     }}
     QComboBox::drop-down {{
         border: none;
         width: 24px;
     }}
+    QComboBox::down-arrow {{
+        image: none;
+        border: none;
+    }}
     QComboBox QAbstractItemView {{
         background-color: {t['surface']};
         color: {t['text']};
         border: 1px solid {t['border_strong']};
-        selection-background-color: {t['accent_soft']};
+        selection-background-color: {t['surface_hover']};
         selection-color: {t['text']};
         outline: none;
-    }}
-    QCheckBox {{
-        spacing: 8px;
-        color: {t['text']};
-        font-size: 13px;
-    }}
-    QCheckBox::indicator {{
-        width: 17px;
-        height: 17px;
-        border-radius: 5px;
-        border: 1.5px solid {t['border_strong']};
-        background-color: {t['surface_alt']};
-    }}
-    QCheckBox::indicator:checked {{
-        background-color: {t['accent']};
-        border-color: {t['accent']};
+        padding: 4px;
     }}
     QScrollArea {{
         border: none;
@@ -352,12 +635,12 @@ def build_stylesheet(mode: str) -> str:
     }}
     QScrollBar:vertical {{
         background: transparent;
-        width: 8px;
+        width: 7px;
         margin: 4px 0;
     }}
     QScrollBar::handle:vertical {{
         background: {t['border_strong']};
-        border-radius: 4px;
+        border-radius: 3px;
         min-height: 28px;
     }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
@@ -366,41 +649,9 @@ def build_stylesheet(mode: str) -> str:
     """
 
 
-def make_logo_pixmap(size: int = 32, dark: bool = True) -> QPixmap:
-    """Render our crisp minimal `> ●` vector badge directly via QPainter."""
-    w = int(size * 1.5)
-    h = size
-    pm = QPixmap(w, h)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-    bg = QColor("#1a1b26") if dark else QColor("#171923")
-    border = QColor("#2f344a") if dark else QColor("#2a2e3f")
-    p.setBrush(bg)
-    p.setPen(QPen(border, 1.5))
-    p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), h * 0.24, h * 0.24)
-
-    # Crisp `>` chevron
-    path = QPainterPath()
-    path.moveTo(w * 0.24, h * 0.30)
-    path.lineTo(w * 0.43, h * 0.50)
-    path.lineTo(w * 0.24, h * 0.70)
-    pen = QPen(QColor("#e4e7f2"), max(2.2, h * 0.10))
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    p.drawPath(path)
-
-    # Red recording dot
-    r = h * 0.14
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor("#f0657a"))
-    p.drawEllipse(QRectF(w * 0.69 - r, h * 0.50 - r, r * 2, r * 2))
-    p.end()
-    return pm
-
+# ---------------------------------------------------------------------------
+# Config & live process / running terminal discovery
+# ---------------------------------------------------------------------------
 
 def read_config() -> dict[str, str]:
     cfg = {
@@ -465,9 +716,10 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
-def load_legacy_asciinema() -> list[dict]:
+def _scan_proc_table() -> dict[int, dict]:
+    """Snapshot current user's processes from /proc."""
     uid = os.getuid()
-    found = []
+    procs: dict[int, dict] = {}
     try:
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
@@ -476,45 +728,83 @@ def load_legacy_asciinema() -> list[dict]:
             try:
                 if os.stat(entry.path).st_uid != uid:
                     continue
+                with open(f"{entry.path}/stat", "r", encoding="utf-8", errors="replace") as f:
+                    st = f.read()
+                lp = st.find("(")
+                rp = st.rfind(")")
+                if lp == -1 or rp == -1:
+                    continue
+                comm = st[lp + 1:rp]
+                fields = st[rp + 2:].split()
+                ppid = int(fields[1])
                 with open(f"{entry.path}/cmdline", "rb") as f:
                     parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\x00") if x]
-                if not parts:
-                    continue
-                if "asciinema" not in os.path.basename(parts[0]) and not any("asciinema" in p for p in parts[:2]):
-                    continue
-                if "rec" not in parts[1:4]:
-                    continue
-                cast = next((p for p in reversed(parts) if p.endswith(".cast")), "")
-                started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
-                cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
-                try:
-                    cwd = os.readlink(f"{entry.path}/cwd")
-                except OSError:
-                    cwd = ""
-                found.append({
+                procs[pid] = {
                     "pid": pid,
-                    "child_pid": 0,
-                    "state": "recording",
-                    "name": "legacy-tab",
-                    "terminal": "old-tab",
-                    "cast": cast,
-                    "meta": "",
-                    "cwd": cwd,
-                    "fg_cmd": "asciinema rec (pre-v1.3.0 tab — type exit in tab to save)",
-                    "last_cmd": "",
-                    "started_at": started_at,
-                    "cast_size": cast_size,
-                    "legacy": True,
-                })
+                    "ppid": ppid,
+                    "comm": comm,
+                    "parts": parts,
+                }
             except OSError:
                 continue
     except OSError:
         pass
-    return found
+    return procs
 
 
-def load_live_sessions() -> list[dict]:
-    out = []
+def _read_proc_cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def _read_proc_env_var(pid: int, key: str) -> str:
+    try:
+        prefix = (key + "=").encode("utf-8")
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for item in f.read().split(b"\x00"):
+                if item.startswith(prefix):
+                    return item[len(prefix):].decode("utf-8", "replace")
+    except OSError:
+        pass
+    return ""
+
+
+def _has_pts_stdin(pid: int) -> bool:
+    try:
+        return os.readlink(f"/proc/{pid}/fd/0").startswith("/dev/pts/")
+    except OSError:
+        return False
+
+
+def _deepest_fg_cmd(root_pid: int, children_map: dict[int, list[int]], procs: dict[int, dict]) -> str:
+    cur = root_pid
+    visited = {cur}
+    while True:
+        kids = [k for k in children_map.get(cur, []) if k not in visited]
+        if not kids:
+            break
+        cur = max(kids)
+        visited.add(cur)
+    if cur != root_pid and cur in procs:
+        parts = procs[cur]["parts"]
+        return " ".join(parts)[:80] if parts else procs[cur]["comm"]
+    return ""
+
+
+def discover_all_terminals() -> tuple[list[dict], list[dict], dict[str, int]]:
+    """Return (managed_sessions, open_unrecorded_terminals, running_counts_by_terminal)."""
+    procs = _scan_proc_table()
+    children_map: dict[int, list[int]] = {}
+    for pid, info in procs.items():
+        children_map.setdefault(info["ppid"], []).append(pid)
+
+    managed: list[dict] = []
+    covered_pids: set[int] = set()
+    running_counts: dict[str, int] = {}
+
+    # 1. Live rec-pty managed sessions
     if SESS_DIR.is_dir():
         for p in sorted(SESS_DIR.glob("*.json")):
             try:
@@ -527,13 +817,147 @@ def load_live_sessions() -> list[dict]:
                 cast = data.get("cast", "")
                 if cast and os.path.exists(cast):
                     data["cast_size"] = os.path.getsize(cast)
-                out.append(data)
+                managed.append(data)
+                covered_pids.add(pid)
+                cpid = int(data.get("child_pid", 0))
+                if cpid > 0:
+                    covered_pids.add(cpid)
+                term = (data.get("terminal") or "").lower()
+                if term:
+                    running_counts[term] = running_counts.get(term, 0) + 1
             except Exception:
                 continue
-    out.extend(load_legacy_asciinema())
+
+    # 2. Legacy pre-v1.3.0 asciinema rec sessions
+    for pid, info in procs.items():
+        if pid in covered_pids:
+            continue
+        parts = info["parts"]
+        if not parts:
+            continue
+        base0 = os.path.basename(parts[0])
+        if ("asciinema" in base0 or any("asciinema" in x for x in parts[:2])) and "rec" in parts[1:4]:
+            cast = next((x for x in reversed(parts) if x.endswith(".cast")), "")
+            started_at = os.path.getmtime(cast) if cast and os.path.exists(cast) else 0.0
+            cast_size = os.path.getsize(cast) if cast and os.path.exists(cast) else 0
+            # Find child shell for accurate cwd / terminal
+            child_shell = next((k for k in children_map.get(pid, []) if procs.get(k, {}).get("comm") in SHELL_COMMS), 0)
+            cwd = _read_proc_cwd(child_shell or pid)
+            term = _detect_ancestor_terminal(pid, procs) or "legacy"
+            managed.append({
+                "pid": pid,
+                "child_pid": child_shell,
+                "state": "recording",
+                "name": "legacy-asciinema",
+                "terminal": term,
+                "cast": cast,
+                "meta": "",
+                "cwd": cwd,
+                "fg_cmd": _deepest_fg_cmd(child_shell or pid, children_map, procs) or "asciinema rec (old tab)",
+                "last_cmd": "",
+                "started_at": started_at,
+                "cast_size": cast_size,
+                "legacy": True,
+            })
+            covered_pids.add(pid)
+            if child_shell:
+                covered_pids.add(child_shell)
+            if term != "legacy":
+                running_counts[term] = running_counts.get(term, 0) + 1
+
+    # 3. Already-running unrecorded terminal shells (Kitty, Tabby, Alacritty, etc.)
+    open_unrecorded: list[dict] = []
+    for pid, info in procs.items():
+        if pid in covered_pids:
+            continue
+        if info["comm"] not in SHELL_COMMS:
+            continue
+        # Skip non-interactive helper shells or shells already inside rec-pty/asciinema
+        if _has_ancestor_in(pid, covered_pids, procs):
+            continue
+        if not _has_pts_stdin(pid):
+            continue
+        term = _detect_ancestor_terminal(pid, procs)
+        if not term:
+            continue
+        # Avoid counting nested subshell (parent is also an interactive shell under same terminal)
+        parent = procs.get(info["ppid"])
+        if parent and parent["comm"] in SHELL_COMMS:
+            continue
+
+        cwd = _read_proc_cwd(pid)
+        fg = _deepest_fg_cmd(pid, children_map, procs)
+        kitty_sock = _read_proc_env_var(pid, "KITTY_LISTEN_ON") if term == "kitty" else ""
+        kitty_win = _read_proc_env_var(pid, "KITTY_WINDOW_ID") if term == "kitty" else ""
+        open_unrecorded.append({
+            "pid": pid,
+            "terminal": term,
+            "shell": info["comm"],
+            "cwd": cwd,
+            "fg_cmd": fg,
+            "kitty_sock": kitty_sock,
+            "kitty_win": kitty_win,
+        })
+        running_counts[term] = running_counts.get(term, 0) + 1
+
+    # Also count running terminal emulators even if no unrecorded shells matched
+    for pid, info in procs.items():
+        tid = _match_term_proc(info)
+        if tid and tid not in running_counts:
+            running_counts[tid] = 0
+
     order = {"recording": 0, "paused": 1, "standby": 2}
-    out.sort(key=lambda x: (order.get(x.get("state", "standby"), 2), x.get("pid", 0)))
-    return out
+    managed.sort(key=lambda x: (order.get(x.get("state", "standby"), 2), x.get("pid", 0)))
+    open_unrecorded.sort(key=lambda x: (x["terminal"], x["pid"]))
+    return managed, open_unrecorded, running_counts
+
+
+def _match_term_proc(info: dict) -> str:
+    comm = info["comm"].lower()
+    if comm in PROC_TERM_MAP:
+        return PROC_TERM_MAP[comm]
+    if info["parts"]:
+        base = os.path.basename(info["parts"][0]).lower()
+        if base in PROC_TERM_MAP:
+            return PROC_TERM_MAP[base]
+        joined = " ".join(info["parts"][:2]).lower()
+        if "tabby" in joined and ("tabby" in base or "electron" in base or "/tabby/" in joined):
+            return "tabby"
+    return ""
+
+
+def _detect_ancestor_terminal(pid: int, procs: dict[int, dict]) -> str:
+    cur = pid
+    for _ in range(7):
+        info = procs.get(cur)
+        if not info:
+            break
+        ppid = info["ppid"]
+        if ppid <= 1 or ppid == cur:
+            break
+        pinfo = procs.get(ppid)
+        if not pinfo:
+            break
+        tid = _match_term_proc(pinfo)
+        if tid:
+            return tid
+        cur = ppid
+    return ""
+
+
+def _has_ancestor_in(pid: int, target_set: set[int], procs: dict[int, dict]) -> bool:
+    cur = pid
+    for _ in range(8):
+        info = procs.get(cur)
+        if not info:
+            return False
+        ppid = info["ppid"]
+        if ppid in target_set:
+            return True
+        if ppid <= 1 or ppid == cur:
+            return False
+        cur = ppid
+    return False
 
 
 def send_session_cmd(pid: int, cmd_line: str) -> bool:
@@ -555,7 +979,7 @@ def detect_display_label() -> str:
                 return line.split("=", 1)[1].strip()
     except Exception:
         pass
-    return "auto"
+    return "1080p"
 
 
 def fmt_elapsed(started_at: float) -> str:
@@ -578,6 +1002,17 @@ def fmt_size(n: int) -> str:
     return f"{val:.1f} TB"
 
 
+def short_cwd(path: str) -> str:
+    if not path:
+        return "~"
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+
 class WorkerThread(QThread):
     done = Signal(bool, str)
 
@@ -590,13 +1025,17 @@ class WorkerThread(QThread):
         try:
             proc = subprocess.run(self.cmd, capture_output=True, text=True)
             if proc.returncode == 0:
-                self.done.emit(True, f"{self.label} complete")
+                self.done.emit(True, f"{self.label} done")
             else:
-                err = (proc.stderr or proc.stdout or "command failed").strip().splitlines()[-1]
-                self.done.emit(False, f"{self.label} failed: {err}")
+                err = (proc.stderr or proc.stdout or "failed").strip().splitlines()[-1]
+                self.done.emit(False, f"{self.label}: {err}")
         except Exception as exc:
-            self.done.emit(False, f"{self.label} error: {exc}")
+            self.done.emit(False, f"{self.label}: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# Main Window — Clean Sidebar + Focused Workspace
+# ---------------------------------------------------------------------------
 
 class RecGuiWindow(QMainWindow):
     def __init__(self):
@@ -605,13 +1044,19 @@ class RecGuiWindow(QMainWindow):
         self.ui_mode = self.cfg.get("REC_UI_THEME", "dark")
         if self.ui_mode not in ("dark", "light"):
             self.ui_mode = "dark"
+
         self.workers: list[WorkerThread] = []
+        self.switches: list[tuple[ToggleSwitch, bool]] = []
+        self.combos: list[CleanComboBox] = []
+        self.term_switches: dict[str, ToggleSwitch] = {}
+        self.term_status_lbls: dict[str, QLabel] = {}
         self.last_sessions_sig = None
         self.last_clips_sig = None
+        self.running_counts: dict[str, int] = {}
 
         self.setWindowTitle("rec-cli")
-        self.setMinimumSize(820, 580)
-        self.resize(920, 640)
+        self.setMinimumSize(920, 560)
+        self.resize(1040, 640)
         self.setWindowIcon(QIcon(make_logo_pixmap(48, dark=True)))
 
         self._build_ui()
@@ -623,86 +1068,143 @@ class RecGuiWindow(QMainWindow):
         self.timer.timeout.connect(self._on_tick)
         self.timer.start(1000)
 
+    def _register_switch(self, sw: ToggleSwitch, accent_red: bool = False) -> ToggleSwitch:
+        self.switches.append((sw, accent_red))
+        return sw
+
+    def _register_combo(self, cb: CleanComboBox) -> CleanComboBox:
+        self.combos.append(cb)
+        return cb
+
     def _build_ui(self):
         root = QWidget()
         root.setObjectName("root")
         self.setCentralWidget(root)
-        outer = QVBoxLayout(root)
+
+        outer = QHBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # --- Top Header Bar ---
-        top_bar = QFrame()
-        top_bar.setObjectName("topBar")
-        top_lay = QHBoxLayout(top_bar)
-        top_lay.setContentsMargins(20, 14, 20, 14)
-        top_lay.setSpacing(12)
+        # ---- Left Sidebar (216px) ----
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(216)
+        sb = QVBoxLayout(sidebar)
+        sb.setContentsMargins(14, 16, 14, 14)
+        sb.setSpacing(6)
 
+        # Brand header
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
         self.logo_lbl = QLabel()
-        top_lay.addWidget(self.logo_lbl)
+        brand.addWidget(self.logo_lbl)
 
-        title_col = QVBoxLayout()
-        title_col.setSpacing(1)
-        title_lbl = QLabel("rec-cli")
-        title_lbl.setObjectName("appTitle")
-        sub_lbl = QLabel(f"v{VERSION}")
-        sub_lbl.setObjectName("dim")
-        title_col.addWidget(title_lbl)
-        title_col.addWidget(sub_lbl)
-        top_lay.addLayout(title_col)
+        bcol = QVBoxLayout()
+        bcol.setSpacing(0)
+        b_title = QLabel("rec-cli")
+        b_title.setObjectName("appTitle")
+        b_ver = QLabel(f"v{VERSION}")
+        b_ver.setObjectName("dim")
+        bcol.addWidget(b_title)
+        bcol.addWidget(b_ver)
+        brand.addLayout(bcol)
+        brand.addStretch()
+        sb.addLayout(brand)
 
+        sb.addSpacing(10)
+
+        # Live status pill in sidebar
         self.live_pill = QLabel("Idle")
-        self.live_pill.setObjectName("idlePill")
-        top_lay.addWidget(self.live_pill)
+        self.live_pill.setObjectName("neutralBadge")
+        self.live_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sb.addWidget(self.live_pill)
 
+        sb.addSpacing(10)
+
+        # Navigation items
+        self.nav_defs = [
+            ("sessions", "Sessions"),
+            ("terminals", "Terminals"),
+            ("clips", "Clips"),
+            ("settings", "Settings"),
+        ]
+        self.nav_btns: list[QPushButton] = []
+        for idx, (icon_kind, label) in enumerate(self.nav_defs):
+            btn = QPushButton(f"  {label}")
+            btn.setObjectName("navItem")
+            btn.setProperty("active", idx == 0)
+            btn.setIconSize(QSize(16, 16))
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.clicked.connect(lambda _c=False, i=idx: self._switch_page(i))
+            sb.addWidget(btn)
+            self.nav_btns.append(btn)
+
+        sb.addStretch()
+
+        # Toast pill (subtle feedback)
         self.toast_pill = QLabel("")
-        self.toast_pill.setObjectName("savedPill")
+        self.toast_pill.setObjectName("toastPill")
+        self.toast_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.toast_pill.hide()
-        top_lay.addWidget(self.toast_pill)
+        sb.addWidget(self.toast_pill)
 
-        top_lay.addStretch()
-
-        self.stop_all_btn = QPushButton("Stop All")
+        # Stop All (only visible when recording/paused)
+        self.stop_all_btn = QPushButton("Stop All Recordings")
         self.stop_all_btn.setObjectName("dangerBtn")
         self.stop_all_btn.clicked.connect(self._stop_all)
         self.stop_all_btn.hide()
-        top_lay.addWidget(self.stop_all_btn)
+        sb.addWidget(self.stop_all_btn)
 
-        self.auto_chk = QCheckBox("Auto-record")
-        self.auto_chk.setChecked(is_auto_enabled())
-        self.auto_chk.toggled.connect(self._on_auto_toggled)
-        top_lay.addWidget(self.auto_chk)
+        div = QFrame()
+        div.setObjectName("divider")
+        sb.addWidget(div)
+        sb.addSpacing(4)
 
-        self.theme_btn = QPushButton("Light Mode" if self.ui_mode == "dark" else "Dark Mode")
-        self.theme_btn.clicked.connect(self._toggle_theme)
-        top_lay.addWidget(self.theme_btn)
+        # Auto-record switch row
+        auto_row = QHBoxLayout()
+        auto_row.setContentsMargins(2, 2, 2, 2)
+        auto_lbl = QLabel("Auto-record")
+        auto_lbl.setObjectName("muted")
+        self.auto_sw = self._register_switch(ToggleSwitch(is_auto_enabled()), accent_red=True)
+        self.auto_sw.toggled.connect(self._on_auto_toggled)
+        auto_row.addWidget(auto_lbl)
+        auto_row.addStretch()
+        auto_row.addWidget(self.auto_sw)
+        sb.addLayout(auto_row)
 
-        outer.addWidget(top_bar)
+        sb.addSpacing(6)
 
-        # --- Navigation Tabs ---
-        nav_bar = QFrame()
-        nav_bar.setObjectName("navBar")
-        nav_lay = QHBoxLayout(nav_bar)
-        nav_lay.setContentsMargins(16, 0, 16, 0)
-        nav_lay.setSpacing(4)
+        # Segmented Dark | Light theme switcher
+        seg_wrap = QFrame()
+        seg_wrap.setObjectName("segWrap")
+        seg_lay = QHBoxLayout(seg_wrap)
+        seg_lay.setContentsMargins(3, 3, 3, 3)
+        seg_lay.setSpacing(3)
 
-        self.nav_btns: list[QPushButton] = []
-        for idx, label in enumerate(("Live Sessions", "Terminals & Settings", "Clips")):
-            btn = QPushButton(label)
-            btn.setObjectName("navBtn")
-            btn.setProperty("active", idx == 0)
-            btn.clicked.connect(lambda _checked=False, i=idx: self._switch_page(i))
-            nav_lay.addWidget(btn)
-            self.nav_btns.append(btn)
-        nav_lay.addStretch()
+        self.dark_btn = QPushButton(" Dark")
+        self.dark_btn.setObjectName("segBtn")
+        self.dark_btn.setIconSize(QSize(13, 13))
+        self.dark_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.dark_btn.clicked.connect(lambda: self._set_theme("dark"))
 
-        outer.addWidget(nav_bar)
+        self.light_btn = QPushButton(" Light")
+        self.light_btn.setObjectName("segBtn")
+        self.light_btn.setIconSize(QSize(13, 13))
+        self.light_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.light_btn.clicked.connect(lambda: self._set_theme("light"))
 
-        # --- Pages ---
+        seg_lay.addWidget(self.dark_btn, 1)
+        seg_lay.addWidget(self.light_btn, 1)
+        sb.addWidget(seg_wrap)
+
+        outer.addWidget(sidebar)
+
+        # ---- Main Content Area ----
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_sessions_page())
-        self.stack.addWidget(self._build_settings_page())
+        self.stack.addWidget(self._build_terminals_page())
         self.stack.addWidget(self._build_clips_page())
+        self.stack.addWidget(self._build_settings_page())
         outer.addWidget(self.stack, 1)
 
     def _switch_page(self, idx: int):
@@ -711,41 +1213,38 @@ class RecGuiWindow(QMainWindow):
             b.setProperty("active", i == idx)
             b.style().unpolish(b)
             b.style().polish(b)
-        if idx == 0:
+        self._update_nav_icons()
+        if idx in (0, 1):
             self._refresh_sessions(force=True)
         elif idx == 2:
             self._refresh_clips(force=True)
 
-    # ---------------- Page 1: Live Sessions ----------------
+    # ---------------- Page 0: Live & Running Terminals ----------------
     def _build_sessions_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setContentsMargins(24, 22, 24, 20)
         lay.setSpacing(14)
 
         hdr = QHBoxLayout()
-        t = QLabel("Active Terminal Sessions")
-        t.setObjectName("sectionTitle")
+        t = QLabel("Sessions")
+        t.setObjectName("pageTitle")
         hdr.addWidget(t)
         hdr.addStretch()
-
-        launch_btn = QPushButton("+ New Recorded Terminal")
-        launch_btn.setObjectName("primaryBtn")
-        launch_btn.clicked.connect(self._launch_recorded_terminal)
-        hdr.addWidget(launch_btn)
 
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(lambda: self._refresh_sessions(force=True))
         hdr.addWidget(refresh_btn)
-        lay.addLayout(hdr)
 
-        hint = QLabel("Control parallel recordings across Kitty, Tabby, and remote SSH sessions by PID without dropping connections.")
-        hint.setObjectName("muted")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
+        launch_btn = QPushButton("+ New Recorded Terminal")
+        launch_btn.setObjectName("recBtn")
+        launch_btn.clicked.connect(lambda: self._launch_recorded_terminal())
+        hdr.addWidget(launch_btn)
+        lay.addLayout(hdr)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.sessions_container = QWidget()
         self.sessions_lay = QVBoxLayout(self.sessions_container)
         self.sessions_lay.setContentsMargins(0, 0, 4, 0)
@@ -755,191 +1254,97 @@ class RecGuiWindow(QMainWindow):
         lay.addWidget(scroll, 1)
         return page
 
-    # ---------------- Page 2: Terminals & Settings ----------------
-    def _build_settings_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        inner = QWidget()
-        lay = QVBoxLayout(inner)
-        lay.setContentsMargins(24, 20, 24, 24)
-        lay.setSpacing(18)
-
-        # Card 1: Terminal Selector
-        term_card = QFrame()
-        term_card.setObjectName("card")
-        tc_lay = QVBoxLayout(term_card)
-        tc_lay.setContentsMargins(18, 16, 18, 18)
-        tc_lay.setSpacing(12)
-
-        tc_hdr = QHBoxLayout()
-        tc_title = QLabel("Terminals to Record")
-        tc_title.setObjectName("sectionTitle")
-        tc_hdr.addWidget(tc_title)
-        tc_hdr.addStretch()
-
-        self.all_terms_chk = QCheckBox("Record all terminals")
-        tc_hdr.addWidget(self.all_terms_chk)
-        tc_lay.addLayout(tc_hdr)
-
-        tc_sub = QLabel("Choose which terminal emulators auto-record when opened. Changes save immediately.")
-        tc_sub.setObjectName("muted")
-        tc_lay.addWidget(tc_sub)
-
-        grid = QGridLayout()
-        grid.setSpacing(10)
-        self.term_buttons: dict[str, QPushButton] = {}
-        selected_set = {x.strip().lower() for x in self.cfg.get("REC_TERMINALS", "kitty,tabby").split(",") if x.strip()}
-        is_all = "all" in selected_set
-        self.all_terms_chk.setChecked(is_all)
-
-        for idx, (tid, label, bins) in enumerate(TERMINALS):
-            installed = any(shutil.which(b) for b in bins)
-            badge = "Installed" if installed else "Not detected"
-            btn = QPushButton(f"{label}\n{badge}")
-            btn.setObjectName("termChip")
-            btn.setCheckable(True)
-            is_sel = is_all or (tid in selected_set)
-            btn.setChecked(is_sel)
-            btn.setProperty("selected", is_sel)
-            btn.setEnabled(not is_all)
-            btn.clicked.connect(lambda _c=False, t_id=tid: self._on_term_chip_toggled(t_id))
-            self.term_buttons[tid] = btn
-            grid.addWidget(btn, idx // 4, idx % 4)
-
-        self.all_terms_chk.toggled.connect(self._on_all_terms_toggled)
-        tc_lay.addLayout(grid)
-        lay.addWidget(term_card)
-
-        # Card 2: Video & Output Settings
-        vid_card = QFrame()
-        vid_card.setObjectName("card")
-        vc_lay = QVBoxLayout(vid_card)
-        vc_lay.setContentsMargins(18, 16, 18, 18)
-        vc_lay.setSpacing(14)
-
-        vc_title = QLabel("Recording & Video Output")
-        vc_title.setObjectName("sectionTitle")
-        vc_lay.addWidget(vc_title)
-
-        form = QGridLayout()
-        form.setHorizontalSpacing(18)
-        form.setVerticalSpacing(12)
-
-        disp = detect_display_label()
-        self.res_combo = QComboBox()
-        self.res_items = [
-            ("auto", f"Auto ({disp})"),
-            ("720p", "720p HD (1280x720)"),
-            ("1080p", "1080p Full HD (1920x1080)"),
-            ("1440p", "1440p QHD (2560x1440)"),
-            ("4k", "4K UHD (3840x2160)"),
-            ("reels", "TikTok / Reels 9:16 (1080x1920, cursor-follow)"),
-            ("reels-4k", "TikTok / Reels 4K 9:16 (2160x3840, cursor-follow)"),
-        ]
-        for val, text in self.res_items:
-            self.res_combo.addItem(text, val)
-        self._select_combo_data(self.res_combo, self.cfg.get("REC_RESOLUTION", "auto"))
-        self.res_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("REC_RESOLUTION", self.res_combo.currentData())
-        )
-
-        self.speed_combo = QComboBox()
-        for val, text in [("1", "1x (Real time)"), ("1.5", "1.5x"), ("2", "2x (Fast typing)"), ("2.5", "2.5x"), ("3", "3x")]:
-            self.speed_combo.addItem(text, val)
-        self._select_combo_data(self.speed_combo, self.cfg.get("REC_SPEED", "2"))
-        self.speed_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("REC_SPEED", self.speed_combo.currentData())
-        )
-
-        self.maxlen_combo = QComboBox()
-        for val, text in [("60", "1 minute"), ("180", "3 minutes"), ("300", "5 minutes"), ("600", "10 minutes"), ("900", "15 minutes")]:
-            self.maxlen_combo.addItem(text, val)
-        self._select_combo_data(self.maxlen_combo, self.cfg.get("REC_MAX_SECS", "300"))
-        self.maxlen_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("REC_MAX_SECS", self.maxlen_combo.currentData())
-        )
-
-        self.theme_combo = QComboBox()
-        for val, text in [
-            ("tokyo-night", "Tokyo Night"),
-            ("dracula", "Dracula"),
-            ("catppuccin", "Catppuccin Mocha"),
-            ("gruvbox", "Gruvbox Dark"),
-            ("nord", "Nord"),
-        ]:
-            self.theme_combo.addItem(text, val)
-        self._select_combo_data(self.theme_combo, self.cfg.get("REC_THEME", "tokyo-night"))
-        self.theme_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("REC_THEME", self.theme_combo.currentData())
-        )
-
-        form.addWidget(self._field_label("Resolution"), 0, 0)
-        form.addWidget(self.res_combo, 1, 0)
-        form.addWidget(self._field_label("Playback Speed"), 0, 1)
-        form.addWidget(self.speed_combo, 1, 1)
-        form.addWidget(self._field_label("Max Clip Length"), 2, 0)
-        form.addWidget(self.maxlen_combo, 3, 0)
-        form.addWidget(self._field_label("Terminal Video Theme"), 2, 1)
-        form.addWidget(self.theme_combo, 3, 1)
-        vc_lay.addLayout(form)
-
-        # Output folder row
-        dir_row = QHBoxLayout()
-        dir_row.setSpacing(8)
-        self.dir_edit = QLineEdit(self.cfg.get("REC_VIDEO_DIR", str(Path.home() / "Videos/content")))
-        self.dir_edit.setReadOnly(True)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_video_dir)
-        open_dir_btn = QPushButton("Open Folder")
-        open_dir_btn.clicked.connect(self._open_video_dir)
-        dir_row.addWidget(self._field_label("Save Clips To"))
-        dir_row.addWidget(self.dir_edit, 1)
-        dir_row.addWidget(browse_btn)
-        dir_row.addWidget(open_dir_btn)
-        vc_lay.addLayout(dir_row)
-
-        # Clean boolean switches
-        toggles = QHBoxLayout()
-        toggles.setSpacing(22)
-        self.frame_chk = QCheckBox("Rounded window frame")
-        self.frame_chk.setChecked(self.cfg.get("REC_FRAME", "on").lower() not in ("off", "0", "false"))
-        self.frame_chk.toggled.connect(lambda c: self._save_setting("REC_FRAME", "on" if c else "off"))
-
-        self.redact_chk = QCheckBox("Auto-redact secrets (API keys / tokens)")
-        self.redact_chk.setChecked(self.cfg.get("REC_REDACT", "on").lower() not in ("off", "0", "false"))
-        self.redact_chk.toggled.connect(lambda c: self._save_setting("REC_REDACT", "on" if c else "off"))
-
-        self.reels_copy_chk = QCheckBox("Also export 9:16 Reels copy")
-        self.reels_copy_chk.setChecked(self.cfg.get("REC_REELS_COPY", "off").lower() in ("on", "1", "true"))
-        self.reels_copy_chk.toggled.connect(lambda c: self._save_setting("REC_REELS_COPY", "on" if c else "off"))
-
-        toggles.addWidget(self.frame_chk)
-        toggles.addWidget(self.redact_chk)
-        toggles.addWidget(self.reels_copy_chk)
-        toggles.addStretch()
-        vc_lay.addLayout(toggles)
-
-        lay.addWidget(vid_card)
-        lay.addStretch()
-        scroll.setWidget(inner)
-        return scroll
-
-    # ---------------- Page 3: Clips Library ----------------
-    def _build_clips_page(self) -> QWidget:
+    # ---------------- Page 1: Terminal Selector ----------------
+    def _build_terminals_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setContentsMargins(24, 22, 24, 20)
         lay.setSpacing(14)
 
         hdr = QHBoxLayout()
-        self.clips_title = QLabel("Saved Clips")
-        self.clips_title.setObjectName("sectionTitle")
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        t = QLabel("Terminals")
+        t.setObjectName("pageTitle")
+        sub = QLabel("Select which terminals auto-record when opened.")
+        sub.setObjectName("muted")
+        title_col.addWidget(t)
+        title_col.addWidget(sub)
+        hdr.addLayout(title_col)
+        hdr.addStretch()
+
+        all_lbl = QLabel("Record all")
+        all_lbl.setObjectName("muted")
+        selected_set = {x.strip().lower() for x in self.cfg.get("REC_TERMINALS", "kitty,tabby").split(",") if x.strip()}
+        is_all = "all" in selected_set
+        self.all_terms_sw = self._register_switch(ToggleSwitch(is_all))
+        self.all_terms_sw.toggled.connect(self._on_all_terms_toggled)
+        hdr.addWidget(all_lbl)
+        hdr.addSpacing(6)
+        hdr.addWidget(self.all_terms_sw)
+        lay.addLayout(hdr)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        grid.setContentsMargins(0, 0, 4, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+
+        for idx, (tid, label, bins) in enumerate(TERMINALS):
+            installed = any(shutil.which(b) for b in bins)
+            card = QFrame()
+            card.setObjectName("panel")
+            cl = QHBoxLayout(card)
+            cl.setContentsMargins(14, 13, 14, 13)
+            cl.setSpacing(10)
+
+            info = QVBoxLayout()
+            info.setSpacing(4)
+            name_lbl = QLabel(label)
+            name_lbl.setObjectName("rowTitle")
+            st_row = QHBoxLayout()
+            st_row.setContentsMargins(0, 0, 0, 0)
+            st_lbl = QLabel("Installed" if installed else "Not installed")
+            st_lbl.setObjectName("muted" if installed else "dim")
+            st_lbl.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            st_row.addWidget(st_lbl)
+            st_row.addStretch()
+            self.term_status_lbls[tid] = st_lbl
+            info.addWidget(name_lbl)
+            info.addLayout(st_row)
+            cl.addLayout(info, 1)
+
+            sw = self._register_switch(ToggleSwitch(is_all or (tid in selected_set)))
+            sw.setEnabled(not is_all)
+            sw.toggled.connect(lambda _c, t_id=tid: self._save_selected_terminals())
+            self.term_switches[tid] = sw
+            cl.addWidget(sw)
+
+            grid.addWidget(card, idx // 2, idx % 2)
+
+        grid.setRowStretch(len(TERMINALS) // 2 + 1, 1)
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+        return page
+
+    # ---------------- Page 2: Clips Library ----------------
+    def _build_clips_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(28, 24, 28, 20)
+        lay.setSpacing(14)
+
+        hdr = QHBoxLayout()
+        self.clips_title = QLabel("Clips")
+        self.clips_title.setObjectName("pageTitle")
         hdr.addWidget(self.clips_title)
         hdr.addStretch()
 
         self.clip_search = QLineEdit()
-        self.clip_search.setPlaceholderText("Filter clips (e.g. nmap, ffuf, reels)…")
-        self.clip_search.setFixedWidth(250)
+        self.clip_search.setPlaceholderText("Filter clips...")
+        self.clip_search.setFixedWidth(210)
         self.clip_search.textChanged.connect(lambda: self._refresh_clips(force=True))
         hdr.addWidget(self.clip_search)
 
@@ -954,6 +1359,7 @@ class RecGuiWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.clips_container = QWidget()
         self.clips_lay = QVBoxLayout(self.clips_container)
         self.clips_lay.setContentsMargins(0, 0, 4, 0)
@@ -963,7 +1369,148 @@ class RecGuiWindow(QMainWindow):
         lay.addWidget(scroll, 1)
         return page
 
-    # ---------------- Helpers & Actions ----------------
+    # ---------------- Page 3: Settings ----------------
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(28, 24, 28, 20)
+        outer.setSpacing(16)
+
+        t = QLabel("Settings")
+        t.setObjectName("pageTitle")
+        outer.addWidget(t)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 4, 0)
+        lay.setSpacing(14)
+
+        # Panel 1: Video Output
+        vid = QFrame()
+        vid.setObjectName("panel")
+        vl = QGridLayout(vid)
+        vl.setContentsMargins(16, 16, 16, 16)
+        vl.setHorizontalSpacing(16)
+        vl.setVerticalSpacing(10)
+
+        disp = detect_display_label()
+        self.res_combo = self._register_combo(CleanComboBox())
+        for val, text in [
+            ("auto", f"Auto ({disp})"),
+            ("720p", "720p HD (1280x720)"),
+            ("1080p", "1080p Full HD (1920x1080)"),
+            ("1440p", "1440p QHD (2560x1440)"),
+            ("4k", "4K UHD (3840x2160)"),
+            ("reels", "9:16 Reels (1080x1920, cursor-follow)"),
+            ("reels-4k", "9:16 Reels 4K (2160x3840, cursor-follow)"),
+        ]:
+            self.res_combo.addItem(text, val)
+        self._select_combo_data(self.res_combo, self.cfg.get("REC_RESOLUTION", "auto"))
+        self.res_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("REC_RESOLUTION", self.res_combo.currentData())
+        )
+
+        self.speed_combo = self._register_combo(CleanComboBox())
+        for val, text in [("1", "1x (Real time)"), ("1.5", "1.5x"), ("2", "2x (Default)"), ("2.5", "2.5x"), ("3", "3x")]:
+            self.speed_combo.addItem(text, val)
+        self._select_combo_data(self.speed_combo, self.cfg.get("REC_SPEED", "2"))
+        self.speed_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("REC_SPEED", self.speed_combo.currentData())
+        )
+
+        self.maxlen_combo = self._register_combo(CleanComboBox())
+        for val, text in [("60", "1 min"), ("180", "3 min"), ("300", "5 min"), ("600", "10 min"), ("900", "15 min")]:
+            self.maxlen_combo.addItem(text, val)
+        self._select_combo_data(self.maxlen_combo, self.cfg.get("REC_MAX_SECS", "300"))
+        self.maxlen_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("REC_MAX_SECS", self.maxlen_combo.currentData())
+        )
+
+        self.theme_combo = self._register_combo(CleanComboBox())
+        for val, text in [
+            ("tokyo-night", "Tokyo Night"),
+            ("dracula", "Dracula"),
+            ("catppuccin", "Catppuccin Mocha"),
+            ("gruvbox", "Gruvbox Dark"),
+            ("nord", "Nord"),
+        ]:
+            self.theme_combo.addItem(text, val)
+        self._select_combo_data(self.theme_combo, self.cfg.get("REC_THEME", "tokyo-night"))
+        self.theme_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("REC_THEME", self.theme_combo.currentData())
+        )
+
+        vl.addWidget(self._field_label("Resolution"), 0, 0)
+        vl.addWidget(self.res_combo, 1, 0)
+        vl.addWidget(self._field_label("Playback Speed"), 0, 1)
+        vl.addWidget(self.speed_combo, 1, 1)
+        vl.addWidget(self._field_label("Max Clip Length"), 2, 0)
+        vl.addWidget(self.maxlen_combo, 3, 0)
+        vl.addWidget(self._field_label("Video Theme"), 2, 1)
+        vl.addWidget(self.theme_combo, 3, 1)
+
+        # Output directory inside same card
+        vl.addWidget(self._field_label("Output Folder"), 4, 0, 1, 2)
+        dir_row = QHBoxLayout()
+        dir_row.setSpacing(8)
+        self.dir_edit = QLineEdit(self.cfg.get("REC_VIDEO_DIR", str(Path.home() / "Videos/content")))
+        self.dir_edit.setReadOnly(True)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_video_dir)
+        open_dir_btn = QPushButton("Open")
+        open_dir_btn.clicked.connect(self._open_video_dir)
+        dir_row.addWidget(self.dir_edit, 1)
+        dir_row.addWidget(browse_btn)
+        dir_row.addWidget(open_dir_btn)
+        vl.addLayout(dir_row, 5, 0, 1, 2)
+        lay.addWidget(vid)
+
+        # Panel 2: Behavior Switches (clean rows with ToggleSwitch)
+        opts = QFrame()
+        opts.setObjectName("panel")
+        ol = QVBoxLayout(opts)
+        ol.setContentsMargins(16, 6, 16, 6)
+        ol.setSpacing(0)
+
+        rows = [
+            ("Rounded window frame", "Clean padding and border around rendered clips", "REC_FRAME", "on"),
+            ("Auto-redact secrets", "Mask API keys, tokens, and passwords in output", "REC_REDACT", "on"),
+            ("Export 9:16 Reels copy", "Also save a cursor-following vertical clip", "REC_REELS_COPY", "off"),
+        ]
+        for i, (title, desc, key, default) in enumerate(rows):
+            rwidget = QWidget()
+            rl = QHBoxLayout(rwidget)
+            rl.setContentsMargins(0, 11, 0, 11)
+            tcol = QVBoxLayout()
+            tcol.setSpacing(1)
+            tl = QLabel(title)
+            tl.setObjectName("rowTitle")
+            dl = QLabel(desc)
+            dl.setObjectName("muted")
+            tcol.addWidget(tl)
+            tcol.addWidget(dl)
+            rl.addLayout(tcol, 1)
+
+            checked = self.cfg.get(key, default).lower() not in ("off", "0", "false")
+            sw = self._register_switch(ToggleSwitch(checked))
+            sw.toggled.connect(lambda c, k=key: self._save_setting(k, "on" if c else "off"))
+            rl.addWidget(sw)
+            ol.addWidget(rwidget)
+
+            if i < len(rows) - 1:
+                sep = QFrame()
+                sep.setObjectName("divider")
+                ol.addWidget(sep)
+
+        lay.addWidget(opts)
+        lay.addStretch()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        return page
+
+    # ---------------- Theme & Visual Updates ----------------
     def _field_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("muted")
@@ -978,46 +1525,59 @@ class RecGuiWindow(QMainWindow):
     def _show_toast(self, msg: str):
         self.toast_pill.setText(msg)
         self.toast_pill.show()
-        QTimer.singleShot(2600, self.toast_pill.hide)
+        QTimer.singleShot(2400, self.toast_pill.hide)
+
+    def _update_nav_icons(self):
+        t = THEMES["light" if self.ui_mode == "light" else "dark"]
+        cur = self.stack.currentIndex()
+        for i, (kind, _label) in enumerate(self.nav_defs):
+            col = t["text"] if i == cur else t["text_muted"]
+            self.nav_btns[i].setIcon(make_nav_icon(kind, col, 16))
+        self.dark_btn.setIcon(make_nav_icon("moon", t["text"] if self.ui_mode == "dark" else t["text_muted"], 13))
+        self.light_btn.setIcon(make_nav_icon("sun", t["text"] if self.ui_mode == "light" else t["text_muted"], 13))
 
     def _apply_theme(self):
         self.setStyleSheet(build_stylesheet(self.ui_mode))
-        self.logo_lbl.setPixmap(make_logo_pixmap(30, dark=(self.ui_mode == "dark")))
-        self.theme_btn.setText("Light Mode" if self.ui_mode == "dark" else "Dark Mode")
+        self.logo_lbl.setPixmap(make_logo_pixmap(26, dark=(self.ui_mode == "dark")))
+        self.dark_btn.setProperty("active", self.ui_mode == "dark")
+        self.light_btn.setProperty("active", self.ui_mode == "light")
+        for b in (self.dark_btn, self.light_btn):
+            b.style().unpolish(b)
+            b.style().polish(b)
+        for sw, red in self.switches:
+            sw.set_theme(self.ui_mode, accent_red=red)
+        for cb in self.combos:
+            cb.set_theme(self.ui_mode)
+        self._update_nav_icons()
 
-    def _toggle_theme(self):
-        self.ui_mode = "light" if self.ui_mode == "dark" else "dark"
+    def _set_theme(self, mode: str):
+        if mode not in ("dark", "light") or mode == self.ui_mode:
+            return
+        self.ui_mode = mode
         write_config_key("REC_UI_THEME", self.ui_mode)
         self._apply_theme()
 
+    def _toggle_theme(self):
+        self._set_theme("light" if self.ui_mode == "dark" else "dark")
+
+    # ---------------- Config Actions ----------------
     def _on_auto_toggled(self, checked: bool):
         set_auto_enabled(checked)
         self._show_toast("Auto-record ON" if checked else "Auto-record OFF")
 
     def _on_all_terms_toggled(self, checked: bool):
-        for tid, btn in self.term_buttons.items():
-            btn.setEnabled(not checked)
+        for sw in self.term_switches.values():
+            sw.setEnabled(not checked)
             if checked:
-                btn.setChecked(True)
-                btn.setProperty("selected", True)
-                btn.style().unpolish(btn)
-                btn.style().polish(btn)
+                sw.setChecked(True)
         if checked:
             self._save_setting("REC_TERMINALS", "all")
         else:
             self._save_selected_terminals()
 
-    def _on_term_chip_toggled(self, tid: str):
-        btn = self.term_buttons[tid]
-        btn.setProperty("selected", btn.isChecked())
-        btn.style().unpolish(btn)
-        btn.style().polish(btn)
-        self._save_selected_terminals()
-
     def _save_selected_terminals(self):
-        chosen = [tid for tid, btn in self.term_buttons.items() if btn.isChecked()]
-        val = ",".join(chosen) if chosen else "none"
-        self._save_setting("REC_TERMINALS", val)
+        chosen = [tid for tid, sw in self.term_switches.items() if sw.isChecked()]
+        self._save_setting("REC_TERMINALS", ",".join(chosen) if chosen else "none")
 
     def _save_setting(self, key: str, val: str):
         self.cfg[key] = val
@@ -1037,93 +1597,128 @@ class RecGuiWindow(QMainWindow):
         if shutil.which("xdg-open"):
             subprocess.Popen(["xdg-open", str(vdir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
-    def _launch_recorded_terminal(self):
-        name, ok = QInputDialog.getText(self, "New Recorded Terminal", "Optional clip name (leave blank to auto-name by command):")
+    # ---------------- Session & Terminal Actions ----------------
+    def _launch_recorded_terminal(self, preferred_term: str = "", cwd: str = ""):
+        name, ok = QInputDialog.getText(self, "New Recorded Terminal", "Clip name (leave blank to auto-name):")
         if not ok:
             return
         name = name.strip()
         shell = os.environ.get("SHELL", "/bin/bash")
         rec_cmd = ["rec-pty"] + (["--name", name] if name else []) + ["--", shell]
+        work_dir = cwd if (cwd and os.path.isdir(cwd)) else None
 
-        # Prefer user's selected installed terminal
-        preferred = [x.strip().lower() for x in self.cfg.get("REC_TERMINALS", "kitty,tabby").split(",")]
-        candidates = preferred + ["kitty", "alacritty", "wezterm", "konsole", "gnome-terminal", "xterm"]
+        preferred = ([preferred_term] if preferred_term else []) + [
+            x.strip().lower() for x in self.cfg.get("REC_TERMINALS", "kitty,tabby").split(",")
+        ]
+        candidates = preferred + ["kitty", "alacritty", "wezterm", "ghostty", "konsole", "gnome-terminal", "xterm"]
+
         launched = False
         for term in candidates:
             if term == "kitty" and shutil.which("kitty"):
-                subprocess.Popen(["kitty", "-e", *rec_cmd], start_new_session=True)
+                cmd = ["kitty"] + (["--directory", work_dir] if work_dir else []) + ["-e", *rec_cmd]
+                subprocess.Popen(cmd, start_new_session=True)
                 launched = True
                 break
             if term == "alacritty" and shutil.which("alacritty"):
-                subprocess.Popen(["alacritty", "-e", *rec_cmd], start_new_session=True)
+                cmd = ["alacritty"] + (["--working-directory", work_dir] if work_dir else []) + ["-e", *rec_cmd]
+                subprocess.Popen(cmd, start_new_session=True)
                 launched = True
                 break
             if term == "wezterm" and shutil.which("wezterm"):
-                subprocess.Popen(["wezterm", "start", "--", *rec_cmd], start_new_session=True)
+                cmd = ["wezterm", "start"] + (["--cwd", work_dir] if work_dir else []) + ["--", *rec_cmd]
+                subprocess.Popen(cmd, start_new_session=True)
+                launched = True
+                break
+            if term == "ghostty" and shutil.which("ghostty"):
+                cmd = ["ghostty"] + ([f"--working-directory={work_dir}"] if work_dir else []) + ["-e", *rec_cmd]
+                subprocess.Popen(cmd, start_new_session=True)
                 launched = True
                 break
             if term == "konsole" and shutil.which("konsole"):
-                subprocess.Popen(["konsole", "-e", *rec_cmd], start_new_session=True)
+                cmd = ["konsole"] + (["--workdir", work_dir] if work_dir else []) + ["-e", *rec_cmd]
+                subprocess.Popen(cmd, start_new_session=True)
                 launched = True
                 break
             if term == "gnome-terminal" and shutil.which("gnome-terminal"):
-                subprocess.Popen(["gnome-terminal", "--", *rec_cmd], start_new_session=True)
+                cmd = ["gnome-terminal"] + ([f"--working-directory={work_dir}"] if work_dir else []) + ["--", *rec_cmd]
+                subprocess.Popen(cmd, start_new_session=True)
                 launched = True
                 break
             if term == "tabby" and shutil.which("tabby"):
-                subprocess.Popen(["tabby"], start_new_session=True)
+                subprocess.Popen(["tabby"], cwd=work_dir, start_new_session=True)
                 launched = True
                 break
+
         if launched:
-            self._show_toast("Launched recorded terminal")
+            self._show_toast("Launched terminal")
             QTimer.singleShot(800, lambda: self._refresh_sessions(force=True))
         else:
-            QMessageBox.information(self, "rec-cli", "Open any terminal and run `rec start` to begin recording.")
+            QMessageBox.information(self, "rec-cli", "Open a terminal and run: rec start")
+
+    def _attach_open_terminal(self, info: dict):
+        """Attach via kitty remote control if available, otherwise copy `rec start`."""
+        sock = info.get("kitty_sock", "")
+        win_id = info.get("kitty_win", "")
+        if sock and win_id and shutil.which("kitty"):
+            try:
+                subprocess.run(
+                    ["kitty", "@", "--to", sock, "send-text", "--match", f"id:{win_id}", "rec start\r"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+                )
+                self._show_toast(f"Started recording in Kitty #{win_id}")
+                QTimer.singleShot(600, lambda: self._refresh_sessions(force=True))
+                return
+            except Exception:
+                pass
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText("rec start")
+        self._show_toast("Copied: rec start")
 
     def _stop_all(self):
-        sessions = load_live_sessions()
+        managed, _, _ = discover_all_terminals()
         count = 0
-        for s in sessions:
+        for s in managed:
             if s.get("legacy"):
                 continue
             if s.get("state") in ("recording", "paused"):
                 if send_session_cmd(s["pid"], "stop"):
                     count += 1
-        self._show_toast(f"Stopped {count} session(s) — rendering MP4")
+        self._show_toast(f"Stopped {count} session(s)")
         QTimer.singleShot(300, lambda: self._refresh_sessions(force=True))
 
     def _session_action(self, pid: int, verb: str):
         if verb == "mark":
-            label, ok = QInputDialog.getText(self, f"Chapter Marker (PID {pid})", "Chapter label (e.g. privesc, got root):")
+            label, ok = QInputDialog.getText(self, f"Chapter Marker (PID {pid})", "Chapter label:")
             if not ok or not label.strip():
                 return
             send_session_cmd(pid, f"mark {label.strip()}")
-            self._show_toast(f"Marked: {label.strip()}")
+            self._show_toast("Marker added")
         elif verb == "start":
-            name, ok = QInputDialog.getText(self, f"Start Clip on PID {pid}", "Optional clip name (blank = auto-name):")
+            name, ok = QInputDialog.getText(self, f"Record PID {pid}", "Clip name (leave blank to auto-name):")
             if not ok:
                 return
             send_session_cmd(pid, f"start {name.strip()}".strip())
-            self._show_toast(f"Started recording PID {pid}")
+            self._show_toast(f"Recording PID {pid}")
         elif verb == "kill":
-            ans = QMessageBox.question(self, "Terminate Session", f"Terminate recording process PID {pid} and its shell?")
+            ans = QMessageBox.question(self, "Terminate Session", f"Terminate process PID {pid}?")
             if ans != QMessageBox.StandardButton.Yes:
                 return
             try:
                 os.kill(pid, signal.SIGTERM)
-                self._show_toast(f"Terminated PID {pid}")
+                self._show_toast(f"Terminated {pid}")
             except OSError:
                 pass
         else:
             send_session_cmd(pid, verb)
-            labels = {"stop": "Stopped — rendering MP4", "pause": "Paused", "resume": "Resumed", "cancel": "Discarded"}
+            labels = {"stop": "Stopped & rendering", "pause": "Paused", "resume": "Resumed", "cancel": "Discarded"}
             self._show_toast(labels.get(verb, verb))
         QTimer.singleShot(250, lambda: self._refresh_sessions(force=True))
 
     def _run_bg(self, cmd: list[str], label: str):
-        self._show_toast(f"{label}…")
+        self._show_toast(f"{label}...")
         w = WorkerThread(cmd, label)
-        w.done.connect(lambda ok, msg: (self._show_toast(msg), self._refresh_clips(force=True)))
+        w.done.connect(lambda _ok, msg: (self._show_toast(msg), self._refresh_clips(force=True)))
         self.workers.append(w)
         w.finished.connect(lambda: self.workers.remove(w) if w in self.workers else None)
         w.start()
@@ -1155,152 +1750,277 @@ class RecGuiWindow(QMainWindow):
             item = layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
+    def _update_terminal_badges(self, running_counts: dict[str, int]):
+        for tid, _label, bins in TERMINALS:
+            lbl = self.term_status_lbls.get(tid)
+            if not lbl:
+                continue
+            installed = any(shutil.which(b) for b in bins)
+            if tid in running_counts:
+                cnt = running_counts[tid]
+                lbl.setText(f"● Running ({cnt} tab{'s' if cnt != 1 else ''})" if cnt > 0 else "● Running")
+                lbl.setObjectName("okBadge")
+            elif installed:
+                lbl.setText("Installed")
+                lbl.setObjectName("muted")
+            else:
+                lbl.setText("Not installed")
+                lbl.setObjectName("dim")
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
+
     def _refresh_sessions(self, force: bool = False):
-        sessions = load_live_sessions()
-        rec_n = sum(1 for s in sessions if s.get("state") == "recording")
-        paused_n = sum(1 for s in sessions if s.get("state") == "paused")
+        managed, open_terms, running_counts = discover_all_terminals()
+        self.running_counts = running_counts
+        self._update_terminal_badges(running_counts)
+
+        rec_n = sum(1 for s in managed if s.get("state") == "recording")
+        paused_n = sum(1 for s in managed if s.get("state") == "paused")
+        total_open = len(managed) + len(open_terms)
+
+        # Update sidebar status pill & nav label
+        self.nav_btns[0].setText(f"  Sessions ({total_open})" if total_open else "  Sessions")
 
         if rec_n > 0:
             self.live_pill.setText(f"● {rec_n} Recording")
-            self.live_pill.setObjectName("recPill")
-            self.stop_all_btn.show()
+            self.live_pill.setObjectName("recBadge")
+            self.stop_all_btn.setVisible(any(not s.get("legacy") and s.get("state") in ("recording", "paused") for s in managed))
         elif paused_n > 0:
             self.live_pill.setText(f"❚❚ {paused_n} Paused")
-            self.live_pill.setObjectName("pausedPill")
+            self.live_pill.setObjectName("pausedBadge")
             self.stop_all_btn.show()
+        elif total_open > 0:
+            self.live_pill.setText(f"{total_open} Terminal{'s' if total_open != 1 else ''} Open")
+            self.live_pill.setObjectName("neutralBadge")
+            self.stop_all_btn.hide()
         else:
             self.live_pill.setText("Idle")
-            self.live_pill.setObjectName("idlePill")
+            self.live_pill.setObjectName("neutralBadge")
             self.stop_all_btn.hide()
         self.live_pill.style().unpolish(self.live_pill)
         self.live_pill.style().polish(self.live_pill)
 
-        # Avoid rebuilding cards unnecessarily if nothing visible changed
-        sig = [
-            (s.get("pid"), s.get("state"), s.get("name"), s.get("fg_cmd"), s.get("cast_size"), int(time.time() - s.get("started_at", 0)) if s.get("state") == "recording" else 0)
-            for s in sessions
-        ]
+        sig = (
+            [
+                (s.get("pid"), s.get("state"), s.get("name"), s.get("fg_cmd"), s.get("cast_size"),
+                 int(time.time() - s.get("started_at", 0)) if s.get("state") == "recording" else 0)
+                for s in managed
+            ],
+            [(o["pid"], o["terminal"], o["cwd"], o["fg_cmd"]) for o in open_terms],
+        )
         if not force and sig == self.last_sessions_sig:
             return
         self.last_sessions_sig = sig
 
         self._clear_layout(self.sessions_lay)
 
-        if not sessions:
+        if not managed and not open_terms:
             empty = QFrame()
-            empty.setObjectName("card")
+            empty.setObjectName("panel")
             el = QVBoxLayout(empty)
-            el.setContentsMargins(24, 34, 24, 34)
+            el.setContentsMargins(24, 42, 24, 42)
             el.setSpacing(6)
-            lbl1 = QLabel("No active recording sessions")
-            lbl1.setObjectName("sectionTitle")
-            lbl1.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl2 = QLabel("Open Kitty or Tabby, run `rec start`, or click \"+ New Recorded Terminal\" above.")
-            lbl2.setObjectName("muted")
-            lbl2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            el.addWidget(lbl1)
-            el.addWidget(lbl2)
+            l1 = QLabel("No terminals detected")
+            l1.setObjectName("rowTitle")
+            l1.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            l2 = QLabel("Open Kitty, Tabby, or any terminal — or click + New Recorded Terminal above.")
+            l2.setObjectName("muted")
+            l2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            el.addWidget(l1)
+            el.addWidget(l2)
             self.sessions_lay.addWidget(empty)
             self.sessions_lay.addStretch()
             return
 
-        for s in sessions:
-            pid = s["pid"]
-            state = s.get("state", "standby")
-            name = s.get("name") or (s.get("last_cmd", "").split()[0] if s.get("last_cmd") else "auto-named")
-            term = s.get("terminal", "tty")
-            cwd = (s.get("cwd") or "").replace(str(Path.home()), "~")
-            cmd_txt = s.get("fg_cmd") or s.get("last_cmd") or cwd
-            elapsed = fmt_elapsed(s.get("started_at", 0)) if state != "standby" else "standby"
-            sz = fmt_size(s.get("cast_size", 0)) if state != "standby" else ""
+        if managed:
+            sec = QLabel("RECORDING SESSIONS")
+            sec.setObjectName("sectionLabel")
+            self.sessions_lay.addWidget(sec)
 
-            card = QFrame()
-            card.setObjectName("cardActive" if state == "recording" else "card")
-            cl = QHBoxLayout(card)
-            cl.setContentsMargins(16, 13, 16, 13)
-            cl.setSpacing(12)
+            for s in managed:
+                self.sessions_lay.addWidget(self._make_managed_card(s))
 
-            left = QVBoxLayout()
-            left.setSpacing(5)
+        if open_terms:
+            if managed:
+                self.sessions_lay.addSpacing(8)
+            sec2 = QLabel("OPEN TERMINALS (NOT RECORDING)")
+            sec2.setObjectName("sectionLabel")
+            self.sessions_lay.addWidget(sec2)
 
-            row1 = QHBoxLayout()
-            row1.setSpacing(8)
-            pill = QLabel("● REC" if state == "recording" else "❚❚ PAUSED" if state == "paused" else "○ STANDBY")
-            pill.setObjectName("recPill" if state == "recording" else "pausedPill" if state == "paused" else "idlePill")
-            row1.addWidget(pill)
-
-            name_lbl = QLabel(name)
-            name_lbl.setObjectName("sectionTitle")
-            row1.addWidget(name_lbl)
-
-            pid_lbl = QLabel(f"PID {pid}")
-            pid_lbl.setObjectName("monoBadge")
-            row1.addWidget(pid_lbl)
-
-            term_lbl = QLabel(term)
-            term_lbl.setObjectName("monoBadge")
-            row1.addWidget(term_lbl)
-
-            meta_str = f"{elapsed}  ·  {sz}" if sz else elapsed
-            time_lbl = QLabel(meta_str)
-            time_lbl.setObjectName("muted")
-            row1.addWidget(time_lbl)
-            row1.addStretch()
-            left.addLayout(row1)
-
-            cmd_lbl = QLabel(f"{cmd_txt}   ({cwd})" if cmd_txt != cwd else cwd)
-            cmd_lbl.setObjectName("muted")
-            left.addWidget(cmd_lbl)
-            cl.addLayout(left, 1)
-
-            # Contextual action buttons
-            btns = QHBoxLayout()
-            btns.setSpacing(6)
-            if s.get("legacy"):
-                b_kill = QPushButton("Kill Legacy Tab")
-                b_kill.setObjectName("dangerBtn")
-                b_kill.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "kill"))
-                btns.addWidget(b_kill)
-            elif state == "recording":
-                b_pause = QPushButton("Pause")
-                b_pause.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "pause"))
-                b_mark = QPushButton("+ Mark")
-                b_mark.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "mark"))
-                b_stop = QPushButton("Stop & Save")
-                b_stop.setObjectName("primaryBtn")
-                b_stop.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "stop"))
-                b_cancel = QPushButton("Discard")
-                b_cancel.setObjectName("dangerBtn")
-                b_cancel.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "cancel"))
-                for b in (b_pause, b_mark, b_stop, b_cancel):
-                    btns.addWidget(b)
-            elif state == "paused":
-                b_res = QPushButton("Resume")
-                b_res.setObjectName("primaryBtn")
-                b_res.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "resume"))
-                b_stop = QPushButton("Stop & Save")
-                b_stop.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "stop"))
-                b_cancel = QPushButton("Discard")
-                b_cancel.setObjectName("dangerBtn")
-                b_cancel.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "cancel"))
-                for b in (b_res, b_stop, b_cancel):
-                    btns.addWidget(b)
-            else:
-                b_start = QPushButton("Start Clip")
-                b_start.setObjectName("primaryBtn")
-                b_start.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "start"))
-                b_kill = QPushButton("Kill")
-                b_kill.setObjectName("dangerBtn")
-                b_kill.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "kill"))
-                for b in (b_start, b_kill):
-                    btns.addWidget(b)
-
-            cl.addLayout(btns)
-            self.sessions_lay.addWidget(card)
+            for o in open_terms:
+                self.sessions_lay.addWidget(self._make_open_term_card(o))
 
         self.sessions_lay.addStretch()
+
+    def _make_managed_card(self, s: dict) -> QFrame:
+        pid = s["pid"]
+        state = s.get("state", "standby")
+        legacy = bool(s.get("legacy"))
+        name = s.get("name") or (s.get("last_cmd", "").split()[0] if s.get("last_cmd") else "session")
+        term = s.get("terminal", "tty")
+        cwd = short_cwd(s.get("cwd", ""))
+        cmd_txt = s.get("fg_cmd") or s.get("last_cmd") or cwd
+        elapsed = fmt_elapsed(s.get("started_at", 0)) if state != "standby" else "ready"
+        sz = fmt_size(s.get("cast_size", 0)) if state != "standby" else ""
+
+        card = QFrame()
+        card.setObjectName("panelRec" if state == "recording" else "panel")
+        cl = QHBoxLayout(card)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(5)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(7)
+        if state == "recording":
+            pill = QLabel("● REC" if not legacy else "● REC (OLD)")
+            pill.setObjectName("recBadge")
+        elif state == "paused":
+            pill = QLabel("❚❚ PAUSED")
+            pill.setObjectName("pausedBadge")
+        else:
+            pill = QLabel("○ READY")
+            pill.setObjectName("neutralBadge")
+        row1.addWidget(pill)
+
+        name_lbl = QLabel(name)
+        name_lbl.setObjectName("rowTitle")
+        row1.addWidget(name_lbl)
+
+        for txt in (f"PID {pid}", term):
+            tag = QLabel(txt)
+            tag.setObjectName("monoTag")
+            row1.addWidget(tag)
+
+        meta = QLabel(f"{elapsed} · {sz}" if sz else elapsed)
+        meta.setObjectName("muted")
+        row1.addWidget(meta)
+        row1.addStretch()
+        left.addLayout(row1)
+
+        sub = ElidedLabel(f"{cmd_txt}  ·  {cwd}" if cmd_txt != cwd else cwd)
+        sub.setObjectName("muted")
+        left.addWidget(sub)
+        cl.addLayout(left, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        if legacy:
+            b_kill = QPushButton("Kill")
+            b_kill.setObjectName("dangerBtn")
+            b_kill.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "kill"))
+            btns.addWidget(b_kill)
+        elif state == "recording":
+            b_pause = QPushButton("Pause")
+            b_pause.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "pause"))
+            b_mark = QPushButton("Mark")
+            b_mark.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "mark"))
+            b_stop = QPushButton("Stop")
+            b_stop.setObjectName("primaryBtn")
+            b_stop.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "stop"))
+            b_cancel = QPushButton("Discard")
+            b_cancel.setObjectName("dangerBtn")
+            b_cancel.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "cancel"))
+            for b in (b_pause, b_mark, b_stop, b_cancel):
+                btns.addWidget(b)
+        elif state == "paused":
+            b_res = QPushButton("Resume")
+            b_res.setObjectName("recBtn")
+            b_res.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "resume"))
+            b_stop = QPushButton("Stop")
+            b_stop.setObjectName("primaryBtn")
+            b_stop.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "stop"))
+            b_cancel = QPushButton("Discard")
+            b_cancel.setObjectName("dangerBtn")
+            b_cancel.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "cancel"))
+            for b in (b_res, b_stop, b_cancel):
+                btns.addWidget(b)
+        else:
+            b_start = QPushButton("Record")
+            b_start.setObjectName("recBtn")
+            b_start.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "start"))
+            b_kill = QPushButton("Kill")
+            b_kill.setObjectName("dangerBtn")
+            b_kill.clicked.connect(lambda _c=False, p=pid: self._session_action(p, "kill"))
+            for b in (b_start, b_kill):
+                btns.addWidget(b)
+
+        # Tighten card buttons so all controls always fit cleanly without clipping
+        for i in range(btns.count()):
+            w = btns.itemAt(i).widget()
+            if isinstance(w, QPushButton):
+                w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        cl.addLayout(btns)
+        return card
+
+    def _make_open_term_card(self, o: dict) -> QFrame:
+        pid = o["pid"]
+        term = o["terminal"]
+        cwd = short_cwd(o.get("cwd", ""))
+        cmd = o.get("fg_cmd") or o.get("shell", "shell")
+
+        card = QFrame()
+        card.setObjectName("panel")
+        cl = QHBoxLayout(card)
+        cl.setContentsMargins(14, 11, 14, 11)
+        cl.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(4)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(7)
+        badge = QLabel("● OPEN")
+        badge.setObjectName("okBadge")
+        row1.addWidget(badge)
+
+        tname = QLabel(term)
+        tname.setObjectName("rowTitle")
+        row1.addWidget(tname)
+
+        pid_tag = QLabel(f"PID {pid}")
+        pid_tag.setObjectName("monoTag")
+        row1.addWidget(pid_tag)
+
+        sh_tag = QLabel(o.get("shell", "sh"))
+        sh_tag.setObjectName("monoTag")
+        row1.addWidget(sh_tag)
+        row1.addStretch()
+        left.addLayout(row1)
+
+        sub = ElidedLabel(f"{cmd}  ·  {cwd}" if cmd != cwd else cwd)
+        sub.setObjectName("muted")
+        left.addWidget(sub)
+        cl.addLayout(left, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+
+        can_remote = bool(o.get("kitty_sock") and o.get("kitty_win"))
+        b_attach = QPushButton("Start Rec" if can_remote else "Copy rec start")
+        if can_remote:
+            b_attach.setObjectName("recBtn")
+        b_attach.clicked.connect(lambda _c=False, info=o: self._attach_open_terminal(info))
+        btns.addWidget(b_attach)
+
+        b_new = QPushButton("Record Here")
+        b_new.setObjectName("primaryBtn")
+        b_new.clicked.connect(lambda _c=False, t=term, c=o.get("cwd", ""): self._launch_recorded_terminal(t, c))
+        btns.addWidget(b_new)
+
+        # Tighten card buttons so all controls always fit cleanly without clipping
+        for i in range(btns.count()):
+            w = btns.itemAt(i).widget()
+            if isinstance(w, QPushButton):
+                w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        cl.addLayout(btns)
+        return card
 
     def _refresh_clips(self, force: bool = False):
         vdir = Path(self.cfg.get("REC_VIDEO_DIR", str(Path.home() / "Videos/content")))
@@ -1317,16 +2037,17 @@ class RecGuiWindow(QMainWindow):
         self.last_clips_sig = sig
 
         total_bytes = sum(s for _, s, _ in sig)
-        self.clips_title.setText(f"Saved Clips  ({len(mp4s)} · {fmt_size(total_bytes)})")
+        self.clips_title.setText(f"Clips  ({len(mp4s)} · {fmt_size(total_bytes)})" if mp4s else "Clips")
+        self.nav_btns[2].setText(f"  Clips ({len(mp4s)})" if mp4s else "  Clips")
 
         self._clear_layout(self.clips_lay)
 
         if not mp4s:
             empty = QFrame()
-            empty.setObjectName("card")
+            empty.setObjectName("panel")
             el = QVBoxLayout(empty)
-            el.setContentsMargins(24, 34, 24, 34)
-            lbl = QLabel("No clips found" if query else f"No clips in {vdir} yet")
+            el.setContentsMargins(24, 38, 24, 38)
+            lbl = QLabel("No matching clips" if query else f"No clips in {short_cwd(str(vdir))} yet")
             lbl.setObjectName("muted")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             el.addWidget(lbl)
@@ -1338,16 +2059,16 @@ class RecGuiWindow(QMainWindow):
             st = p.stat()
             mtime = time.strftime("%b %d · %H:%M", time.localtime(st.st_mtime))
             card = QFrame()
-            card.setObjectName("card")
+            card.setObjectName("panel")
             rl = QHBoxLayout(card)
             rl.setContentsMargins(14, 10, 14, 10)
             rl.setSpacing(10)
 
             info = QVBoxLayout()
             info.setSpacing(2)
-            name_lbl = QLabel(p.name)
-            name_lbl.setStyleSheet("font-weight: 600;")
-            meta_lbl = QLabel(f"{fmt_size(st.st_size)}  ·  {mtime}")
+            name_lbl = ElidedLabel(p.name)
+            name_lbl.setObjectName("rowTitle")
+            meta_lbl = QLabel(f"{fmt_size(st.st_size)} · {mtime}")
             meta_lbl.setObjectName("muted")
             info.addWidget(name_lbl)
             info.addWidget(meta_lbl)
@@ -1357,9 +2078,9 @@ class RecGuiWindow(QMainWindow):
             b_play.setObjectName("primaryBtn")
             b_play.clicked.connect(lambda _c=False, path=p: self._play_clip(path))
             b_gif = QPushButton("GIF")
-            b_gif.clicked.connect(lambda _c=False, path=p: self._run_bg(["rec-cli", "gif", str(path)], "GIF export"))
+            b_gif.clicked.connect(lambda _c=False, path=p: self._run_bg(["rec-cli", "gif", str(path)], "GIF"))
             b_thumb = QPushButton("Thumb")
-            b_thumb.clicked.connect(lambda _c=False, path=p: self._run_bg(["rec-cli", "thumb", str(path)], "Thumbnail"))
+            b_thumb.clicked.connect(lambda _c=False, path=p: self._run_bg(["rec-cli", "thumb", str(path)], "Thumb"))
             b_del = QPushButton("Delete")
             b_del.setObjectName("dangerBtn")
             b_del.clicked.connect(lambda _c=False, path=p: self._delete_clip(path))
@@ -1376,7 +2097,6 @@ def main() -> int:
     app.setApplicationName("rec-cli")
     win = RecGuiWindow()
     if "--smoke-test" in sys.argv:
-        # Clean headless verification for CI / automated tests
         win.show()
         win._toggle_theme()
         win._toggle_theme()
