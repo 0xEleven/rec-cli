@@ -695,12 +695,12 @@ sd.rounded_rectangle([VX, top_safe + 10, VX + VW, VY + VH + 10], radius=radius, 
 shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(16, W // 50)))
 base = Image.alpha_composite(base, shadow)
 
-# Card shell + titlebar + minimal "> tool ●" badge
+# Card shell + clean minimal titlebar (no text label clutter)
 card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 cd = ImageDraw.Draw(card)
 bw = max(2, W // 540)
-cd.rounded_rectangle([VX, top_safe, VX + VW, VY + VH], radius=radius, fill=bg_c + (255,), outline=acc_c + (165,), width=bw)
-cd.line([VX + bw, VY, VX + VW - bw, VY], fill=acc_c + (55,), width=max(1, bw // 2))
+cd.rounded_rectangle([VX, top_safe, VX + VW, VY + VH], radius=radius, fill=bg_c + (255,), outline=acc_c + (145,), width=bw)
+cd.line([VX + bw, VY, VX + VW - bw, VY], fill=acc_c + (45,), width=max(1, bw // 2))
 
 dot_r = max(6, title_h // 6)
 dot_cy = top_safe + title_h // 2
@@ -709,41 +709,18 @@ for idx, col in enumerate(((247, 118, 142, 255), (224, 175, 104, 255), (158, 206
     cx = dot_x0 + idx * int(dot_r * 3.1)
     cd.ellipse([cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r], fill=col)
 
-font = None
-for fp in (
-    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-    "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
-):
-    try:
-        font = ImageFont.truetype(fp, max(16, int(title_h * 0.44)))
-        break
-    except Exception:
-        pass
-if font is None:
-    font = ImageFont.load_default()
-
-label = f"> {tool}"
-bbox = cd.textbbox((0, 0), label, font=font)
-tw_lbl, th_lbl = bbox[2] - bbox[0], bbox[3] - bbox[1]
-lx = VX + (VW - tw_lbl) // 2 - int(dot_r * 1.4)
-ly = top_safe + (title_h - th_lbl) // 2 - bbox[1] // 2
-cd.text((lx, ly), label, fill=fg_c + (220,), font=font)
-rx = lx + tw_lbl + int(dot_r * 2.1)
-cd.ellipse([rx - dot_r, dot_cy - dot_r, rx + dot_r, dot_cy + dot_r], fill=(247, 118, 142, 255))
-
 base_rgb = Image.alpha_composite(base, card).convert("RGB")
 
 # Inner viewport fits strictly inside the rounded card's border
 IVW = VW - bw * 2
 IVH = VH - bw * 2
 
-# Camera physics:
-# - fit_scale fits 100% of terminal width cleanly with ZERO cropped characters.
-# - follow_scale zooms in comfortably (~1.72x fit_scale) to follow the cursor while typing.
-# - Wide output bursts smoothly ease back to fit_scale so wide tables (like nmap) are never cut off!
+# Calm, subtle camera physics (zero jarring zoom pumping, subpixel-smooth affine pan/zoom):
+# - fit_scale fits 100% of terminal width with zero cropping.
+# - follow_scale applies a gentle 1.28x zoom while actively typing, held steadily with hysteresis.
+# - 2nd-order critically damped springs guarantee gentle ease-in and ease-out (zero sudden snaps).
 fit_scale = min(IVW / max(1, TW), IVH / max(1, TH))
-follow_scale = min(fit_scale * 1.72, (IVH * 0.92) / max(1, TH) * 1.35)
+follow_scale = min(fit_scale * 1.28, (IVH * 0.94) / max(1, TH) * 1.20)
 if follow_scale < fit_scale:
     follow_scale = fit_scale
 
@@ -751,16 +728,33 @@ fps = 30
 dt = 1.0 / fps
 n_out_frames = max(1, int(math.ceil(total_dur * fps)))
 
-# Camera state in source-terminal pixel space
-cam_x = TW * 0.35
-cam_y = TH * 0.25
+# Critically damped spring state (position + velocity) in source-terminal pixel space
+cam_x = TW * 0.5
+cam_vx = 0.0
+cam_y = TH * 0.35
+cam_vy = 0.0
 cam_scale = fit_scale
+cam_vs = 0.0
 
-# Pre-index cursor lookup
+# Smoothed target anchor (prevents micro-jitter) + zoom hysteresis (prevents pumping)
+anchor_x = cam_x
+anchor_y = cam_y
+zoom_mode = "fit"  # "fit" or "follow"
+last_zoom_switch_t = -10.0
+MIN_ZOOM_HOLD = 2.2  # seconds before allowing a zoom state change
+
+def step_spring(pos: float, vel: float, target: float, omega: float, step_dt: float) -> tuple[float, float]:
+    """Exact critically-damped harmonic spring step (smooth ease-in, zero overshoot)."""
+    diff = pos - target
+    exp_term = math.exp(-omega * step_dt)
+    new_pos = target + (diff + (vel + omega * diff) * step_dt) * exp_term
+    new_vel = (vel - (vel + omega * diff) * omega * step_dt) * exp_term
+    return new_pos, new_vel
+
 track_idx = 0
 last_input_t = -99.0
 recent_wide_t = -99.0
-cur_nx, cur_ny = 0.25, 0.20
+cur_nx, cur_ny = 0.35, 0.25
 
 def sample_cursor(abs_t: float):
     global track_idx, last_input_t, recent_wide_t, cur_nx, cur_ny
@@ -769,11 +763,11 @@ def sample_cursor(abs_t: float):
         cur_nx, cur_ny = nx, ny
         if is_in:
             last_input_t = ev_t
-        elif span >= 0.58:
+        elif span >= 0.62:
             recent_wide_t = ev_t
         track_idx += 1
-    typing_active = (abs_t - last_input_t) <= 0.95
-    wide_burst = (abs_t - recent_wide_t) <= 1.25 and not typing_active
+    typing_active = (abs_t - last_input_t) <= 1.6
+    wide_burst = (abs_t - recent_wide_t) <= 2.0 and not typing_active
     return cur_nx, cur_ny, typing_active, wide_burst
 
 cmd = [
@@ -798,59 +792,61 @@ try:
         src_img = raw_frames[gif_idx][2]
 
         nx, ny, typing_active, wide_burst = sample_cursor(slice_start + t)
-        tgt_x = nx * TW
-        tgt_y = ny * TH
+        raw_x = nx * TW
+        raw_y = ny * TH
 
-        # Smoothly zoom in when typing/focused; pull out to full width on wide output (zero crop!)
+        # Hysteresis on zoom state so camera never pumps in/out rapidly
+        desired_mode = zoom_mode
         if wide_burst:
-            tgt_scale = fit_scale
-            tgt_x = TW * 0.5
+            desired_mode = "fit"
         elif typing_active:
-            tgt_scale = follow_scale
+            desired_mode = "follow"
         else:
-            tgt_scale = fit_scale + (follow_scale - fit_scale) * 0.45
+            desired_mode = "fit"
 
-        # Critically-damped smooth glide with subtle horizontal deadzone
-        alpha_s = 1.0 - math.exp(-dt * 4.0)
-        alpha_p = 1.0 - math.exp(-dt * 6.5)
-        cam_scale += (tgt_scale - cam_scale) * alpha_s
+        if desired_mode != zoom_mode and (t - last_zoom_switch_t) >= MIN_ZOOM_HOLD:
+            zoom_mode = desired_mode
+            last_zoom_switch_t = t
 
-        # Soft deadzone so single characters don't micro-shake the camera
+        tgt_scale = follow_scale if zoom_mode == "follow" else fit_scale
+        tgt_x = TW * 0.5 if zoom_mode == "fit" else raw_x
+        tgt_y = raw_y
+
+        # Generous deadzone so individual keystrokes stay rock-steady
         view_w_src = IVW / max(0.05, cam_scale)
         view_h_src = IVH / max(0.05, cam_scale)
-        if abs(tgt_x - cam_x) > view_w_src * 0.10 or wide_burst:
-            cam_x += (tgt_x - cam_x) * alpha_p
-        if abs(tgt_y - cam_y) > view_h_src * 0.08:
-            cam_y += (tgt_y - cam_y) * alpha_p
+        if zoom_mode == "fit" or abs(tgt_x - anchor_x) > view_w_src * 0.22:
+            anchor_x = tgt_x
+        if abs(tgt_y - anchor_y) > view_h_src * 0.18:
+            anchor_y = tgt_y
 
-        # Render scaled terminal cleanly inside (IVW x IVH) without ever cropping off edges unexpectedly
-        scaled_w = max(2, int(round(TW * cam_scale)))
-        scaled_h = max(2, int(round(TH * cam_scale)))
-        scaled = src_img.resize((scaled_w, scaled_h), Image.Resampling.BILINEAR)
+        # Smooth critically damped springs (gentle pan omega=2.6, very calm zoom omega=1.6)
+        cam_scale, cam_vs = step_spring(cam_scale, cam_vs, tgt_scale, 1.6, dt)
+        cam_x, cam_vx = step_spring(cam_x, cam_vx, anchor_x, 2.6, dt)
+        cam_y, cam_vy = step_spring(cam_y, cam_vy, anchor_y, 2.4, dt)
 
-        viewport = Image.new("RGB", (IVW, IVH), bg_c)
-        if scaled_w <= IVW:
-            paste_x = (IVW - scaled_w) // 2
-            crop_x0 = 0
-            crop_w = scaled_w
+        # Subpixel-accurate floating-point AFFINE transform (eliminates 1px pan/zoom jitter!)
+        inv_s = 1.0 / max(0.05, cam_scale)
+        vis_w = IVW * inv_s
+        vis_h = IVH * inv_s
+
+        if vis_w >= TW:
+            src_x0 = (TW - vis_w) * 0.5
         else:
-            cx_px = cam_x * cam_scale
-            crop_x0 = int(max(0, min(scaled_w - IVW, cx_px - IVW * 0.5)))
-            paste_x = 0
-            crop_w = IVW
+            src_x0 = max(0.0, min(TW - vis_w, cam_x - vis_w * 0.5))
 
-        if scaled_h <= IVH:
-            paste_y = (IVH - scaled_h) // 2
-            crop_y0 = 0
-            crop_h = scaled_h
+        if vis_h >= TH:
+            src_y0 = (TH - vis_h) * 0.5
         else:
-            cy_px = cam_y * cam_scale
-            crop_y0 = int(max(0, min(scaled_h - IVH, cy_px - IVH * 0.5)))
-            paste_y = 0
-            crop_h = IVH
+            src_y0 = max(0.0, min(TH - vis_h, cam_y - vis_h * 0.5))
 
-        region = scaled.crop((crop_x0, crop_y0, crop_x0 + crop_w, crop_y0 + crop_h))
-        viewport.paste(region, (paste_x, paste_y))
+        viewport = src_img.transform(
+            (IVW, IVH),
+            Image.Transform.AFFINE,
+            (inv_s, 0.0, src_x0, 0.0, inv_s, src_y0),
+            resample=Image.Resampling.BICUBIC,
+            fillcolor=bg_c,
+        )
 
         frame_out = base_rgb.copy()
         frame_out.paste(viewport, (VX + bw, VY + bw))
@@ -932,29 +928,6 @@ dot_gap = int(dot_r * 3.1)
 for idx, col in enumerate(((247, 118, 142, 255), (224, 175, 104, 255), (158, 206, 106, 255))):
     cx = dot_x0 + idx * dot_gap
     cd.ellipse([cx - dot_r, dot_cy - dot_r, cx + dot_r, dot_cy + dot_r], fill=col)
-
-font = None
-for fp in (
-    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-    "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
-):
-    try:
-        font = ImageFont.truetype(fp, max(13, int(TH * 0.42)))
-        break
-    except Exception:
-        pass
-if font is None:
-    font = ImageFont.load_default()
-
-label = f"> {title}"
-bbox = cd.textbbox((0, 0), label, font=font)
-tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-lx = wx + (win_w - tw) // 2 - int(dot_r * 1.2)
-ly = wy + (TH - th) // 2 - bbox[1] // 2
-cd.text((lx, ly), label, fill=fg_c + (200,), font=font)
-rx = lx + tw + int(dot_r * 2.0)
-cd.ellipse([rx - dot_r, dot_cy - dot_r, rx + dot_r, dot_cy + dot_r], fill=(247, 118, 142, 255))
 
 img = Image.alpha_composite(img, card).convert("RGB")
 img.save(out_png, "PNG")
