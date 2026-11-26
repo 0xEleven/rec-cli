@@ -6,7 +6,7 @@ set -euo pipefail
 #           Fedora, RHEL, Rocky, Alma, CentOS, openSUSE, Alpine, Void, Gentoo
 # Shells:   Zsh, Bash, Fish
 
-VERSION="1.4.0"
+VERSION="2.0.0"
 PREFIX="${PREFIX:-$HOME/.local}"
 INSTALL_DEPS=1
 CONFIGURE_SHELLS=1
@@ -110,11 +110,14 @@ install_files() {
   local icons_dir="$PREFIX/share/icons/hicolor/scalable/apps"
   mkdir -p "$bin_dir" "$share_dir/shell" "$share_dir/starship" "$apps_dir" "$icons_dir"
 
-  install -m 755 "$REPO_ROOT/bin/rec-cli"   "$bin_dir/rec-cli"
-  install -m 755 "$REPO_ROOT/bin/rec-pty"   "$bin_dir/rec-pty"
-  install -m 755 "$REPO_ROOT/bin/rec-gui"   "$bin_dir/rec-gui"
-  install -m 755 "$REPO_ROOT/bin/cast2mp4"  "$bin_dir/cast2mp4"
-  install -m 755 "$REPO_ROOT/bin/casts2mp4" "$bin_dir/casts2mp4"
+  install -m 755 "$REPO_ROOT/bin/rec-cli"           "$bin_dir/rec-cli"
+  install -m 755 "$REPO_ROOT/bin/rec-pty"           "$bin_dir/rec-pty"
+  install -m 755 "$REPO_ROOT/bin/rec-gui"           "$bin_dir/rec-gui"
+  install -m 755 "$REPO_ROOT/bin/rec-studio-engine" "$bin_dir/rec-studio-engine"
+  install -m 755 "$REPO_ROOT/bin/rec-studio-editor" "$bin_dir/rec-studio-editor"
+  install -m 755 "$REPO_ROOT/bin/rec-capture"       "$bin_dir/rec-capture"
+  install -m 755 "$REPO_ROOT/bin/cast2mp4"          "$bin_dir/cast2mp4"
+  install -m 755 "$REPO_ROOT/bin/casts2mp4"         "$bin_dir/casts2mp4"
 
   install -m 644 "$REPO_ROOT/shell/rec.zsh"  "$share_dir/shell/rec.zsh"
   install -m 644 "$REPO_ROOT/shell/rec.bash" "$share_dir/shell/rec.bash"

@@ -1,0 +1,1337 @@
+#!/usr/bin/env python3
+"""rec-studio-engine — Recordly-grade video editor & compositor engine for rec-cli v2.0.0.
+
+Provides:
+- Non-destructive `.recproj` JSON project format (save/reopen any edit)
+- Shared WYSIWYG frame compositor (backgrounds, wallpapers, gradients, blur,
+  padding, rounded corners, drop shadows, window chrome, crop, aspect ratios,
+  2nd-order critically damped spring zooms, directional motion blur,
+  macOS-style vector cursor with smoothing & click bounce, dynamic webcam
+  bubble with auto-shrink on zoom, and timed text/blur/box/arrow/image overlays)
+- Exact timeline mapper for multi-segment trims (cuts) & variable speed regions
+- 1-click Auto-Zoom analyzer (from cursor track or visual frame-diff hotspots)
+- Full-resolution FFmpeg MP4 (H.264 CFR + synced AAC audio) & palette GIF export
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Callable
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+ASPECT_RATIOS: dict[str, tuple[int, int] | None] = {
+    "16:9": (16, 9),
+    "9:16": (9, 16),
+    "1:1": (1, 1),
+    "4:3": (4, 3),
+    "4:5": (4, 5),
+    "21:9": (21, 9),
+    "original": None,
+}
+
+# Curated studio wallpapers (multi-stop mesh/angled gradients — clean, non-garish)
+WALLPAPER_PRESETS: dict[str, dict] = {
+    "midnight":   {"label": "Midnight",   "c1": "#0f172a", "c2": "#1e293b", "c3": "#312e81", "angle": 135},
+    "carbon":     {"label": "Carbon",     "c1": "#0c0c0e", "c2": "#1a1a20", "c3": "#27272f", "angle": 145},
+    "ocean":      {"label": "Ocean",      "c1": "#0c4a6e", "c2": "#0f766e", "c3": "#1e3a8a", "angle": 130},
+    "sunset":     {"label": "Sunset",     "c1": "#7c2d12", "c2": "#be123c", "c3": "#3b0764", "angle": 125},
+    "aurora":     {"label": "Aurora",     "c1": "#064e3b", "c2": "#1d4ed8", "c3": "#1e1b4b", "angle": 140},
+    "slate":      {"label": "Slate",      "c1": "#1f2937", "c2": "#374151", "c3": "#111827", "angle": 135},
+    "sand":       {"label": "Warm Sand",  "c1": "#f5efe6", "c2": "#e8dcc8", "c3": "#d6c5ad", "angle": 135},
+    "alabaster":  {"label": "Alabaster",  "c1": "#f8fafc", "c2": "#e2e8f0", "c3": "#cbd5e1", "angle": 135},
+}
+
+SPRING_PROFILES = {
+    "smooth":    (12.0, 2.0 * math.sqrt(12.0)),  # calm critically damped
+    "snappy":    (28.0, 2.0 * math.sqrt(28.0)),  # crisp Screen Studio feel
+    "cinematic": (7.5,  2.0 * math.sqrt(7.5)),   # slow luxurious glide
+}
+
+
+def hex_to_rgb(h: str, default: tuple[int, int, int] = (20, 20, 24)) -> tuple[int, int, int]:
+    try:
+        h = (h or "").strip().lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        if len(h) >= 6:
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        pass
+    return default
+
+
+def new_id(prefix: str = "item") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def probe_media(path: str) -> dict:
+    """Return {duration, width, height, fps, has_audio} using ffprobe."""
+    info = {"duration": 5.0, "width": 1920, "height": 1080, "fps": 30.0, "has_audio": False}
+    if not path or not os.path.isfile(path) or not shutil.which("ffprobe"):
+        return info
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error", "-print_format", "json",
+                "-show_format", "-show_streams", path,
+            ],
+            stderr=subprocess.DEVNULL, text=True, timeout=8,
+        )
+        data = json.loads(out)
+        fmt = data.get("format", {})
+        if fmt.get("duration"):
+            info["duration"] = max(0.2, float(fmt["duration"]))
+        for st in data.get("streams", []):
+            ctype = st.get("codec_type")
+            if ctype == "video":
+                info["width"] = int(st.get("width") or info["width"])
+                info["height"] = int(st.get("height") or info["height"])
+                rfr = st.get("avg_frame_rate") or st.get("r_frame_rate") or "30/1"
+                if "/" in rfr:
+                    num, den = rfr.split("/", 1)
+                    if float(den) > 0 and float(num) > 0:
+                        fps = float(num) / float(den)
+                        info["fps"] = max(10.0, min(60.0, fps))
+            elif ctype == "audio":
+                info["has_audio"] = True
+    except Exception:
+        pass
+    return info
+
+
+def default_project(source_path: str = "") -> dict:
+    meta = probe_media(source_path) if source_path and os.path.isfile(source_path) else {
+        "duration": 10.0, "width": 1920, "height": 1080, "fps": 30.0, "has_audio": False
+    }
+    # Auto-load matching sidecar cursor track or webcam if recorded via rec-capture
+    cursor_track = []
+    webcam_path = ""
+    if source_path:
+        base = str(Path(source_path).with_suffix(""))
+        for cand in (base + ".cursor.json", source_path + ".cursor.json"):
+            if os.path.isfile(cand):
+                try:
+                    cdata = json.loads(Path(cand).read_text(encoding="utf-8"))
+                    cursor_track = cdata.get("track", cdata) if isinstance(cdata, dict) else cdata
+                except Exception:
+                    pass
+                break
+        for wcand in (base + ".webcam.mp4", base + "_webcam.mp4"):
+            if os.path.isfile(wcand):
+                webcam_path = wcand
+                break
+
+    return {
+        "version": 1,
+        "source": source_path,
+        "duration": round(meta["duration"], 3),
+        "src_w": meta["width"],
+        "src_h": meta["height"],
+        "src_fps": round(meta["fps"], 2),
+        "has_audio": meta["has_audio"],
+        "aspect_ratio": "16:9",
+        "background": {
+            "type": "preset",       # preset | gradient | solid | image
+            "preset": "midnight",
+            "color1": "#0f172a",
+            "color2": "#312e81",
+            "angle": 135,
+            "image": "",
+            "blur": 0,
+        },
+        "frame": {
+            "padding": 7,           # 0..22 %
+            "radius": 18,           # 0..44 px (at 1080p reference)
+            "shadow": 65,           # 0..100 %
+            "chrome": "none",       # none | macos | minimal
+            "crop_top": 0.0,        # 0..35 %
+            "crop_bottom": 0.0,
+            "crop_left": 0.0,
+            "crop_right": 0.0,
+        },
+        "motion": {
+            "spring": "smooth",     # smooth | snappy | cinematic
+            "motion_blur": 20,      # 0..100 %
+        },
+        "cursor": {
+            "enabled": bool(cursor_track),
+            "style": "macos",       # macos | ring | dot
+            "size": 1.25,           # 0.7..2.5
+            "smoothing": 65,        # 0..100
+            "click_bounce": True,
+            "hide_idle": True,
+            "track": cursor_track,  # [[t, nx, ny, clicked], ...]
+        },
+        "zooms": [],                # [{id, start, end, depth, x, y, auto}]
+        "trims": [],                # [{id, start, end}] (cut regions removed on export)
+        "speeds": [],               # [{id, start, end, rate}]
+        "annotations": [],          # [{id, kind, start, end, x, y, w, h, text, color, bg, font_size, image_path}]
+        "webcam": {
+            "enabled": bool(webcam_path),
+            "path": webcam_path,
+            "corner": "br",         # br | bl | tr | tl
+            "size": 20,             # 10..35 % of min canvas dim
+            "roundness": 100,       # 0..100 (100 = circle)
+            "shadow": True,
+            "shrink_on_zoom": True,
+        },
+        "audio": {
+            "overlay_path": "",
+            "overlay_volume": 0.75,
+            "overlay_offset": 0.0,
+            "mute_source": False,
+        },
+        "export": {
+            "resolution": "1080p",  # 720p | 1080p | 1440p | 4k
+            "fps": 30,              # 30 | 60
+            "quality": "high",      # high | balanced | compact
+            "format": "mp4",        # mp4 | gif
+        },
+    }
+
+
+def save_project(proj: dict, path: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(proj, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def load_project(path: str) -> dict:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    base = default_project(raw.get("source", ""))
+    # Deep merge top-level dicts so older/partial .recproj files stay forward-compatible
+    for k, v in raw.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k].update(v)
+        else:
+            base[k] = v
+    return base
+
+
+def compute_output_dims(proj: dict, preview_max: int = 0) -> tuple[int, int]:
+    """Resolve exact even (width, height) from aspect_ratio + export resolution."""
+    ar_key = proj.get("aspect_ratio", "16:9")
+    res_key = proj.get("export", {}).get("resolution", "1080p").lower()
+    short_map = {"720p": 720, "1080p": 1080, "1440p": 1440, "4k": 2160}
+    base_short = short_map.get(res_key, 1080)
+
+    ratio = ASPECT_RATIOS.get(ar_key)
+    if ratio is None:
+        sw = max(2, int(proj.get("src_w", 1920)))
+        sh = max(2, int(proj.get("src_h", 1080)))
+        scale = base_short / max(1, min(sw, sh))
+        w, h = int(round(sw * scale)), int(round(sh * scale))
+    else:
+        rw, rh = ratio
+        if rw >= rh:
+            h = base_short
+            w = int(round(base_short * rw / rh))
+        else:
+            w = base_short
+            h = int(round(base_short * rh / rw))
+
+    if preview_max > 0:
+        longest = max(w, h)
+        if longest > preview_max:
+            s = preview_max / longest
+            w = int(round(w * s))
+            h = int(round(h * s))
+
+    # H.264 requires even dimensions
+    w = max(64, w - (w % 2))
+    h = max(64, h - (h % 2))
+    return (w, h)
+
+
+# ---------------------------------------------------------------------------
+# Timeline Mapper (Trims / Cuts + Variable Speed Regions)
+# ---------------------------------------------------------------------------
+
+def _merged_trims(trims: list[dict], duration: float) -> list[tuple[float, float]]:
+    segs = []
+    for t in trims or []:
+        s = max(0.0, min(duration, float(t.get("start", 0.0))))
+        e = max(0.0, min(duration, float(t.get("end", 0.0))))
+        if e - s >= 0.05:
+            segs.append((s, e))
+    segs.sort()
+    merged = []
+    for s, e in segs:
+        if merged and s <= merged[-1][1] + 0.02:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def build_timeline_segments(proj: dict) -> list[dict]:
+    """Split source timeline into ordered kept segments: [{src_start, src_end, rate, out_start, out_end}]."""
+    dur = max(0.1, float(proj.get("duration", 5.0)))
+    cuts = _merged_trims(proj.get("trims", []), dur)
+    speeds = proj.get("speeds", []) or []
+
+    # Build kept intervals by subtracting cuts from [0, dur]
+    kept = []
+    cur = 0.0
+    for cs, ce in cuts:
+        if cs > cur + 0.02:
+            kept.append((cur, cs))
+        cur = max(cur, ce)
+    if cur < dur - 0.02:
+        kept.append((cur, dur))
+    if not kept:
+        kept = [(0.0, dur)]
+
+    # Split kept intervals by speed region boundaries
+    boundaries = set()
+    for ks, ke in kept:
+        boundaries.add(ks)
+        boundaries.add(ke)
+    for sp in speeds:
+        s = max(0.0, min(dur, float(sp.get("start", 0.0))))
+        e = max(0.0, min(dur, float(sp.get("end", 0.0))))
+        if e - s >= 0.05:
+            boundaries.add(s)
+            boundaries.add(e)
+
+    pts = sorted(boundaries)
+    segs = []
+    out_t = 0.0
+    for i in range(len(pts) - 1):
+        a, b = pts[i], pts[i + 1]
+        if b - a < 0.02:
+            continue
+        mid = 0.5 * (a + b)
+        # Skip if inside a cut
+        if any(cs <= mid <= ce for cs, ce in cuts):
+            continue
+        rate = 1.0
+        for sp in speeds:
+            if float(sp.get("start", 0.0)) <= mid <= float(sp.get("end", 0.0)):
+                rate = max(0.25, min(8.0, float(sp.get("rate", 1.0))))
+                break
+        out_dur = (b - a) / rate
+        segs.append({
+            "src_start": a,
+            "src_end": b,
+            "rate": rate,
+            "out_start": out_t,
+            "out_end": out_t + out_dur,
+        })
+        out_t += out_dur
+
+    return segs or [{"src_start": 0.0, "src_end": dur, "rate": 1.0, "out_start": 0.0, "out_end": dur}]
+
+
+def output_duration(proj: dict) -> float:
+    segs = build_timeline_segments(proj)
+    return segs[-1]["out_end"] if segs else max(0.1, float(proj.get("duration", 5.0)))
+
+
+def out_time_to_src_time(segs: list[dict], out_t: float) -> float:
+    for seg in segs:
+        if out_t <= seg["out_end"] + 1e-6:
+            dt = max(0.0, out_t - seg["out_start"])
+            return min(seg["src_end"], seg["src_start"] + dt * seg["rate"])
+    return segs[-1]["src_end"]
+
+
+# ---------------------------------------------------------------------------
+# Auto-Zoom Analyzer (Cursor Track OR Visual Motion Hotspots)
+# ---------------------------------------------------------------------------
+
+def generate_auto_zooms(proj: dict) -> list[dict]:
+    """Generate smooth Recordly-style auto-zoom regions from cursor clicks or video motion."""
+    dur = max(0.5, float(proj.get("duration", 5.0)))
+    track = proj.get("cursor", {}).get("track") or []
+    zooms: list[dict] = []
+
+    if track and len(track) >= 4:
+        # Cluster clicks & slow-hover dwelling points into clean zoom blocks
+        clicks = [pt for pt in track if len(pt) >= 4 and pt[3]]
+        anchors = clicks if clicks else track[::max(1, len(track) // 12)]
+        last_end = -1.0
+        for pt in anchors:
+            t = float(pt[0])
+            nx = max(0.12, min(0.88, float(pt[1])))
+            ny = max(0.12, min(0.88, float(pt[2])))
+            if t < last_end + 1.2:
+                continue
+            z_start = max(0.0, t - 0.35)
+            z_end = min(dur, t + 2.4)
+            if z_end - z_start >= 1.0:
+                zooms.append({
+                    "id": new_id("zoom"),
+                    "start": round(z_start, 2),
+                    "end": round(z_end, 2),
+                    "depth": 1.75,
+                    "x": round(nx, 3),
+                    "y": round(ny, 3),
+                    "auto": True,
+                })
+                last_end = z_end
+        if zooms:
+            return zooms
+
+    # Fallback: sample low-res frames from the source video and find motion hotspots!
+    src = proj.get("source", "")
+    if src and os.path.isfile(src) and shutil.which("ffmpeg"):
+        try:
+            sw, sh = 160, 90
+            sample_fps = 2.0
+            proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-v", "error", "-i", src,
+                    "-vf", f"fps={sample_fps},scale={sw}:{sh}",
+                    "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            fbytes = sw * sh
+            prev = None
+            idx = 0
+            hotspots = []
+            while True:
+                buf = proc.stdout.read(fbytes)
+                if len(buf) < fbytes:
+                    break
+                t = idx / sample_fps
+                idx += 1
+                if HAS_NUMPY:
+                    cur = np.frombuffer(buf, dtype=np.uint8).reshape((sh, sw)).astype(np.int16)
+                    if prev is not None:
+                        diff = np.abs(cur - prev)
+                        mask = diff > 18
+                        cnt = int(mask.sum())
+                        if cnt >= 18:
+                            ys, xs = np.where(mask)
+                            cx = float(xs.mean()) / sw
+                            cy = float(ys.mean()) / sh
+                            hotspots.append((t, cnt, max(0.15, min(0.85, cx)), max(0.15, min(0.85, cy))))
+                    prev = cur
+                else:
+                    prev = buf
+            proc.wait(timeout=10)
+
+            # Pick spaced-out peak activity moments
+            hotspots.sort(key=lambda h: h[0])
+            last_end = -1.0
+            for t, cnt, cx, cy in hotspots:
+                if t < last_end + 2.0:
+                    continue
+                zs = max(0.0, t - 0.3)
+                ze = min(dur, t + 2.5)
+                if ze - zs >= 1.2:
+                    zooms.append({
+                        "id": new_id("zoom"),
+                        "start": round(zs, 2),
+                        "end": round(ze, 2),
+                        "depth": 1.65,
+                        "x": round(cx, 3),
+                        "y": round(cy, 3),
+                        "auto": True,
+                    })
+                    last_end = ze
+                    if len(zooms) >= 8:
+                        break
+        except Exception:
+            pass
+
+    # If video was very static, add one gentle showcase zoom in the middle
+    if not zooms and dur >= 2.0:
+        zooms.append({
+            "id": new_id("zoom"),
+            "start": round(dur * 0.25, 2),
+            "end": round(min(dur, dur * 0.25 + min(3.0, dur * 0.45)), 2),
+            "depth": 1.6,
+            "x": 0.5,
+            "y": 0.5,
+            "auto": True,
+        })
+    return zooms
+
+
+# ---------------------------------------------------------------------------
+# Camera & Cursor Spring Evaluators
+# ---------------------------------------------------------------------------
+
+def _eval_zoom_target(zooms: list[dict], src_t: float) -> tuple[float, float, float]:
+    """Target (zoom_depth, focus_x, focus_y) at source time `src_t`."""
+    for z in zooms or []:
+        if float(z.get("start", 0.0)) <= src_t <= float(z.get("end", 0.0)):
+            return (
+                max(1.0, min(4.0, float(z.get("depth", 1.75)))),
+                max(0.0, min(1.0, float(z.get("x", 0.5)))),
+                max(0.0, min(1.0, float(z.get("y", 0.5)))),
+            )
+    return (1.0, 0.5, 0.5)
+
+
+def evaluate_camera_at_time(proj: dict, src_t: float) -> tuple[float, float, float, float, float]:
+    """Compute smooth critically-damped camera (zoom, fx, fy, vx, vy) at `src_t`."""
+    zooms = proj.get("zooms") or []
+    if not zooms:
+        return (1.0, 0.5, 0.5, 0.0, 0.0)
+
+    spring_key = proj.get("motion", {}).get("spring", "smooth")
+    k, c = SPRING_PROFILES.get(spring_key, SPRING_PROFILES["smooth"])
+
+    # Integrate analytically over a short lookback window (2.5s) at 60Hz for instant scrubbing!
+    dt = 1.0 / 60.0
+    t0 = max(0.0, src_t - 2.5)
+    z_val, fx, fy = _eval_zoom_target(zooms, t0)
+    vz = vfx = vfy = 0.0
+
+    t = t0
+    while t < src_t:
+        step = min(dt, src_t - t)
+        tz, tfx, tfy = _eval_zoom_target(zooms, t)
+        az = k * (tz - z_val) - c * vz
+        afx = k * (tfx - fx) - c * vfx
+        afy = k * (tfy - fy) - c * vfy
+        vz += az * step
+        vfx += afx * step
+        vfy += afy * step
+        z_val += vz * step
+        fx += vfx * step
+        fy += vfy * step
+        t += step
+
+    return (max(1.0, z_val), max(0.0, min(1.0, fx)), max(0.0, min(1.0, fy)), vfx, vfy)
+
+
+def evaluate_cursor_at_time(proj: dict, src_t: float) -> tuple[float, float, float, bool] | None:
+    """Return smoothed (nx, ny, click_age_sec, visible) or None if cursor disabled/no track."""
+    cur_cfg = proj.get("cursor", {})
+    if not cur_cfg.get("enabled"):
+        return None
+    track = cur_cfg.get("track") or []
+    if not track:
+        return None
+
+    # Find surrounding samples + last click + idle time
+    smoothing = max(0.0, min(100.0, float(cur_cfg.get("smoothing", 65)))) / 100.0
+    window = 0.04 + smoothing * 0.28  # 40ms .. 320ms Gaussian-like weighted average
+
+    wx = wy = wsum = 0.0
+    last_move_t = float(track[0][0])
+    last_click_t = -10.0
+    prev_xy = (float(track[0][1]), float(track[0][2]))
+    nearest = track[0]
+
+    for pt in track:
+        pt_t = float(pt[0])
+        if pt_t > src_t + window:
+            break
+        px, py = float(pt[1]), float(pt[2])
+        if pt_t <= src_t:
+            nearest = pt
+            if abs(px - prev_xy[0]) > 0.002 or abs(py - prev_xy[1]) > 0.002:
+                last_move_t = pt_t
+                prev_xy = (px, py)
+            if len(pt) >= 4 and pt[3]:
+                last_click_t = pt_t
+        dist = abs(pt_t - src_t)
+        if dist <= window:
+            w = math.exp(-((dist / max(0.02, window * 0.5)) ** 2))
+            wx += px * w
+            wy += py * w
+            wsum += w
+
+    if wsum > 0:
+        nx, ny = wx / wsum, wy / wsum
+    else:
+        nx, ny = float(nearest[1]), float(nearest[2])
+
+    click_age = src_t - last_click_t if last_click_t >= 0 else 99.0
+    visible = True
+    if cur_cfg.get("hide_idle", True) and (src_t - last_move_t) > 3.0 and click_age > 1.0:
+        visible = False
+    return (max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny)), click_age, visible)
+
+
+# ---------------------------------------------------------------------------
+# Shared WYSIWYG Frame Compositor (Preview == Export)
+# ---------------------------------------------------------------------------
+
+class StudioCompositor:
+    """High-speed cached compositor producing identical frames for preview & export."""
+
+    def __init__(self):
+        self._bg_cache_key = None
+        self._bg_cache_img: Image.Image | None = None
+        self._mask_cache: dict[tuple[int, int, int], Image.Image] = {}
+        self._shadow_cache: dict[tuple[int, int, int, int], Image.Image] = {}
+        self._img_cache: dict[str, Image.Image] = {}
+        self._font_path = self._find_font()
+
+    @staticmethod
+    def _find_font() -> str:
+        for cand in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        ):
+            if os.path.isfile(cand):
+                return cand
+        return ""
+
+    def _get_font(self, px: int) -> ImageFont.ImageFont:
+        px = max(10, int(px))
+        if self._font_path:
+            try:
+                return ImageFont.truetype(self._font_path, px)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    def _build_background(self, proj: dict, W: int, H: int) -> Image.Image:
+        bg = proj.get("background", {})
+        key = (
+            W, H, bg.get("type"), bg.get("preset"), bg.get("color1"),
+            bg.get("color2"), bg.get("angle"), bg.get("image"), bg.get("blur"),
+        )
+        if key == self._bg_cache_key and self._bg_cache_img is not None:
+            return self._bg_cache_img
+
+        btype = bg.get("type", "preset")
+        img: Image.Image
+
+        if btype == "solid":
+            c1 = hex_to_rgb(bg.get("color1", "#141418"))
+            img = Image.new("RGBA", (W, H), (*c1, 255))
+
+        elif btype == "image" and bg.get("image") and os.path.isfile(bg["image"]):
+            try:
+                raw = Image.open(bg["image"]).convert("RGBA")
+                # Center cover-crop to (W, H)
+                scale = max(W / raw.width, H / raw.height)
+                nw, nh = max(W, int(raw.width * scale)), max(H, int(raw.height * scale))
+                raw = raw.resize((nw, nh), Image.Resampling.LANCZOS)
+                x0 = (nw - W) // 2
+                y0 = (nh - H) // 2
+                img = raw.crop((x0, y0, x0 + W, y0 + H))
+                blur_px = int(bg.get("blur", 0))
+                if blur_px > 0:
+                    img = img.filter(ImageFilter.GaussianBlur(radius=max(1, int(blur_px * min(W, H) / 720.0))))
+            except Exception:
+                img = Image.new("RGBA", (W, H), (15, 23, 42, 255))
+
+        else:
+            # Smooth angled gradient (preset or custom 2-color)
+            if btype == "preset":
+                pinfo = WALLPAPER_PRESETS.get(bg.get("preset", "midnight"), WALLPAPER_PRESETS["midnight"])
+                c1 = hex_to_rgb(pinfo["c1"])
+                c2 = hex_to_rgb(pinfo["c2"])
+                c3 = hex_to_rgb(pinfo["c3"])
+                angle_deg = float(pinfo.get("angle", 135))
+            else:
+                c1 = hex_to_rgb(bg.get("color1", "#0f172a"))
+                c2 = hex_to_rgb(bg.get("color2", "#312e81"))
+                c3 = c2
+                angle_deg = float(bg.get("angle", 135))
+
+            gw, gh = 240, 240
+            if HAS_NUMPY:
+                rad = math.radians(angle_deg)
+                dx, dy = math.cos(rad), math.sin(rad)
+                xs = np.linspace(-0.5, 0.5, gw, dtype=np.float32)
+                ys = np.linspace(-0.5, 0.5, gh, dtype=np.float32)
+                xg, yg = np.meshgrid(xs, ys)
+                t = np.clip((xg * dx + yg * dy) + 0.5, 0.0, 1.0)
+                # 3-stop smooth interpolation (c1 -> c2 -> c3) + subtle radial glow
+                t1 = np.clip(t * 2.0, 0.0, 1.0)
+                t2 = np.clip((t - 0.5) * 2.0, 0.0, 1.0)
+                arr = np.zeros((gh, gw, 4), dtype=np.uint8)
+                for ch in range(3):
+                    mid = c1[ch] * (1.0 - t1) + c2[ch] * t1
+                    val = np.where(t < 0.5, mid, c2[ch] * (1.0 - t2) + c3[ch] * t2)
+                    arr[:, :, ch] = np.clip(val, 0, 255).astype(np.uint8)
+                arr[:, :, 3] = 255
+                small = Image.fromarray(arr, mode="RGBA")
+            else:
+                small = Image.new("RGBA", (1, gh))
+                sd = ImageDraw.Draw(small)
+                for y in range(gh):
+                    u = y / max(1, gh - 1)
+                    sd.point((0, y), fill=(
+                        int(c1[0] + (c2[0] - c1[0]) * u),
+                        int(c1[1] + (c2[1] - c1[1]) * u),
+                        int(c1[2] + (c2[2] - c1[2]) * u),
+                        255,
+                    ))
+            img = small.resize((W, H), Image.Resampling.BILINEAR)
+
+        self._bg_cache_key = key
+        self._bg_cache_img = img
+        return img
+
+    def _get_round_mask(self, w: int, h: int, r: int) -> Image.Image:
+        r = max(0, min(r, min(w, h) // 2))
+        key = (w, h, r)
+        if key not in self._mask_cache:
+            m = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(m).rounded_rectangle([0, 0, w - 1, h - 1], radius=r, fill=255)
+            if len(self._mask_cache) > 16:
+                self._mask_cache.clear()
+            self._mask_cache[key] = m
+        return self._mask_cache[key]
+
+    def _get_shadow(self, w: int, h: int, r: int, strength: int) -> Image.Image:
+        pad = max(16, int(min(w, h) * 0.06))
+        key = (w, h, r, strength)
+        if key not in self._shadow_cache:
+            sw, sh = w + pad * 2, h + pad * 2
+            sh_img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+            alpha = int(min(210, strength * 1.9))
+            ImageDraw.Draw(sh_img).rounded_rectangle(
+                [pad, pad, pad + w - 1, pad + h - 1], radius=r, fill=(0, 0, 0, alpha)
+            )
+            blur_r = max(6, int(pad * 0.45 * (strength / 100.0 + 0.3)))
+            sh_img = sh_img.filter(ImageFilter.GaussianBlur(radius=blur_r))
+            if len(self._shadow_cache) > 12:
+                self._shadow_cache.clear()
+            self._shadow_cache[key] = sh_img
+        return self._shadow_cache[key]
+
+    def _draw_cursor(self, frame: Image.Image, nx: float, ny: float, click_age: float, proj: dict) -> None:
+        cur = proj.get("cursor", {})
+        style = cur.get("style", "macos")
+        size_mul = max(0.6, min(3.0, float(cur.get("size", 1.25))))
+        bounce = bool(cur.get("click_bounce", True))
+
+        w, h = frame.size
+        cx, cy = nx * w, ny * h
+        base = max(16.0, min(w, h) * 0.028 * size_mul)
+
+        # Click bounce scale + expanding ring ripple (true RGBA alpha composite)
+        scale = 1.0
+        ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(ov)
+        if bounce and 0.0 <= click_age <= 0.38:
+            p = click_age / 0.38
+            scale = 1.0 - 0.22 * math.sin(min(1.0, p * 2.2) * math.pi)
+            ring_r = base * (0.45 + p * 1.8)
+            ring_a = int(190 * (1.0 - p))
+            draw.ellipse(
+                [cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r],
+                outline=(255, 255, 255, ring_a), width=max(2, int(base * 0.11)),
+            )
+
+        s = base * scale
+        if style == "dot":
+            r = s * 0.42
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(240, 82, 82, 220), outline=(255, 255, 255, 240), width=max(2, int(s * 0.1)))
+        elif style == "ring":
+            r = s * 0.55
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 45), outline=(255, 255, 255, 235), width=max(2, int(s * 0.12)))
+        else:
+            # Crisp macOS-style vector pointer with subtle shadow + white outline
+            pts = [
+                (0.0, 0.0),
+                (0.0, 1.0),
+                (0.26, 0.78),
+                (0.45, 1.15),
+                (0.58, 1.08),
+                (0.39, 0.72),
+                (0.72, 0.70),
+            ]
+            sh_pts = [(cx + px * s + 1.5, cy + py * s + 2.0) for px, py in pts]
+            fg_pts = [(cx + px * s, cy + py * s) for px, py in pts]
+            draw.polygon(sh_pts, fill=(0, 0, 0, 95))
+            draw.polygon(fg_pts, fill=(18, 18, 22, 255), outline=(255, 255, 255, 255))
+        frame.alpha_composite(ov)
+
+    def _apply_annotations(self, canvas: Image.Image, proj: dict, src_t: float) -> None:
+        anns = proj.get("annotations") or []
+        if not anns:
+            return
+        W, H = canvas.size
+        ref_scale = min(W, H) / 1080.0
+
+        for ann in anns:
+            if not (float(ann.get("start", 0.0)) <= src_t <= float(ann.get("end", 0.0))):
+                continue
+            kind = ann.get("kind", "text")
+            ax = float(ann.get("x", 0.5)) * W
+            ay = float(ann.get("y", 0.2)) * H
+            aw = max(20.0, float(ann.get("w", 0.22)) * W)
+            ah = max(16.0, float(ann.get("h", 0.09)) * H)
+            x0 = int(max(0, min(W - 4, ax - aw / 2)))
+            y0 = int(max(0, min(H - 4, ay - ah / 2)))
+            x1 = int(max(x0 + 4, min(W, ax + aw / 2)))
+            y1 = int(max(y0 + 4, min(H, ay + ah / 2)))
+
+            if kind == "blur":
+                region = canvas.crop((x0, y0, x1, y1))
+                rad = max(8, int(18 * ref_scale))
+                blurred = region.filter(ImageFilter.GaussianBlur(radius=rad))
+                canvas.paste(blurred, (x0, y0))
+                ImageDraw.Draw(canvas, "RGBA").rounded_rectangle(
+                    [x0, y0, x1, y1], radius=max(4, int(8 * ref_scale)),
+                    outline=(255, 255, 255, 70), width=max(1, int(1.5 * ref_scale)),
+                )
+
+            elif kind == "box":
+                col = hex_to_rgb(ann.get("color", "#e5484d"))
+                ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                ImageDraw.Draw(ov).rounded_rectangle(
+                    [x0, y0, x1, y1],
+                    radius=max(6, int(12 * ref_scale)),
+                    fill=(*col, 38),
+                    outline=(*col, 240),
+                    width=max(2, int(4 * ref_scale)),
+                )
+                canvas.alpha_composite(ov)
+
+            elif kind == "arrow":
+                col = hex_to_rgb(ann.get("color", "#e5484d"))
+                ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(ov)
+                sx, sy = x0, y0
+                ex, ey = x1, y1
+                lw = max(3, int(6 * ref_scale))
+                draw.line([(sx, sy), (ex, ey)], fill=(*col, 245), width=lw)
+                ang = math.atan2(ey - sy, ex - sx)
+                hl = max(14.0, 24.0 * ref_scale)
+                p1 = (ex - hl * math.cos(ang - 0.5), ey - hl * math.sin(ang - 0.5))
+                p2 = (ex - hl * math.cos(ang + 0.5), ey - hl * math.sin(ang + 0.5))
+                draw.polygon([(ex, ey), p1, p2], fill=(*col, 245))
+                canvas.alpha_composite(ov)
+
+            elif kind == "image":
+                ipath = ann.get("image_path", "")
+                if ipath and os.path.isfile(ipath):
+                    try:
+                        ov = self._img_cache.get(ipath)
+                        if ov is None:
+                            ov = Image.open(ipath).convert("RGBA")
+                            self._img_cache[ipath] = ov
+                        ov_r = ov.resize((max(4, x1 - x0), max(4, y1 - y0)), Image.Resampling.LANCZOS)
+                        canvas.paste(ov_r, (x0, y0), ov_r)
+                    except Exception:
+                        pass
+
+            else:
+                # Sleek pill text callout
+                txt = ann.get("text", "Note") or "Note"
+                fsize = max(12, int(float(ann.get("font_size", 32)) * ref_scale))
+                font = self._get_font(fsize)
+                ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(ov)
+                bbox = draw.textbbox((0, 0), txt, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                px = int(18 * ref_scale)
+                py = int(11 * ref_scale)
+                bx0 = int(ax - tw / 2 - px)
+                by0 = int(ay - th / 2 - py)
+                bx1 = int(ax + tw / 2 + px)
+                by1 = int(ay + th / 2 + py)
+                bg_c = hex_to_rgb(ann.get("bg", "#141418"))
+                fg_c = hex_to_rgb(ann.get("color", "#f2f2f5"))
+                draw.rounded_rectangle(
+                    [bx0, by0, bx1, by1],
+                    radius=max(8, int(12 * ref_scale)),
+                    fill=(*bg_c, 225),
+                    outline=(255, 255, 255, 45),
+                    width=max(1, int(1.5 * ref_scale)),
+                )
+                draw.text((bx0 + px, by0 + py - bbox[1]), txt, font=font, fill=(*fg_c, 255))
+                canvas.alpha_composite(ov)
+
+    def compose(
+        self,
+        src_img: Image.Image,
+        proj: dict,
+        src_t: float,
+        out_w: int,
+        out_h: int,
+        webcam_img: Image.Image | None = None,
+    ) -> Image.Image:
+        """Compose a single full Studio frame at (out_w, out_h)."""
+        canvas = self._build_background(proj, out_w, out_h).copy()
+        fcfg = proj.get("frame", {})
+
+        # 1. Crop source frame if requested
+        sw, sh = src_img.size
+        cl = int(sw * max(0.0, min(0.35, float(fcfg.get("crop_left", 0.0)) / 100.0)))
+        cr = int(sw * max(0.0, min(0.35, float(fcfg.get("crop_right", 0.0)) / 100.0)))
+        ct = int(sh * max(0.0, min(0.35, float(fcfg.get("crop_top", 0.0)) / 100.0)))
+        cb = int(sh * max(0.0, min(0.35, float(fcfg.get("crop_bottom", 0.0)) / 100.0)))
+        if cl or cr or ct or cb:
+            x1 = max(cl + 16, sw - cr)
+            y1 = max(ct + 16, sh - cb)
+            work = src_img.crop((cl, ct, x1, y1)).convert("RGBA")
+        else:
+            work = src_img.convert("RGBA")
+
+        # 2. Draw cursor overlay onto source frame BEFORE zoom so cursor zooms naturally!
+        cur_state = evaluate_cursor_at_time(proj, src_t)
+        if cur_state and cur_state[3]:
+            self._draw_cursor(work, cur_state[0], cur_state[1], cur_state[2], proj)
+
+        # 3. Compute viewport slot inside canvas with padding + optional chrome bar
+        pad_pct = max(0.0, min(22.0, float(fcfg.get("padding", 7)))) / 100.0
+        pad_x = int(out_w * pad_pct)
+        pad_y = int(out_h * pad_pct)
+        avail_w = max(64, out_w - pad_x * 2)
+        avail_h = max(64, out_h - pad_y * 2)
+
+        chrome = fcfg.get("chrome", "none")
+        ref_scale = min(out_w, out_h) / 1080.0
+        chrome_h = int(34 * ref_scale) if chrome == "macos" else 0
+
+        # Fit video aspect ratio cleanly inside available slot
+        ww, wh = work.size
+        fit_s = min(avail_w / max(1, ww), max(32, avail_h - chrome_h) / max(1, wh))
+        disp_w = max(32, int(round(ww * fit_s)))
+        disp_h = max(32, int(round(wh * fit_s)))
+        box_w = disp_w
+        box_h = disp_h + chrome_h
+
+        # 4. Evaluate smooth zoom camera + subpixel affine crop/scale
+        zoom, fx, fy, vx, vy = evaluate_camera_at_time(proj, src_t)
+        if zoom > 1.002:
+            view_w = ww / zoom
+            view_h = wh / zoom
+            cx = fx * ww
+            cy = fy * wh
+            vx0 = max(0.0, min(ww - view_w, cx - view_w * 0.5))
+            vy0 = max(0.0, min(wh - view_h, cy - view_h * 0.5))
+            sx = view_w / disp_w
+            sy = view_h / disp_h
+            vid_layer = work.transform(
+                (disp_w, disp_h),
+                Image.Transform.AFFINE,
+                (sx, 0.0, vx0, 0.0, sy, vy0),
+                resample=Image.Resampling.BICUBIC,
+            )
+            # Subtle motion blur during rapid camera pans/zooms
+            mblur = max(0.0, min(100.0, float(proj.get("motion", {}).get("motion_blur", 0)))) / 100.0
+            speed_mag = math.hypot(vx, vy)
+            if mblur > 0.01 and speed_mag > 0.12:
+                br = min(6.0, speed_mag * mblur * 2.2 * ref_scale)
+                if br >= 0.6:
+                    vid_layer = vid_layer.filter(ImageFilter.GaussianBlur(radius=br))
+        else:
+            vid_layer = work.resize((disp_w, disp_h), Image.Resampling.LANCZOS)
+
+        # 5. Assemble window box (optional macOS titlebar chrome + rounded corners)
+        if chrome == "macos":
+            win_box = Image.new("RGBA", (box_w, box_h), (24, 24, 29, 255))
+            d = ImageDraw.Draw(win_box)
+            dot_r = max(3, int(6 * ref_scale))
+            dot_y = chrome_h // 2
+            for idx, col in enumerate(((255, 95, 86), (255, 189, 46), (39, 201, 63))):
+                dot_x = int((18 + idx * 20) * ref_scale)
+                d.ellipse([dot_x - dot_r, dot_y - dot_r, dot_x + dot_r, dot_y + dot_r], fill=(*col, 255))
+            win_box.paste(vid_layer, (0, chrome_h))
+        else:
+            win_box = vid_layer
+
+        radius = int(float(fcfg.get("radius", 18)) * ref_scale)
+        ox = (out_w - box_w) // 2
+        oy = (out_h - box_h) // 2
+
+        # 6. Soft drop shadow beneath rounded window
+        shadow_pct = int(max(0, min(100, float(fcfg.get("shadow", 65)))))
+        if shadow_pct > 0 and pad_pct > 0.005:
+            sh_img = self._get_shadow(box_w, box_h, radius, shadow_pct)
+            spad = (sh_img.width - box_w) // 2
+            dy = int(10 * ref_scale)
+            canvas.alpha_composite(sh_img, (ox - spad, oy - spad + dy))
+
+        # 7. Paste masked video frame + subtle hairline border
+        mask = self._get_round_mask(box_w, box_h, radius)
+        canvas.paste(win_box, (ox, oy), mask)
+        if chrome in ("macos", "minimal") or radius > 0:
+            ImageDraw.Draw(canvas, "RGBA").rounded_rectangle(
+                [ox, oy, ox + box_w - 1, oy + box_h - 1],
+                radius=radius,
+                outline=(255, 255, 255, 28),
+                width=max(1, int(1.2 * ref_scale)),
+            )
+
+        # 8. Dynamic Webcam Bubble (auto-shrinks smoothly when zoomed in!)
+        wcfg = proj.get("webcam", {})
+        if wcfg.get("enabled") and webcam_img is not None:
+            size_pct = max(10.0, min(36.0, float(wcfg.get("size", 20)))) / 100.0
+            shrink = 1.0
+            if wcfg.get("shrink_on_zoom", True) and zoom > 1.02:
+                shrink = max(0.68, 1.0 - (zoom - 1.0) * 0.28)
+            wb_size = max(48, int(min(out_w, out_h) * size_pct * shrink))
+            # Center square-crop webcam image
+            wc = webcam_img.convert("RGBA")
+            m = min(wc.width, wc.height)
+            wc = wc.crop(((wc.width - m) // 2, (wc.height - m) // 2, (wc.width + m) // 2, (wc.height + m) // 2))
+            wc = wc.resize((wb_size, wb_size), Image.Resampling.LANCZOS)
+            wr = int((wb_size / 2.0) * (max(0.0, min(100.0, float(wcfg.get("roundness", 100)))) / 100.0))
+            wmask = self._get_round_mask(wb_size, wb_size, wr)
+
+            margin = max(14, int(min(out_w, out_h) * 0.035))
+            corner = wcfg.get("corner", "br")
+            wx = margin if "l" in corner else (out_w - wb_size - margin)
+            wy = margin if "t" in corner else (out_h - wb_size - margin)
+
+            if wcfg.get("shadow", True):
+                wsh = self._get_shadow(wb_size, wb_size, wr, 75)
+                wpad = (wsh.width - wb_size) // 2
+                canvas.alpha_composite(wsh, (wx - wpad, wy - wpad + int(5 * ref_scale)))
+            canvas.paste(wc, (wx, wy), wmask)
+            ImageDraw.Draw(canvas, "RGBA").rounded_rectangle(
+                [wx, wy, wx + wb_size - 1, wy + wb_size - 1],
+                radius=wr, outline=(255, 255, 255, 190), width=max(2, int(3 * ref_scale)),
+            )
+
+        # 9. Timed Annotations (text, blur, box, arrow, image)
+        self._apply_annotations(canvas, proj, src_t)
+
+        return canvas.convert("RGB")
+
+
+# ---------------------------------------------------------------------------
+# Fast Single-Frame Extractor (for instant interactive Editor scrubbing)
+# ---------------------------------------------------------------------------
+
+def extract_frame_pil(video_path: str, ts: float, max_w: int = 960) -> Image.Image | None:
+    """Grab a single decoded RGB frame at `ts` seconds via FFmpeg fast seek."""
+    if not video_path or not os.path.isfile(video_path) or not shutil.which("ffmpeg"):
+        return None
+    try:
+        # Fast input seek before -i
+        cmd = [
+            "ffmpeg", "-v", "error",
+            "-ss", f"{max(0.0, ts):.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", f"scale='min({max_w},iw)':-2",
+            "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+        ]
+        raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5)
+        if not raw:
+            return None
+        from io import BytesIO
+        return Image.open(BytesIO(raw)).convert("RGB")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Full-Resolution Studio Exporter (MP4 H.264+AAC & Palette GIF)
+# ---------------------------------------------------------------------------
+
+def _build_atempo_chain(rate: float) -> str:
+    """FFmpeg atempo accepts 0.5..2.0 per stage; chain stages cleanly for any speed."""
+    stages = []
+    r = max(0.25, min(8.0, float(rate)))
+    while r > 2.0:
+        stages.append("atempo=2.0")
+        r /= 2.0
+    while r < 0.5:
+        stages.append("atempo=0.5")
+        r /= 0.5
+    stages.append(f"atempo={r:.4f}")
+    return ",".join(stages)
+
+
+def export_project(
+    proj: dict,
+    out_path: str,
+    progress_cb: Callable[[int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[bool, str]:
+    """Render full edited `.recproj` project to universal MP4 or optimized GIF."""
+    src = proj.get("source", "")
+    if not src or not os.path.isfile(src):
+        return (False, f"Source video not found: {src}")
+    if not shutil.which("ffmpeg"):
+        return (False, "ffmpeg not found in PATH")
+
+    exp = proj.get("export", {})
+    fmt = exp.get("format", "mp4").lower()
+    fps = int(exp.get("fps", 30))
+    if fmt == "gif":
+        fps = min(20, fps)
+    out_w, out_h = compute_output_dims(proj)
+    qual_crf = {"high": "17", "balanced": "20", "compact": "24"}.get(exp.get("quality", "high"), "18")
+
+    segs = build_timeline_segments(proj)
+    total_out_dur = segs[-1]["out_end"]
+    total_frames = max(1, int(round(total_out_dur * fps)))
+
+    # Decode source frames cleanly at needed sample rate into sequential reader
+    src_w = int(proj.get("src_w", 1920))
+    src_h = int(proj.get("src_h", 1080))
+    # Cap decode size to max needed for crisp zoom without wasting RAM
+    dec_scale = min(1.0, max(out_w * 2, 1920) / max(1, max(src_w, src_h)))
+    dec_w = max(64, int(round(src_w * dec_scale)) // 2 * 2)
+    dec_h = max(64, int(round(src_h * dec_scale)) // 2 * 2)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="rec-studio-exp-"))
+    try:
+        if progress_cb:
+            progress_cb(2, "Preparing video stream...")
+
+        # Open sequential decoder for source video at source/target fps
+        dec_fps = max(fps, 30)
+        dec_proc = subprocess.Popen(
+            [
+                "ffmpeg", "-v", "error", "-i", src,
+                "-vf", f"fps={dec_fps},scale={dec_w}:{dec_h}:flags=lanczos",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        frame_bytes = dec_w * dec_h * 3
+        dec_idx = -1
+        dec_img: Image.Image | None = None
+
+        def get_src_frame(target_t: float) -> Image.Image | None:
+            nonlocal dec_idx, dec_img
+            want = max(0, int(round(target_t * dec_fps)))
+            while dec_idx < want:
+                buf = dec_proc.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes:
+                    break
+                dec_idx += 1
+                if dec_idx == want:
+                    dec_img = Image.frombytes("RGB", (dec_w, dec_h), buf)
+            return dec_img
+
+        # Optional webcam sequential decoder
+        wcfg = proj.get("webcam", {})
+        w_proc = None
+        w_idx = -1
+        w_img: Image.Image | None = None
+        ww_dec = wh_dec = 320
+        if wcfg.get("enabled") and wcfg.get("path") and os.path.isfile(wcfg["path"]):
+            w_proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-v", "error", "-i", wcfg["path"],
+                    "-vf", f"fps={dec_fps},scale={ww_dec}:{wh_dec}:force_original_aspect_ratio=increase,crop={ww_dec}:{wh_dec}",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+
+        def get_webcam_frame(target_t: float) -> Image.Image | None:
+            nonlocal w_idx, w_img
+            if w_proc is None:
+                return None
+            want = max(0, int(round(target_t * dec_fps)))
+            wbytes = ww_dec * wh_dec * 3
+            while w_idx < want:
+                buf = w_proc.stdout.read(wbytes)
+                if len(buf) < wbytes:
+                    break
+                w_idx += 1
+                if w_idx == want:
+                    w_img = Image.frombytes("RGB", (ww_dec, wh_dec), buf)
+            return w_img
+
+        # Encode composed RGB frames to intermediate silent H.264 MP4
+        raw_vid = str(work_dir / "video_only.mp4")
+        enc_proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{out_w}x{out_h}", "-r", str(fps),
+                "-i", "pipe:0",
+                "-c:v", "libx264", "-preset", "medium", "-crf", qual_crf,
+                "-profile:v", "high", "-level:v", "4.2",
+                "-pix_fmt", "yuv420p", "-r", str(fps),
+                raw_vid,
+            ],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+
+        comp = StudioCompositor()
+        canceled = False
+        for f_i in range(total_frames):
+            if cancel_check and cancel_check():
+                canceled = True
+                break
+            out_t = f_i / fps
+            src_t = out_time_to_src_time(segs, out_t)
+            s_frame = get_src_frame(src_t)
+            if s_frame is None:
+                break
+            w_frame = get_webcam_frame(src_t) if w_proc is not None else None
+            composed = comp.compose(s_frame, proj, src_t, out_w, out_h, webcam_img=w_frame)
+            enc_proc.stdin.write(composed.tobytes())
+            if progress_cb and (f_i % max(1, fps // 3) == 0 or f_i == total_frames - 1):
+                pct = 5 + int(80 * (f_i + 1) / total_frames)
+                progress_cb(pct, f"Rendering frame {f_i + 1}/{total_frames}")
+
+        try:
+            enc_proc.stdin.close()
+        except Exception:
+            pass
+        for pr in (dec_proc, w_proc):
+            if pr is not None:
+                try:
+                    pr.terminate()
+                    pr.wait(timeout=3)
+                except Exception:
+                    pass
+        _, enc_err = enc_proc.communicate(timeout=60)
+
+        if canceled:
+            return (False, "Export canceled")
+        if enc_proc.returncode != 0 or not os.path.isfile(raw_vid):
+            return (False, f"Encode failed: {enc_err.decode('utf-8', 'replace').strip()}")
+
+        out_p = Path(out_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+
+        if fmt == "gif":
+            if progress_cb:
+                progress_cb(90, "Generating optimized GIF palette...")
+            gif_w = min(out_w, 1280)
+            res = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-i", raw_vid,
+                    "-vf", f"fps={fps},scale={gif_w}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
+                    str(out_p),
+                ],
+                capture_output=True, text=True,
+            )
+            if res.returncode != 0:
+                return (False, f"GIF export failed: {res.stderr.strip()}")
+            if progress_cb:
+                progress_cb(100, "Export complete")
+            return (True, str(out_p))
+
+        # Mux audio (synced source audio through trim/speed segments + optional overlay audio, or silent AAC)
+        if progress_cb:
+            progress_cb(88, "Syncing audio & finalizing MP4...")
+
+        acfg = proj.get("audio", {})
+        use_src_audio = bool(proj.get("has_audio")) and not bool(acfg.get("mute_source", False))
+        ov_path = acfg.get("overlay_path", "")
+        use_ov_audio = bool(ov_path and os.path.isfile(ov_path))
+
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", raw_vid]
+        fc_parts = []
+        audio_maps = []
+        next_in = 1
+
+        if use_src_audio:
+            cmd.extend(["-i", src])
+            s_in = next_in
+            next_in += 1
+            seg_labels = []
+            for idx, seg in enumerate(segs):
+                lbl = f"as{idx}"
+                atempo = _build_atempo_chain(seg["rate"])
+                fc_parts.append(
+                    f"[{s_in}:a]atrim=start={seg['src_start']:.3f}:end={seg['src_end']:.3f},asetpts=PTS-STARTPTS,{atempo}[{lbl}]"
+                )
+                seg_labels.append(f"[{lbl}]")
+            if len(seg_labels) > 1:
+                fc_parts.append(f"{''.join(seg_labels)}concat=n={len(seg_labels)}:v=0:a=1[src_a]")
+            else:
+                fc_parts.append(f"{seg_labels[0]}acopy[src_a]")
+            audio_maps.append("[src_a]")
+
+        if use_ov_audio:
+            cmd.extend(["-i", ov_path])
+            o_in = next_in
+            next_in += 1
+            vol = max(0.0, min(2.0, float(acfg.get("overlay_volume", 0.75))))
+            off_ms = max(0, int(float(acfg.get("overlay_offset", 0.0)) * 1000))
+            delay_f = f",adelay={off_ms}|{off_ms}" if off_ms > 0 else ""
+            fc_parts.append(f"[{o_in}:a]volume={vol:.2f}{delay_f},atrim=0:{total_out_dur:.3f}[ov_a]")
+            audio_maps.append("[ov_a]")
+
+        if len(audio_maps) == 2:
+            fc_parts.append(f"{audio_maps[0]}{audio_maps[1]}amix=inputs=2:duration=first:dropout_transition=2[aout]")
+            cmd.extend([
+                "-filter_complex", ";".join(fc_parts),
+                "-map", "0:v:0", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(out_p),
+            ])
+        elif len(audio_maps) == 1:
+            cmd.extend([
+                "-filter_complex", ";".join(fc_parts),
+                "-map", "0:v:0", "-map", audio_maps[0],
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(out_p),
+            ])
+        else:
+            # Universal player compatibility: exact-duration silent AAC stereo track
+            cmd.extend([
+                "-f", "lavfi", "-t", f"{total_out_dur:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(out_p),
+            ])
+
+        mux = subprocess.run(cmd, capture_output=True, text=True)
+        if mux.returncode != 0:
+            # Fallback to copy video + silent track if source audio stream had odd codec
+            fb = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-i", raw_vid,
+                    "-f", "lavfi", "-t", f"{total_out_dur:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", str(out_p),
+                ],
+                capture_output=True, text=True,
+            )
+            if fb.returncode != 0:
+                return (False, f"Mux failed: {mux.stderr.strip()}")
+
+        if progress_cb:
+            progress_cb(100, "Export complete")
+        return (True, str(out_p))
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="rec-studio-engine — Render a .recproj project to MP4 or GIF")
+    parser.add_argument("project", help="Path to .recproj file")
+    parser.add_argument("-o", "--output", default="", help="Output MP4 or GIF path")
+    args = parser.parse_args()
+
+    proj = load_project(args.project)
+    fmt = proj.get("export", {}).get("format", "mp4")
+    out = args.output or str(Path(args.project).with_suffix(f".{fmt}"))
+
+    def on_prog(pct: int, msg: str):
+        print(f"[{pct:3d}%] {msg}", flush=True)
+
+    ok, info = export_project(proj, out, progress_cb=on_prog)
+    if not ok:
+        print(f"Error: {info}", file=sys.stderr)
+        return 1
+    print(f"Exported: {info}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

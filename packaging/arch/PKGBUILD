@@ -1,6 +1,6 @@
 # Maintainer: 0xEleven <0xEleven@users.noreply.github.com>
 pkgname=rec-cli
-pkgver=1.4.0
+pkgver=2.0.0
 pkgrel=1
 pkgdesc="Smart terminal clip recorder CLI for Zsh, Bash, and Fish (2x speed, 5-min chunks, process-named MP4s)"
 arch=('any')
@@ -19,11 +19,14 @@ sha256sums=('SKIP')
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
 
-  install -Dm755 bin/rec-cli    "${pkgdir}/usr/bin/rec-cli"
-  install -Dm755 bin/rec-pty    "${pkgdir}/usr/bin/rec-pty"
-  install -Dm755 bin/rec-gui    "${pkgdir}/usr/bin/rec-gui"
-  install -Dm755 bin/cast2mp4   "${pkgdir}/usr/bin/cast2mp4"
-  install -Dm755 bin/casts2mp4  "${pkgdir}/usr/bin/casts2mp4"
+  install -Dm755 bin/rec-cli           "${pkgdir}/usr/bin/rec-cli"
+  install -Dm755 bin/rec-pty           "${pkgdir}/usr/bin/rec-pty"
+  install -Dm755 bin/rec-gui           "${pkgdir}/usr/bin/rec-gui"
+  install -Dm755 bin/rec-studio-engine "${pkgdir}/usr/bin/rec-studio-engine"
+  install -Dm755 bin/rec-studio-editor "${pkgdir}/usr/bin/rec-studio-editor"
+  install -Dm755 bin/rec-capture       "${pkgdir}/usr/bin/rec-capture"
+  install -Dm755 bin/cast2mp4          "${pkgdir}/usr/bin/cast2mp4"
+  install -Dm755 bin/casts2mp4         "${pkgdir}/usr/bin/casts2mp4"
 
   install -Dm644 shell/rec.zsh  "${pkgdir}/usr/share/rec-cli/shell/rec.zsh"
   install -Dm644 shell/rec.bash "${pkgdir}/usr/share/rec-cli/shell/rec.bash"

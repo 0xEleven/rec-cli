@@ -4,7 +4,7 @@ set -euo pipefail
 # rec-cli — Process-managed terminal clip recorder CLI (v1.3.0)
 # Manage parallel recordings across tabs, panes, and SSH sessions by PID or name.
 
-VERSION="1.4.0"
+VERSION="2.0.0"
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli"
 CONF_FILE="$CONF_DIR/config"
@@ -117,7 +117,10 @@ show_help() {
 ${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} - Process-Managed Terminal Clip Recorder (Zsh, Bash, Fish)
 
 ${C_CYAN}Process & Parallel Recording Control (works across tabs, panes & SSH):${C_RESET}
-  ${C_BOLD}rec gui${C_RESET}                        Open the modern Qt desktop GUI (dark/light mode, terminal picker, live PIDs)
+  ${C_BOLD}rec gui${C_RESET}                        Open the Qt Studio GUI (Dark/Light mode, live PIDs, Screen Rec & Editor)
+  ${C_BOLD}rec edit [clip|project]${C_RESET}        Open a clip (.mp4/.cast) or .recproj in the multi-track Studio Editor
+  ${C_BOLD}rec screen [flags]${C_RESET}             Record full screen / region with mic, system audio & webcam bubble
+  ${C_BOLD}rec render-project <f.recproj>${C_RESET} Export a saved .recproj Studio project headlessly to MP4 or GIF
   ${C_BOLD}rec ps${C_RESET}                         List all live recording processes with PID, state, name & cmd
   ${C_BOLD}rec start [name]${C_RESET}               Start recording this terminal (or: rec start <pid> [name])
   ${C_BOLD}rec stop [pid|name|all]${C_RESET}        Stop & render MP4 without dropping SSH or closing the tab
@@ -876,6 +879,38 @@ case "${1:-help}" in
     else
       nohup rec-gui "$@" </dev/null >/dev/null 2>&1 &
     fi
+    ;;
+  edit|studio)
+    shift
+    target=""
+    if [[ $# -ge 1 ]]; then
+      if [[ -f "$1" ]]; then
+        target="$1"
+      else
+        target="$(resolve_clip "$1")" || exit 1
+      fi
+    fi
+    if ! command -v rec-gui >/dev/null 2>&1; then
+      echo "Error: rec-gui not found in PATH." >&2
+      exit 1
+    fi
+    if [[ -n "$target" ]]; then
+      setsid -f rec-gui "$target" </dev/null >/dev/null 2>&1
+    else
+      setsid -f rec-gui --editor </dev/null >/dev/null 2>&1
+    fi
+    ;;
+  screen|capture)
+    shift
+    if [[ $# -eq 0 ]]; then
+      setsid -f rec-gui --screen </dev/null >/dev/null 2>&1
+    else
+      rec-capture "$@"
+    fi
+    ;;
+  render-project|export-project)
+    shift
+    rec-studio-engine "$@"
     ;;
   ps|jobs|active) run_session_mgr ps ;;
   stop|off)       shift; run_session_mgr stop "$@" ;;

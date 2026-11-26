@@ -16,17 +16,17 @@
 
 ## What it does
 
-- Desktop GUI (`rec gui` or app launcher) built with Qt6 (`PyQt6`/`PySide6`/`PyQt5`), featuring Dark & Light mode, a visual terminal picker, live PID session controls, instant settings, and a clips library browser.
-- Manage parallel recordings like processes (`rec ps`): start, stop, pause, resume, cancel, or drop chapter markers on ANY recording by PID or name from ANY other terminal, even while SSHed into a remote machine, without dropping your SSH session.
-- Records terminal sessions into MP4 videos at `auto` (detects your screen resolution automatically), `720p`, `1080p`, `1440p`, `4k`, `reels` (9:16 cursor-following auto-reframe), or `reels-4k`.
-- Auto-reframe for TikTok, Instagram Reels, and YouTube Shorts tracks your cursor with smooth critically-damped springs and automatically fits full multi-line commands and wide output (like `nmap` tables) so nothing gets cropped.
-- Renders at 2x speed by default so typing looks snappy, and splits long sessions into 5-minute clips.
-- Names clips after the tool you actually ran (`nmap_20261125-134012.mp4`, `ffuf_..._part2.mp4`), ignoring `sudo`, `cd`, `ls`, and `clear`.
-- Only keeps sessions with both keyboard input and terminal output. Skips passive background panes like `openvpn`, `tail -f`, `watch`, and `htop`.
-- Redacts leaked secrets (AWS keys, GitHub tokens, API keys, JWTs, `PASSWORD=...`) before rendering.
-- Wraps videos in a clean rounded window frame with a titlebar (toggleable).
-- Only auto-records in terminals you allow (`kitty` and `tabby` by default).
-- Deletes raw `.cast` files after rendering so disk space is not wasted.
+- **Studio Desktop App (`rec gui`)**: Clean monochrome Qt6 GUI with Dark and Light mode, live terminal PID manager (1-click in-place recording via silent standby), visual terminal auto-record picker, screen/region recorder, multi-track video editor, and clips library.
+- **Recordly-style Multi-Track Studio Editor (`rec edit [clip|project]`)**:
+  - **Smart Auto-Zoom & Manual Zoom Regions**: 1-click Auto-Zoom from cursor/motion activity plus draggable zoom regions on the timeline with critically damped spring easing, click-on-canvas focus targeting, and motion blur.
+  - **Interactive Multi-Track Timeline**: Drag and resize Zoom regions, Trim Cuts (remove unwanted sections), Speed regions (0.25x to 4x), Overlays, and supplementary Audio tracks, with Undo/Redo and Spacebar preview playback.
+  - **Wallpapers, Frames & Aspect Ratios**: 8 built-in studio wallpapers, custom gradients, solid fills, or blurred wallpaper images, padding, corner radius, drop shadows, macOS/minimal window chrome, crop controls, and aspect ratio presets (`16:9`, `9:16`, `1:1`, `4:5`, `4:3`, `21:9`, `Original`).
+  - **Cursor Polish**: Smoothed macOS-style vector cursor, highlight ring or dot modes, click bounce & ripple animation, and auto-hide when idle.
+  - **Annotations & Dynamic Webcam Bubble**: Timed Text callouts, Blur/Redact boxes, Highlight boxes, Arrows, Image overlays, and a floating rounded webcam bubble that auto-shrinks during zooms.
+  - **Projects & Export**: Save and reopen non-destructive `.recproj` project files, and export to MP4 (`720p` to `4K UHD`, 30/60fps, synced AAC audio) or palette-optimized GIF (`rec render-project`).
+- **Screen, Region, Audio & Webcam Capture (`rec screen`)**: Record full screen or custom regions on Wayland (GNOME DBus / `wf-recorder`) or X11 (`x11grab`) with Microphone + System Audio, synchronized webcam sidecar, cursor tracking, and live zoom point flagging (`SIGUSR2`).
+- **Process-Managed Parallel Terminal Recording (`rec ps`)**: Start, stop, pause, resume, cancel, or drop YouTube chapter markers on any live terminal or SSH session by PID or name from any other terminal without dropping SSH.
+- **Smart Auto-Render Pipeline**: Records terminal sessions at `auto`, `720p`, `1080p`, `1440p`, `4k`, `reels` (9:16 cursor-following auto-reframe), or `reels-4k`, at 2x speed in 5-minute chunks, auto-named after the tool you ran, with automatic secret redaction and passive OpenVPN/log skip.
 
 ## Install
 
@@ -45,7 +45,7 @@ cd rec-cli
 Download the `.deb` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo apt install ./rec-cli_1.4.0_all.deb
+sudo apt install ./rec-cli_2.0.0_all.deb
 ```
 
 ### Fedora / RHEL / Rocky / Alma / openSUSE
@@ -53,9 +53,9 @@ sudo apt install ./rec-cli_1.4.0_all.deb
 Download the `.rpm` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo dnf install ./rec-cli-1.4.0-1.noarch.rpm
+sudo dnf install ./rec-cli-2.0.0-1.noarch.rpm
 # openSUSE
-sudo zypper install ./rec-cli-1.4.0-1.noarch.rpm
+sudo zypper install ./rec-cli-2.0.0-1.noarch.rpm
 ```
 
 ### Arch / Manjaro / EndeavourOS
@@ -78,7 +78,10 @@ Optional Starship `● REC` prompt badge: paste [starship/rec-module.toml](stars
 
 | Command | Action |
 | --- | --- |
-| `rec gui` | Open the Qt desktop GUI (Dark/Light mode, terminal selector, live PID controls, clips library) |
+| `rec gui` | Open the Qt Studio GUI (Dark/Light mode, live PID sessions, Screen Rec, Studio Editor, terminal picker, clips library) |
+| `rec edit [clip\|project]` | Open any MP4, `.cast`, or `.recproj` directly in the multi-track Studio Editor |
+| `rec screen [flags]` | Open the Screen Recorder tab (or capture via CLI with `--mic`, `--system-audio`, `--webcam`, `--area`) |
+| `rec render-project <f.recproj>` | Render a saved `.recproj` project headlessly to MP4 or GIF |
 | `rec ps` | List all live recording sessions with PID, state (`REC`/`PAUSED`/`STANDBY`), name, elapsed time, size, and running command |
 | `rec start [name]` | Start recording this terminal, or run `rec start <pid> [name]` to start a fresh clip on another live session |
 | `rec stop [pid\|name\|all]` | Stop and render MP4 without closing the tab or dropping SSH |

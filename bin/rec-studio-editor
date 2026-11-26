@@ -1,0 +1,2040 @@
+#!/usr/bin/env python3
+"""rec-studio-editor — Recordly-style Studio Editor & Screen Recorder UI for rec-cli v2.0.0.
+
+Embeds cleanly inside `rec-gui` (sharing its Dark & Light monochrome themes)
+and can also run standalone via `rec edit <clip.mp4|project.recproj>`.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+if "--smoke-test" in sys.argv or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ["QT_QPA_PLATFORMTHEME"] = ""
+    os.environ["XDG_CURRENT_DESKTOP"] = ""
+    os.environ["GNOME_DESKTOP_SESSION_ID"] = ""
+
+try:
+    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal, QSize, QRectF, QPointF
+    from PyQt6.QtGui import (
+        QColor, QCursor, QFont, QImage, QKeySequence, QLinearGradient,
+        QPainter, QPainterPath, QPen, QPixmap, QShortcut,
+    )
+    from PyQt6.QtWidgets import (
+        QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
+        QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+        QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+        QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+    )
+except ImportError:
+    try:
+        from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF, QPointF
+        from PySide6.QtGui import (
+            QColor, QCursor, QFont, QImage, QKeySequence, QLinearGradient,
+            QPainter, QPainterPath, QPen, QPixmap, QShortcut,
+        )
+        from PySide6.QtWidgets import (
+            QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
+            QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+            QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+            QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+        )
+    except ImportError:
+        from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal, QSize, QRectF, QPointF
+        from PyQt5.QtGui import (
+            QColor, QCursor, QFont, QImage, QKeySequence, QLinearGradient,
+            QPainter, QPainterPath, QPen, QPixmap,
+        )
+        from PyQt5.QtWidgets import (
+            QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
+            QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+            QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+            QSizePolicy, QShortcut, QSlider, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+        )
+
+from PIL import Image
+
+
+def _load_engine():
+    here = Path(__file__).resolve().parent
+    for cand in (here / "rec-studio-engine", Path(shutil.which("rec-studio-engine") or "")):
+        if cand and cand.is_file():
+            loader = importlib.machinery.SourceFileLoader("rec_studio_engine", str(cand))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError("rec-studio-engine not found alongside rec-studio-editor")
+
+
+ENG = _load_engine()
+
+# Monochrome Studio palette matching rec-gui
+PALETTES = {
+    "dark": {
+        "bg": "#0c0c0e",
+        "surface": "#16161a",
+        "surface_alt": "#1d1d22",
+        "border": "#24242a",
+        "border_strong": "#34343d",
+        "text": "#f2f2f5",
+        "muted": "#92929e",
+        "dim": "#5c5c68",
+        "rec": "#e5484d",
+        "zoom": "#e5484d",
+        "trim": "#7f1d1d",
+        "speed": "#d97706",
+        "overlay": "#2563eb",
+        "audio": "#059669",
+        "playhead": "#f2f2f5",
+        "track_bg": "#111115",
+        "track_alt": "#141419",
+    },
+    "light": {
+        "bg": "#f5f5f7",
+        "surface": "#ffffff",
+        "surface_alt": "#f0f0f4",
+        "border": "#e2e2e8",
+        "border_strong": "#c8c8d4",
+        "text": "#111115",
+        "muted": "#5e5e6b",
+        "dim": "#8e8e9c",
+        "rec": "#dc353b",
+        "zoom": "#dc353b",
+        "trim": "#ef4444",
+        "speed": "#d97706",
+        "overlay": "#2563eb",
+        "audio": "#059669",
+        "playhead": "#111115",
+        "track_bg": "#f8f8fb",
+        "track_alt": "#f2f2f6",
+    },
+}
+
+
+def fmt_ts(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    m, s = divmod(int(sec), 60)
+    ms = int((sec - int(sec)) * 10)
+    return f"{m:02d}:{s:02d}.{ms}"
+
+
+def pil_to_qpixmap(img: Image.Image) -> QPixmap:
+    rgb = img.convert("RGB")
+    data = rgb.tobytes("raw", "RGB")
+    qimg = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg.copy())
+
+
+# ---------------------------------------------------------------------------
+# Compact Studio Toggle & Swatch Helpers
+# ---------------------------------------------------------------------------
+
+class MiniSwitch(QWidget):
+    toggled = Signal(bool)
+
+    def __init__(self, checked: bool = False, accent_red: bool = False):
+        super().__init__()
+        self._checked = checked
+        self._accent_red = accent_red
+        self._mode = "dark"
+        self.setFixedSize(34, 18)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def set_theme(self, mode: str):
+        self._mode = mode
+        self.update()
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, v: bool):
+        v = bool(v)
+        if self._checked != v:
+            self._checked = v
+            self.update()
+
+    def mouseReleaseEvent(self, ev):
+        if self.isEnabled() and ev.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self.update()
+            self.toggled.emit(self._checked)
+        super().mouseReleaseEvent(ev)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = h / 2.0
+        if self._checked:
+            bg = QColor("#e5484d" if self._accent_red else ("#f2f2f5" if self._mode == "dark" else "#141418"))
+            fg = QColor("#ffffff" if self._accent_red or self._mode == "light" else "#0c0c0e")
+        else:
+            bg = QColor("#2c2c34" if self._mode == "dark" else "#d2d2dc")
+            fg = QColor("#8e8e9a" if self._mode == "dark" else "#ffffff")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
+        pad = 2.5
+        d = h - pad * 2
+        x = (w - pad - d) if self._checked else pad
+        p.setBrush(fg)
+        p.drawEllipse(QRectF(x, pad, d, d))
+        p.end()
+
+
+class WallpaperSwatch(QPushButton):
+    """Painted gradient thumbnail button for curated Studio wallpapers."""
+
+    def __init__(self, key: str, info: dict):
+        super().__init__()
+        self.key = key
+        self.info = info
+        self.selected = False
+        self.setFixedHeight(32)
+        self.setToolTip(info["label"])
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def set_selected(self, sel: bool):
+        self.selected = sel
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(1.5, 1.5, self.width() - 3, self.height() - 3)
+        grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        grad.setColorAt(0.0, QColor(self.info["c1"]))
+        grad.setColorAt(0.5, QColor(self.info["c2"]))
+        grad.setColorAt(1.0, QColor(self.info["c3"]))
+        p.setBrush(grad)
+        if self.selected:
+            p.setPen(QPen(QColor("#e5484d"), 2.2))
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 45), 1.0))
+        p.drawRoundedRect(rect, 6, 6)
+        p.end()
+
+
+# ---------------------------------------------------------------------------
+# Interactive WYSIWYG Preview Canvas (Click to Aim Zoom / Place Overlay)
+# ---------------------------------------------------------------------------
+
+class PreviewCanvas(QWidget):
+    point_picked = Signal(float, float)  # normalized (0..1, 0..1) inside displayed frame
+
+    def __init__(self):
+        super().__init__()
+        self._pixmap: QPixmap | None = None
+        self._mode = "dark"
+        self._reticle: tuple[float, float] | None = None
+        self._reticle_label = ""
+        self._draw_rect = QRectF()
+        self.setMinimumHeight(260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+
+    def set_theme(self, mode: str):
+        self._mode = mode
+        self.update()
+
+    def set_frame(self, pm: QPixmap | None):
+        self._pixmap = pm
+        self.update()
+
+    def set_reticle(self, pt: tuple[float, float] | None, label: str = ""):
+        self._reticle = pt
+        self._reticle_label = label
+        self.update()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and not self._draw_rect.isEmpty():
+            pos = ev.position() if hasattr(ev, "position") else ev.localPos()
+            if self._draw_rect.contains(pos):
+                nx = (pos.x() - self._draw_rect.left()) / max(1.0, self._draw_rect.width())
+                ny = (pos.y() - self._draw_rect.top()) / max(1.0, self._draw_rect.height())
+                self.point_picked.emit(max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny)))
+        super().mousePressEvent(ev)
+
+    def paintEvent(self, _ev):
+        pal = PALETTES["light" if self._mode == "light" else "dark"]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        p.fillRect(self.rect(), QColor(pal["bg"]))
+        pad = 10
+        avail = QRectF(pad, pad, max(10, self.width() - pad * 2), max(10, self.height() - pad * 2))
+
+        if self._pixmap is None or self._pixmap.isNull():
+            p.setPen(QPen(QColor(pal["border"]), 1))
+            p.setBrush(QColor(pal["surface"]))
+            p.drawRoundedRect(avail, 10, 10)
+            p.setPen(QColor(pal["muted"]))
+            p.drawText(avail, Qt.AlignmentFlag.AlignCenter, "Open any MP4, .cast, or .recproj — or click Edit on any clip")
+            self._draw_rect = QRectF()
+            p.end()
+            return
+
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        s = min(avail.width() / max(1, pw), avail.height() / max(1, ph))
+        dw, dh = pw * s, ph * s
+        dx = avail.left() + (avail.width() - dw) / 2.0
+        dy = avail.top() + (avail.height() - dh) / 2.0
+        self._draw_rect = QRectF(dx, dy, dw, dh)
+
+        p.drawPixmap(self._draw_rect.toRect(), self._pixmap)
+        p.setPen(QPen(QColor(pal["border_strong"]), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(self._draw_rect)
+
+        # Draw focus target reticle when a zoom or annotation item is selected
+        if self._reticle is not None:
+            rx = dx + self._reticle[0] * dw
+            ry = dy + self._reticle[1] * dh
+            p.setPen(QPen(QColor("#e5484d"), 2.0))
+            p.setBrush(QColor(229, 72, 77, 40))
+            p.drawEllipse(QPointF(rx, ry), 13, 13)
+            p.drawLine(QPointF(rx - 18, ry), QPointF(rx + 18, ry))
+            p.drawLine(QPointF(rx, ry - 18), QPointF(rx, ry + 18))
+            if self._reticle_label:
+                p.setPen(QColor("#ffffff"))
+                p.setBrush(QColor(18, 18, 22, 210))
+                lbl_r = QRectF(rx + 16, ry - 11, 78, 20)
+                p.drawRoundedRect(lbl_r, 4, 4)
+                p.drawText(lbl_r, Qt.AlignmentFlag.AlignCenter, self._reticle_label)
+
+        p.end()
+
+
+# ---------------------------------------------------------------------------
+# Interactive Multi-Track Timeline (Zoom / Trim / Speed / Overlays / Audio)
+# ---------------------------------------------------------------------------
+
+class TimelineWidget(QWidget):
+    seek_requested = Signal(float)
+    selection_changed = Signal(str, str)   # (track_kind, item_id) or ("", "")
+    project_mutated = Signal()
+
+    TRACKS = [
+        ("zooms",       "Zoom"),
+        ("trims",       "Trim Cut"),
+        ("speeds",      "Speed"),
+        ("annotations", "Overlays"),
+        ("audio",       "Audio"),
+    ]
+    LABEL_W = 82
+    RULER_H = 24
+    ROW_H = 28
+
+    def __init__(self):
+        super().__init__()
+        self._proj: dict | None = None
+        self._cur_t = 0.0
+        self._mode = "dark"
+        self.sel_track = ""
+        self.sel_id = ""
+        self._drag_mode = ""  # "scrub" | "move" | "resize_l" | "resize_r"
+        self._drag_item: dict | None = None
+        self._drag_origin_t = 0.0
+        self._drag_orig_start = 0.0
+        self._drag_orig_end = 0.0
+        self.setFixedHeight(self.RULER_H + len(self.TRACKS) * self.ROW_H + 8)
+        self.setMouseTracking(True)
+
+    def set_theme(self, mode: str):
+        self._mode = mode
+        self.update()
+
+    def set_project(self, proj: dict):
+        self._proj = proj
+        self.update()
+
+    def set_time(self, t: float):
+        self._cur_t = max(0.0, t)
+        self.update()
+
+    def set_selection(self, track: str, item_id: str):
+        self.sel_track = track
+        self.sel_id = item_id
+        self.update()
+
+    def _duration(self) -> float:
+        return max(0.5, float(self._proj.get("duration", 10.0))) if self._proj else 10.0
+
+    def _t_to_x(self, t: float) -> float:
+        w = max(40.0, self.width() - self.LABEL_W - 14)
+        return self.LABEL_W + (max(0.0, min(self._duration(), t)) / self._duration()) * w
+
+    def _x_to_t(self, x: float) -> float:
+        w = max(40.0, self.width() - self.LABEL_W - 14)
+        frac = max(0.0, min(1.0, (x - self.LABEL_W) / w))
+        return frac * self._duration()
+
+    def _hit_test(self, x: float, y: float) -> tuple[str, dict | None, str]:
+        if not self._proj or y < self.RULER_H or x < self.LABEL_W:
+            return ("", None, "")
+        row = int((y - self.RULER_H) // self.ROW_H)
+        if row < 0 or row >= len(self.TRACKS):
+            return ("", None, "")
+        tk = self.TRACKS[row][0]
+        if tk == "audio":
+            return ("audio", None, "")
+        for item in self._proj.get(tk, []):
+            x0 = self._t_to_x(float(item.get("start", 0.0)))
+            x1 = self._t_to_x(float(item.get("end", 0.0)))
+            if x0 - 4 <= x <= x1 + 4:
+                if abs(x - x0) <= 7:
+                    return (tk, item, "resize_l")
+                if abs(x - x1) <= 7:
+                    return (tk, item, "resize_r")
+                return (tk, item, "move")
+        return (tk, None, "")
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.MouseButton.LeftButton or not self._proj:
+            return
+        pos = ev.position() if hasattr(ev, "position") else ev.localPos()
+        x, y = pos.x(), pos.y()
+        if y <= self.RULER_H and x >= self.LABEL_W:
+            self._drag_mode = "scrub"
+            t = self._x_to_t(x)
+            self._cur_t = t
+            self.seek_requested.emit(t)
+            self.update()
+            return
+
+        tk, item, mode = self._hit_test(x, y)
+        if item is not None:
+            self.sel_track = tk
+            self.sel_id = item.get("id", "")
+            self._drag_mode = mode
+            self._drag_item = item
+            self._drag_origin_t = self._x_to_t(x)
+            self._drag_orig_start = float(item["start"])
+            self._drag_orig_end = float(item["end"])
+            self.selection_changed.emit(self.sel_track, self.sel_id)
+            self.update()
+        elif x >= self.LABEL_W:
+            self.sel_track = ""
+            self.sel_id = ""
+            self.selection_changed.emit("", "")
+            self._drag_mode = "scrub"
+            t = self._x_to_t(x)
+            self._cur_t = t
+            self.seek_requested.emit(t)
+            self.update()
+
+    def mouseMoveEvent(self, ev):
+        pos = ev.position() if hasattr(ev, "position") else ev.localPos()
+        x, y = pos.x(), pos.y()
+        if not self._drag_mode:
+            _tk, _it, mode = self._hit_test(x, y)
+            if mode in ("resize_l", "resize_r"):
+                self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
+            elif mode == "move":
+                self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            else:
+                self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+            return
+
+        t = self._x_to_t(x)
+        dur = self._duration()
+        if self._drag_mode == "scrub":
+            self._cur_t = t
+            self.seek_requested.emit(t)
+            self.update()
+        elif self._drag_item is not None:
+            dt = t - self._drag_origin_t
+            if self._drag_mode == "move":
+                span = self._drag_orig_end - self._drag_orig_start
+                ns = max(0.0, min(dur - span, self._drag_orig_start + dt))
+                self._drag_item["start"] = round(ns, 2)
+                self._drag_item["end"] = round(ns + span, 2)
+            elif self._drag_mode == "resize_l":
+                ns = max(0.0, min(self._drag_orig_end - 0.2, self._drag_orig_start + dt))
+                self._drag_item["start"] = round(ns, 2)
+            elif self._drag_mode == "resize_r":
+                ne = max(self._drag_orig_start + 0.2, min(dur, self._drag_orig_end + dt))
+                self._drag_item["end"] = round(ne, 2)
+            self.update()
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag_mode in ("move", "resize_l", "resize_r"):
+            self.project_mutated.emit()
+        self._drag_mode = ""
+        self._drag_item = None
+        super().mouseReleaseEvent(ev)
+
+    def paintEvent(self, _ev):
+        pal = PALETTES["light" if self._mode == "light" else "dark"]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(pal["surface"]))
+        p.setPen(QPen(QColor(pal["border"]), 1))
+        p.drawLine(0, 0, w, 0)
+        p.drawLine(self.LABEL_W, 0, self.LABEL_W, h)
+
+        # Ruler ticks
+        dur = self._duration()
+        p.fillRect(self.LABEL_W + 1, 1, w - self.LABEL_W - 1, self.RULER_H - 1, QColor(pal["track_bg"]))
+        p.setPen(QColor(pal["dim"]))
+        font = p.font()
+        font.setPointSize(8)
+        p.setFont(font)
+
+        step = 1.0 if dur <= 12 else 2.0 if dur <= 30 else 5.0 if dur <= 90 else 15.0 if dur <= 300 else 30.0
+        t = 0.0
+        while t <= dur + 0.01:
+            tx = self._t_to_x(t)
+            p.setPen(QPen(QColor(pal["border_strong"]), 1))
+            p.drawLine(QPointF(tx, self.RULER_H - 6), QPointF(tx, self.RULER_H))
+            p.setPen(QColor(pal["muted"]))
+            p.drawText(QRectF(tx + 3, 2, 44, self.RULER_H - 4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, fmt_ts(t)[:-2])
+            t += step
+
+        # Track rows & blocks
+        track_colors = {
+            "zooms": pal["zoom"],
+            "trims": pal["trim"],
+            "speeds": pal["speed"],
+            "annotations": pal["overlay"],
+            "audio": pal["audio"],
+        }
+
+        for idx, (tk, label) in enumerate(self.TRACKS):
+            ry = self.RULER_H + idx * self.ROW_H
+            row_bg = QColor(pal["track_bg"] if idx % 2 == 0 else pal["track_alt"])
+            p.fillRect(self.LABEL_W + 1, ry, w - self.LABEL_W - 1, self.ROW_H, row_bg)
+            p.setPen(QPen(QColor(pal["border"]), 1))
+            p.drawLine(0, ry, w, ry)
+
+            # Track label
+            p.setPen(QColor(pal["muted"]))
+            p.drawText(QRectF(10, ry, self.LABEL_W - 14, self.ROW_H), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+
+            if not self._proj:
+                continue
+
+            if tk == "audio":
+                ov = self._proj.get("audio", {}).get("overlay_path", "")
+                if ov:
+                    x0 = self._t_to_x(float(self._proj["audio"].get("overlay_offset", 0.0)))
+                    x1 = self._t_to_x(dur)
+                    rect = QRectF(x0, ry + 4, max(24, x1 - x0), self.ROW_H - 8)
+                    c = QColor(track_colors["audio"])
+                    c.setAlpha(185)
+                    p.setBrush(c)
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.drawRoundedRect(rect, 5, 5)
+                    p.setPen(QColor("#ffffff"))
+                    p.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, Path(ov).name)
+                continue
+
+            for item in self._proj.get(tk, []):
+                x0 = self._t_to_x(float(item.get("start", 0.0)))
+                x1 = self._t_to_x(float(item.get("end", 0.0)))
+                rect = QRectF(x0, ry + 4, max(12.0, x1 - x0), self.ROW_H - 8)
+                is_sel = (self.sel_track == tk and self.sel_id == item.get("id"))
+
+                col = QColor(track_colors[tk])
+                col.setAlpha(235 if is_sel else 175)
+                p.setBrush(col)
+                p.setPen(QPen(QColor("#ffffff"), 1.6) if is_sel else Qt.PenStyle.NoPen)
+                p.drawRoundedRect(rect, 5, 5)
+
+                if tk == "zooms":
+                    txt = f"{float(item.get('depth', 1.7)):.1f}x"
+                elif tk == "trims":
+                    txt = "CUT"
+                elif tk == "speeds":
+                    txt = f"{float(item.get('rate', 2.0)):.2g}x"
+                else:
+                    kind = item.get("kind", "text")
+                    txt = item.get("text", "") if kind == "text" else kind.upper()
+                p.setPen(QColor("#ffffff"))
+                p.drawText(rect.adjusted(5, 0, -5, 0), Qt.AlignmentFlag.AlignCenter, txt[:18])
+
+        # Playhead line & top cap
+        px = self._t_to_x(self._cur_t)
+        p.setPen(QPen(QColor(pal["playhead"]), 1.6))
+        p.drawLine(QPointF(px, 4), QPointF(px, h - 2))
+        p.setBrush(QColor("#e5484d"))
+        p.setPen(Qt.PenStyle.NoPen)
+        tri = QPainterPath()
+        tri.moveTo(px - 5, 2)
+        tri.lineTo(px + 5, 2)
+        tri.lineTo(px, 11)
+        tri.closeSubpath()
+        p.drawPath(tri)
+        p.end()
+
+
+# ---------------------------------------------------------------------------
+# Background Export Thread
+# ---------------------------------------------------------------------------
+
+class ExportWorker(QThread):
+    progress = Signal(int, str)
+    finished_export = Signal(bool, str)
+
+    def __init__(self, proj: dict, out_path: str):
+        super().__init__()
+        self.proj = copy.deepcopy(proj)
+        self.out_path = out_path
+        self._canceled = False
+
+    def cancel(self):
+        self._canceled = True
+
+    def run(self):
+        ok, msg = ENG.export_project(
+            self.proj,
+            self.out_path,
+            progress_cb=lambda pct, txt: self.progress.emit(pct, txt),
+            cancel_check=lambda: self._canceled,
+        )
+        self.finished_export.emit(ok, msg)
+
+
+# ---------------------------------------------------------------------------
+# Recordly-Style Screen, Window, Dual-Audio & Webcam Capture Panel
+# ---------------------------------------------------------------------------
+
+class ScreenRecorderPage(QWidget):
+    recording_finished = Signal(str)  # emits saved MP4 path so GUI can open straight in Editor!
+
+    def __init__(self, video_dir_getter):
+        super().__init__()
+        self._video_dir_getter = video_dir_getter
+        self._mode = "dark"
+        self._proc: subprocess.Popen | None = None
+        self._current_out = ""
+        self._started_at = 0.0
+        self._switches: list[MiniSwitch] = []
+        self._probe = self._run_probe()
+        self._build_ui()
+
+        self._tick = QTimer(self)
+        self._tick.timeout.connect(self._on_tick)
+        self._tick.start(500)
+
+    def _run_probe(self) -> dict:
+        cap = shutil.which("rec-capture") or str(Path(__file__).resolve().parent / "rec-capture")
+        try:
+            out = subprocess.check_output([cap, "--probe"], stderr=subprocess.DEVNULL, text=True, timeout=3)
+            return json.loads(out)
+        except Exception:
+            return {"backend": "auto", "screen_w": 1920, "screen_h": 1080, "webcams": [], "has_mic_tool": True}
+
+    def set_theme(self, mode: str):
+        self._mode = mode
+        for sw in self._switches:
+            sw.set_theme(mode)
+
+    def _add_switch_row(self, parent_lay: QVBoxLayout, title: str, desc: str, checked: bool = False, red: bool = False) -> MiniSwitch:
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 8, 0, 8)
+        tc = QVBoxLayout()
+        tc.setSpacing(1)
+        tl = QLabel(title)
+        tl.setObjectName("rowTitle")
+        dl = QLabel(desc)
+        dl.setObjectName("muted")
+        tc.addWidget(tl)
+        tc.addWidget(dl)
+        rl.addLayout(tc, 1)
+        sw = MiniSwitch(checked=checked, accent_red=red)
+        self._switches.append(sw)
+        rl.addWidget(sw)
+        parent_lay.addWidget(row)
+        return sw
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(14)
+
+        hdr = QHBoxLayout()
+        tcol = QVBoxLayout()
+        tcol.setSpacing(2)
+        t = QLabel("Screen Recorder")
+        t.setObjectName("pageTitle")
+        sub = QLabel(
+            f"Display {self._probe.get('screen_w', 1920)}x{self._probe.get('screen_h', 1080)} · "
+            f"Backend: {self._probe.get('backend', 'auto')} · Dual audio + webcam + cursor tracking"
+        )
+        sub.setObjectName("muted")
+        tcol.addWidget(t)
+        tcol.addWidget(sub)
+        hdr.addLayout(tcol)
+        hdr.addStretch()
+
+        self.status_badge = QLabel("Ready")
+        self.status_badge.setObjectName("neutralBadge")
+        hdr.addWidget(self.status_badge)
+        lay.addLayout(hdr)
+
+        # Capture source & options card
+        card = QFrame()
+        card.setObjectName("panel")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(16, 14, 16, 14)
+        cl.setSpacing(10)
+
+        top_grid = QGridLayout()
+        top_grid.setHorizontalSpacing(14)
+        top_grid.setVerticalSpacing(8)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Full Screen", "full")
+        self.mode_combo.addItem("Custom Region (X, Y, W, H)", "area")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+
+        self.fps_combo = QComboBox()
+        self.fps_combo.addItem("30 fps", 30)
+        self.fps_combo.addItem("60 fps", 60)
+
+        self.area_edit = QLineEdit("100,100,1280,720")
+        self.area_edit.setPlaceholderText("x,y,width,height")
+        self.area_edit.setEnabled(False)
+
+        self.cam_combo = QComboBox()
+        cams = self._probe.get("webcams") or []
+        if cams:
+            for c in cams:
+                self.cam_combo.addItem(c, c)
+        else:
+            self.cam_combo.addItem("No webcam detected", "")
+
+        top_grid.addWidget(self._lbl("Capture Source"), 0, 0)
+        top_grid.addWidget(self.mode_combo, 1, 0)
+        top_grid.addWidget(self._lbl("Framerate"), 0, 1)
+        top_grid.addWidget(self.fps_combo, 1, 1)
+        top_grid.addWidget(self._lbl("Region (x,y,w,h)"), 2, 0)
+        top_grid.addWidget(self.area_edit, 3, 0)
+        top_grid.addWidget(self._lbl("Webcam Device"), 2, 1)
+        top_grid.addWidget(self.cam_combo, 3, 1)
+        cl.addLayout(top_grid)
+
+        div = QFrame()
+        div.setObjectName("divider")
+        cl.addWidget(div)
+
+        self.sw_mic = self._add_switch_row(cl, "Microphone Audio", "Record voiceover via PipeWire / PulseAudio", checked=True)
+        self.sw_sys = self._add_switch_row(cl, "System Audio", "Capture desktop / app audio alongside mic", checked=False)
+        self.sw_cam = self._add_switch_row(cl, "Webcam Bubble Sidecar", "Record synchronized camera track for floating bubble in Editor", checked=False)
+        self.sw_cur = self._add_switch_row(cl, "Hide OS Cursor", "Let Studio render smoothed macOS vector cursor + click bounce", checked=False)
+        self.sw_auto_edit = self._add_switch_row(cl, "Open in Studio Editor on Stop", "Jump straight to timeline, auto-zoom & wallpapers when finished", checked=True, red=True)
+        lay.addWidget(card)
+
+        # Action bar
+        act = QHBoxLayout()
+        act.setSpacing(10)
+        self.rec_btn = QPushButton("● Start Screen Recording")
+        self.rec_btn.setObjectName("recBtn")
+        self.rec_btn.setFixedHeight(38)
+        self.rec_btn.clicked.connect(self._toggle_record)
+
+        self.zoom_flag_btn = QPushButton("Flag Zoom Point")
+        self.zoom_flag_btn.setFixedHeight(38)
+        self.zoom_flag_btn.setEnabled(False)
+        self.zoom_flag_btn.clicked.connect(self._flag_zoom)
+
+        act.addWidget(self.rec_btn, 1)
+        act.addWidget(self.zoom_flag_btn)
+        lay.addLayout(act)
+        lay.addStretch()
+
+    def _lbl(self, txt: str) -> QLabel:
+        l = QLabel(txt)
+        l.setObjectName("muted")
+        return l
+
+    def _on_mode_changed(self):
+        self.area_edit.setEnabled(self.mode_combo.currentData() == "area")
+
+    def _toggle_record(self):
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.send_signal(signal.SIGUSR1)
+            except OSError:
+                pass
+            self.rec_btn.setEnabled(False)
+            self.status_badge.setText("Finalizing...")
+            return
+
+        cap_bin = shutil.which("rec-capture") or str(Path(__file__).resolve().parent / "rec-capture")
+        vdir = Path(self._video_dir_getter())
+        vdir.mkdir(parents=True, exist_ok=True)
+        self._current_out = str(vdir / f"screen_{time.strftime('%Y%m%d-%H%M%S')}.mp4")
+
+        cmd = [cap_bin, "-o", self._current_out, "--fps", str(self.fps_combo.currentData())]
+        if self.mode_combo.currentData() == "area" and self.area_edit.text().strip():
+            cmd.extend(["--area", self.area_edit.text().strip()])
+        if self.sw_mic.isChecked():
+            cmd.append("--mic")
+        if self.sw_sys.isChecked():
+            cmd.append("--system-audio")
+        if self.sw_cam.isChecked() and self.cam_combo.currentData():
+            cmd.extend(["--webcam", "--webcam-device", str(self.cam_combo.currentData())])
+        if self.sw_cur.isChecked():
+            cmd.append("--hide-os-cursor")
+
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self._started_at = time.time()
+        self.rec_btn.setText("■ Stop Screen Recording")
+        self.zoom_flag_btn.setEnabled(True)
+        self.status_badge.setText("● REC 00:00")
+        self.status_badge.setObjectName("recBadge")
+        self.status_badge.style().unpolish(self.status_badge)
+        self.status_badge.style().polish(self.status_badge)
+
+    def _flag_zoom(self):
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.send_signal(signal.SIGUSR2)
+                self.status_badge.setText("◆ Zoom Flagged")
+            except OSError:
+                pass
+
+    def _on_tick(self):
+        if self._proc is None:
+            return
+        rc = self._proc.poll()
+        if rc is None:
+            el = max(0, int(time.time() - self._started_at))
+            m, s = divmod(el, 60)
+            self.status_badge.setText(f"● REC {m:02d}:{s:02d}")
+            return
+
+        out, err = self._proc.communicate()
+        self._proc = None
+        self.rec_btn.setEnabled(True)
+        self.rec_btn.setText("● Start Screen Recording")
+        self.zoom_flag_btn.setEnabled(False)
+        self.status_badge.setObjectName("neutralBadge")
+        self.status_badge.style().unpolish(self.status_badge)
+        self.status_badge.style().polish(self.status_badge)
+
+        if rc == 0 and os.path.isfile(self._current_out):
+            self.status_badge.setText("Saved")
+            if self.sw_auto_edit.isChecked():
+                self.recording_finished.emit(self._current_out)
+        else:
+            self.status_badge.setText("Capture failed")
+            msg = (err or out or "Check Wayland/X11 capture permissions").strip()
+            QMessageBox.warning(self, "Screen Capture", msg[:400])
+
+
+# ---------------------------------------------------------------------------
+# Recordly-Style Multi-Track Video Editor Page
+# ---------------------------------------------------------------------------
+
+class StudioEditorPage(QWidget):
+    toast_requested = Signal(str)
+
+    def __init__(self, video_dir_getter):
+        super().__init__()
+        self._video_dir_getter = video_dir_getter
+        self._mode = "dark"
+        self.proj = ENG.default_project("")
+        self.project_path = ""
+        self.compositor = ENG.StudioCompositor()
+        self.cur_t = 0.0
+        self.playing = False
+        self.sel_track = ""
+        self.sel_id = ""
+        self._frame_cache: dict[int, Image.Image] = {}
+        self._webcam_cache: dict[int, Image.Image] = {}
+        self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
+        self._export_worker: ExportWorker | None = None
+        self._switches: list[MiniSwitch] = []
+        self._swatches: dict[str, WallpaperSwatch] = {}
+        self._ar_btns: dict[str, QPushButton] = {}
+        self._bg_type_btns: dict[str, QPushButton] = {}
+        self._insp_tab_btns: list[QPushButton] = []
+        self._syncing_ui = False
+
+        self._build_ui()
+
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_tick)
+        self._play_timer.setInterval(66)  # ~15fps smooth live preview
+
+        self._render_debounce = QTimer(self)
+        self._render_debounce.setSingleShot(True)
+        self._render_debounce.setInterval(25)
+        self._render_debounce.timeout.connect(self._render_preview_now)
+
+    def set_theme(self, mode: str):
+        self._mode = mode
+        self.preview.set_theme(mode)
+        self.timeline.set_theme(mode)
+        for sw in self._switches:
+            sw.set_theme(mode)
+
+    # ---------------- Build UI ----------------
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 12, 16, 12)
+        root.setSpacing(10)
+
+        # --- Top Studio Action Bar ---
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+
+        self.title_lbl = QLabel("Studio Editor")
+        self.title_lbl.setObjectName("pageTitle")
+        bar.addWidget(self.title_lbl)
+
+        self.file_badge = QLabel("No clip loaded")
+        self.file_badge.setObjectName("monoTag")
+        bar.addWidget(self.file_badge)
+        bar.addStretch()
+
+        b_open = QPushButton("Open Video")
+        b_open.clicked.connect(self._open_media_dialog)
+        b_open_proj = QPushButton("Open .recproj")
+        b_open_proj.clicked.connect(self._open_project_dialog)
+        b_save_proj = QPushButton("Save Project")
+        b_save_proj.clicked.connect(self._save_project_dialog)
+        b_undo = QPushButton("Undo")
+        b_undo.clicked.connect(self._undo)
+        b_redo = QPushButton("Redo")
+        b_redo.clicked.connect(self._redo)
+        b_autoz = QPushButton("✦ Auto-Zoom")
+        b_autoz.setObjectName("primaryBtn")
+        b_autoz.clicked.connect(self._run_auto_zoom)
+        b_exp = QPushButton("Export")
+        b_exp.setObjectName("recBtn")
+        b_exp.clicked.connect(lambda: self._switch_inspector_tab(3))
+
+        for b in (b_open, b_open_proj, b_save_proj, b_undo, b_redo, b_autoz, b_exp):
+            bar.addWidget(b)
+        root.addLayout(bar)
+
+        # --- Middle Split: Center Preview + Right Inspector ---
+        mid = QHBoxLayout()
+        mid.setSpacing(12)
+
+        # Center column: Preview + Transport/Add-Clip toolbar
+        center = QVBoxLayout()
+        center.setSpacing(8)
+
+        self.preview = PreviewCanvas()
+        self.preview.point_picked.connect(self._on_canvas_point_picked)
+        center.addWidget(self.preview, 1)
+
+        # Transport & Quick-Add Bar
+        tbar = QHBoxLayout()
+        tbar.setSpacing(6)
+
+        self.play_btn = QPushButton("▶ Play")
+        self.play_btn.setObjectName("primaryBtn")
+        self.play_btn.setFixedWidth(74)
+        self.play_btn.clicked.connect(self._toggle_play)
+        tbar.addWidget(self.play_btn)
+
+        self.time_lbl = QLabel("00:00.0 / 00:00.0")
+        self.time_lbl.setObjectName("monoTag")
+        tbar.addWidget(self.time_lbl)
+
+        tbar.addStretch()
+
+        for lbl, fn in (
+            ("+ Zoom", self._add_zoom),
+            ("+ Trim", self._add_trim),
+            ("+ Speed", self._add_speed),
+        ):
+            btn = QPushButton(lbl)
+            btn.clicked.connect(fn)
+            tbar.addWidget(btn)
+
+        # Clean dropdown menu for all 5 overlay annotation types so toolbar never crowds
+        ov_btn = QPushButton("+ Overlay ▾")
+        ov_menu = QMenu(ov_btn)
+        for lbl, kind in (
+            ("Text Callout", "text"),
+            ("Blur / Redact Box", "blur"),
+            ("Highlight Box", "box"),
+            ("Arrow Pointer", "arrow"),
+            ("Image Overlay...", "image"),
+        ):
+            act = ov_menu.addAction(lbl)
+            act.triggered.connect(lambda _c=False, k=kind: self._add_annotation(k))
+        ov_btn.setMenu(ov_menu)
+        tbar.addWidget(ov_btn)
+
+        self.del_btn = QPushButton("Delete")
+        self.del_btn.setObjectName("dangerBtn")
+        self.del_btn.setEnabled(False)
+        self.del_btn.clicked.connect(self._delete_selected)
+        tbar.addWidget(self.del_btn)
+
+        center.addLayout(tbar)
+        mid.addLayout(center, 1)
+
+        # Right Inspector Panel (fixed 296px)
+        insp = QFrame()
+        insp.setObjectName("panel")
+        insp.setFixedWidth(296)
+        il = QVBoxLayout(insp)
+        il.setContentsMargins(10, 10, 10, 10)
+        il.setSpacing(8)
+
+        # Segmented Inspector Tabs: Canvas | Motion | Item | Export
+        seg = QFrame()
+        seg.setObjectName("segWrap")
+        sl = QHBoxLayout(seg)
+        sl.setContentsMargins(3, 3, 3, 3)
+        sl.setSpacing(2)
+        for idx, name in enumerate(("Canvas", "Motion", "Item", "Export")):
+            tb = QPushButton(name)
+            tb.setObjectName("segBtn")
+            tb.setProperty("active", idx == 0)
+            tb.clicked.connect(lambda _c=False, i=idx: self._switch_inspector_tab(i))
+            sl.addWidget(tb, 1)
+            self._insp_tab_btns.append(tb)
+        il.addWidget(seg)
+
+        self.insp_stack = QStackedWidget()
+        self.insp_stack.addWidget(self._build_canvas_tab())
+        self.insp_stack.addWidget(self._build_motion_tab())
+        self.insp_stack.addWidget(self._build_item_tab())
+        self.insp_stack.addWidget(self._build_export_tab())
+        il.addWidget(self.insp_stack, 1)
+
+        mid.addWidget(insp)
+        root.addLayout(mid, 1)
+
+        # --- Bottom: Multi-Track Interactive Timeline ---
+        self.timeline = TimelineWidget()
+        self.timeline.seek_requested.connect(self._on_timeline_seek)
+        self.timeline.selection_changed.connect(self._on_timeline_select)
+        self.timeline.project_mutated.connect(self._on_timeline_mutated)
+        root.addWidget(self.timeline)
+
+        # Keyboard shortcuts (Space = Play/Pause, Delete = remove selected)
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self).activated.connect(self._toggle_play)
+        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self._undo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self._redo)
+
+        self._sync_ui_from_project()
+
+    # ---------------- Inspector Helper Builders ----------------
+    def _scroll_wrap(self, inner: QWidget) -> QScrollArea:
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sc.setWidget(inner)
+        return sc
+
+    def _sec_lbl(self, txt: str) -> QLabel:
+        l = QLabel(txt.upper())
+        l.setObjectName("sectionLabel")
+        return l
+
+    def _slider_row(self, parent_lay: QVBoxLayout, label: str, lo: int, hi: int, val: int, suffix: str, on_change) -> tuple[QSlider, QLabel]:
+        hdr = QHBoxLayout()
+        l1 = QLabel(label)
+        l1.setObjectName("muted")
+        val_lbl = QLabel(f"{val}{suffix}")
+        val_lbl.setObjectName("monoTag")
+        hdr.addWidget(l1)
+        hdr.addStretch()
+        hdr.addWidget(val_lbl)
+        parent_lay.addLayout(hdr)
+
+        sld = QSlider(Qt.Orientation.Horizontal)
+        sld.setRange(lo, hi)
+        sld.setValue(val)
+
+        def _changed(v):
+            val_lbl.setText(f"{v}{suffix}")
+            if not self._syncing_ui:
+                on_change(v)
+
+        sld.valueChanged.connect(_changed)
+        parent_lay.addWidget(sld)
+        return (sld, val_lbl)
+
+    def _toggle_row(self, parent_lay: QVBoxLayout, label: str, checked: bool, on_change) -> MiniSwitch:
+        r = QHBoxLayout()
+        l = QLabel(label)
+        l.setObjectName("muted")
+        sw = MiniSwitch(checked=checked)
+        self._switches.append(sw)
+
+        def _t(v):
+            if not self._syncing_ui:
+                on_change(v)
+
+        sw.toggled.connect(_t)
+        r.addWidget(l)
+        r.addStretch()
+        r.addWidget(sw)
+        parent_lay.addLayout(r)
+        return sw
+
+    def _switch_inspector_tab(self, idx: int):
+        self.insp_stack.setCurrentIndex(idx)
+        for i, b in enumerate(self._insp_tab_btns):
+            b.setProperty("active", i == idx)
+            b.style().unpolish(b)
+            b.style().polish(b)
+        if idx == 3:
+            self._update_export_summary()
+
+    # ---------------- Inspector Tab 0: Canvas (Aspect, Wallpaper, Padding, Shadow, Chrome, Crop) ----------------
+    def _build_canvas_tab(self) -> QWidget:
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(2, 4, 6, 8)
+        lay.setSpacing(10)
+
+        lay.addWidget(self._sec_lbl("Aspect Ratio"))
+        ar_grid = QGridLayout()
+        ar_grid.setSpacing(5)
+        for i, ar in enumerate(("16:9", "9:16", "1:1", "4:5", "4:3", "21:9", "original")):
+            b = QPushButton("Orig" if ar == "original" else ar)
+            b.setObjectName("segBtn")
+            b.clicked.connect(lambda _c=False, k=ar: self._set_aspect_ratio(k))
+            self._ar_btns[ar] = b
+            ar_grid.addWidget(b, i // 4, i % 4)
+        lay.addLayout(ar_grid)
+
+        lay.addWidget(self._sec_lbl("Background"))
+        bt_row = QHBoxLayout()
+        bt_row.setSpacing(4)
+        for key, lbl in (("preset", "Wallpaper"), ("gradient", "Gradient"), ("solid", "Solid"), ("image", "Image")):
+            b = QPushButton(lbl)
+            b.setObjectName("segBtn")
+            b.clicked.connect(lambda _c=False, k=key: self._set_bg_type(k))
+            self._bg_type_btns[key] = b
+            bt_row.addWidget(b)
+        lay.addLayout(bt_row)
+
+        # Wallpaper preset swatches (4x2)
+        self.bg_presets_box = QWidget()
+        pg = QGridLayout(self.bg_presets_box)
+        pg.setContentsMargins(0, 0, 0, 0)
+        pg.setSpacing(6)
+        for idx, (pkey, pinfo) in enumerate(ENG.WALLPAPER_PRESETS.items()):
+            sw = WallpaperSwatch(pkey, pinfo)
+            sw.clicked.connect(lambda _c=False, k=pkey: self._set_bg_preset(k))
+            self._swatches[pkey] = sw
+            pg.addWidget(sw, idx // 4, idx % 4)
+        lay.addWidget(self.bg_presets_box)
+
+        # Custom color / image controls
+        color_row = QHBoxLayout()
+        color_row.setSpacing(6)
+        self.c1_btn = QPushButton("Color 1")
+        self.c1_btn.clicked.connect(lambda: self._pick_bg_color("color1"))
+        self.c2_btn = QPushButton("Color 2")
+        self.c2_btn.clicked.connect(lambda: self._pick_bg_color("color2"))
+        self.img_btn = QPushButton("Wallpaper Image...")
+        self.img_btn.clicked.connect(self._pick_bg_image)
+        color_row.addWidget(self.c1_btn)
+        color_row.addWidget(self.c2_btn)
+        color_row.addWidget(self.img_btn)
+        lay.addLayout(color_row)
+
+        self.bg_blur_sld, _ = self._slider_row(lay, "Background Blur", 0, 40, 0, "px", lambda v: self._mut_bg("blur", v))
+
+        lay.addWidget(self._sec_lbl("Frame & Style"))
+        self.pad_sld, _ = self._slider_row(lay, "Padding", 0, 22, 7, "%", lambda v: self._mut_frame("padding", v))
+        self.rad_sld, _ = self._slider_row(lay, "Corner Radius", 0, 44, 18, "px", lambda v: self._mut_frame("radius", v))
+        self.shd_sld, _ = self._slider_row(lay, "Drop Shadow", 0, 100, 65, "%", lambda v: self._mut_frame("shadow", v))
+
+        ch_row = QHBoxLayout()
+        ch_lbl = QLabel("Window Chrome")
+        ch_lbl.setObjectName("muted")
+        self.chrome_combo = QComboBox()
+        for val, lbl in (("none", "None"), ("macos", "macOS Dots"), ("minimal", "Minimal Border")):
+            self.chrome_combo.addItem(lbl, val)
+        self.chrome_combo.currentIndexChanged.connect(
+            lambda: (not self._syncing_ui) and self._mut_frame("chrome", self.chrome_combo.currentData())
+        )
+        ch_row.addWidget(ch_lbl)
+        ch_row.addWidget(self.chrome_combo, 1)
+        lay.addLayout(ch_row)
+
+        lay.addWidget(self._sec_lbl("Crop"))
+        self.ct_sld, _ = self._slider_row(lay, "Top", 0, 35, 0, "%", lambda v: self._mut_frame("crop_top", v))
+        self.cb_sld, _ = self._slider_row(lay, "Bottom", 0, 35, 0, "%", lambda v: self._mut_frame("crop_bottom", v))
+        self.cl_sld, _ = self._slider_row(lay, "Left", 0, 35, 0, "%", lambda v: self._mut_frame("crop_left", v))
+        self.cr_sld, _ = self._slider_row(lay, "Right", 0, 35, 0, "%", lambda v: self._mut_frame("crop_right", v))
+
+        lay.addStretch()
+        return self._scroll_wrap(inner)
+
+    # ---------------- Inspector Tab 1: Motion, Cursor, Webcam & Audio ----------------
+    def _build_motion_tab(self) -> QWidget:
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(2, 4, 6, 8)
+        lay.setSpacing(10)
+
+        lay.addWidget(self._sec_lbl("Smart Motion"))
+        sp_row = QHBoxLayout()
+        l_sp = QLabel("Zoom Spring")
+        l_sp.setObjectName("muted")
+        self.spring_combo = QComboBox()
+        for val, lbl in (("smooth", "Smooth"), ("snappy", "Snappy"), ("cinematic", "Cinematic")):
+            self.spring_combo.addItem(lbl, val)
+        self.spring_combo.currentIndexChanged.connect(
+            lambda: (not self._syncing_ui) and self._mut_nested("motion", "spring", self.spring_combo.currentData())
+        )
+        sp_row.addWidget(l_sp)
+        sp_row.addWidget(self.spring_combo, 1)
+        lay.addLayout(sp_row)
+
+        self.mblur_sld, _ = self._slider_row(lay, "Motion Blur", 0, 100, 20, "%", lambda v: self._mut_nested("motion", "motion_blur", v))
+
+        lay.addWidget(self._sec_lbl("Cursor Polish"))
+        self.sw_cur_en = self._toggle_row(lay, "Show Vector Cursor", False, lambda v: self._mut_nested("cursor", "enabled", v))
+        self.sw_cur_bounce = self._toggle_row(lay, "Click Bounce & Ripple", True, lambda v: self._mut_nested("cursor", "click_bounce", v))
+        self.sw_cur_idle = self._toggle_row(lay, "Auto-hide Idle Cursor", True, lambda v: self._mut_nested("cursor", "hide_idle", v))
+
+        cs_row = QHBoxLayout()
+        l_cs = QLabel("Cursor Style")
+        l_cs.setObjectName("muted")
+        self.cur_style_combo = QComboBox()
+        for val, lbl in (("macos", "macOS Pointer"), ("ring", "Highlight Ring"), ("dot", "Minimal Dot")):
+            self.cur_style_combo.addItem(lbl, val)
+        self.cur_style_combo.currentIndexChanged.connect(
+            lambda: (not self._syncing_ui) and self._mut_nested("cursor", "style", self.cur_style_combo.currentData())
+        )
+        cs_row.addWidget(l_cs)
+        cs_row.addWidget(self.cur_style_combo, 1)
+        lay.addLayout(cs_row)
+
+        self.cur_sz_sld, _ = self._slider_row(lay, "Cursor Size", 70, 250, 125, "%", lambda v: self._mut_nested("cursor", "size", v / 100.0))
+        self.cur_sm_sld, _ = self._slider_row(lay, "Cursor Smoothing", 0, 100, 65, "%", lambda v: self._mut_nested("cursor", "smoothing", v))
+
+        lay.addWidget(self._sec_lbl("Dynamic Webcam Bubble"))
+        self.sw_wb_en = self._toggle_row(lay, "Show Webcam Bubble", False, lambda v: self._mut_nested("webcam", "enabled", v))
+        wb_file_row = QHBoxLayout()
+        self.wb_lbl = QLabel("No webcam video")
+        self.wb_lbl.setObjectName("dim")
+        b_wb = QPushButton("Choose...")
+        b_wb.clicked.connect(self._pick_webcam_video)
+        wb_file_row.addWidget(self.wb_lbl, 1)
+        wb_file_row.addWidget(b_wb)
+        lay.addLayout(wb_file_row)
+
+        wc_row = QHBoxLayout()
+        l_wc = QLabel("Corner")
+        l_wc.setObjectName("muted")
+        self.wb_corner_combo = QComboBox()
+        for val, lbl in (("br", "Bottom Right"), ("bl", "Bottom Left"), ("tr", "Top Right"), ("tl", "Top Left")):
+            self.wb_corner_combo.addItem(lbl, val)
+        self.wb_corner_combo.currentIndexChanged.connect(
+            lambda: (not self._syncing_ui) and self._mut_nested("webcam", "corner", self.wb_corner_combo.currentData())
+        )
+        wc_row.addWidget(l_wc)
+        wc_row.addWidget(self.wb_corner_combo, 1)
+        lay.addLayout(wc_row)
+
+        self.wb_sz_sld, _ = self._slider_row(lay, "Bubble Size", 10, 35, 20, "%", lambda v: self._mut_nested("webcam", "size", v))
+        self.wb_rnd_sld, _ = self._slider_row(lay, "Roundness", 0, 100, 100, "%", lambda v: self._mut_nested("webcam", "roundness", v))
+        self.sw_wb_shd = self._toggle_row(lay, "Bubble Shadow", True, lambda v: self._mut_nested("webcam", "shadow", v))
+        self.sw_wb_shrink = self._toggle_row(lay, "Auto-shrink on Zoom", True, lambda v: self._mut_nested("webcam", "shrink_on_zoom", v))
+
+        lay.addWidget(self._sec_lbl("Audio Track"))
+        au_row = QHBoxLayout()
+        self.au_lbl = QLabel("No audio overlay")
+        self.au_lbl.setObjectName("dim")
+        b_au = QPushButton("Add Audio...")
+        b_au.clicked.connect(self._pick_audio_overlay)
+        b_au_clr = QPushButton("×")
+        b_au_clr.setFixedWidth(28)
+        b_au_clr.clicked.connect(self._clear_audio_overlay)
+        au_row.addWidget(self.au_lbl, 1)
+        au_row.addWidget(b_au)
+        au_row.addWidget(b_au_clr)
+        lay.addLayout(au_row)
+
+        self.au_vol_sld, _ = self._slider_row(lay, "Overlay Volume", 0, 150, 75, "%", lambda v: self._mut_nested("audio", "overlay_volume", v / 100.0))
+        self.sw_au_mute = self._toggle_row(lay, "Mute Source Audio", False, lambda v: self._mut_nested("audio", "mute_source", v))
+
+        lay.addStretch()
+        return self._scroll_wrap(inner)
+
+    # ---------------- Inspector Tab 2: Selected Timeline Item ----------------
+    def _build_item_tab(self) -> QWidget:
+        inner = QWidget()
+        self.item_lay = QVBoxLayout(inner)
+        self.item_lay.setContentsMargins(2, 4, 6, 8)
+        self.item_lay.setSpacing(10)
+        self._rebuild_item_inspector()
+        return self._scroll_wrap(inner)
+
+    def _rebuild_item_inspector(self):
+        while self.item_lay.count():
+            it = self.item_lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+
+        item = self._get_selected_item()
+        if item is None:
+            l = QLabel("Select a Zoom, Trim Cut, Speed, or Overlay block on the timeline to edit it.")
+            l.setObjectName("muted")
+            l.setWordWrap(True)
+            self.item_lay.addWidget(l)
+            self.item_lay.addStretch()
+            self.del_btn.setEnabled(False)
+            self.preview.set_reticle(None)
+            return
+
+        self.del_btn.setEnabled(True)
+        tk = self.sel_track
+        titles = {"zooms": "Zoom Region", "trims": "Trim Cut (Removed)", "speeds": "Speed Region", "annotations": "Overlay Annotation"}
+        self.item_lay.addWidget(self._sec_lbl(titles.get(tk, "Item")))
+
+        # Start / End spinboxes
+        dur = max(0.5, float(self.proj.get("duration", 10.0)))
+        se_grid = QGridLayout()
+        s_spin = QDoubleSpinBox()
+        s_spin.setRange(0.0, dur)
+        s_spin.setSingleStep(0.1)
+        s_spin.setSuffix(" s")
+        s_spin.setValue(float(item.get("start", 0.0)))
+
+        e_spin = QDoubleSpinBox()
+        e_spin.setRange(0.1, dur)
+        e_spin.setSingleStep(0.1)
+        e_spin.setSuffix(" s")
+        e_spin.setValue(float(item.get("end", 1.0)))
+
+        def _on_start(v):
+            item["start"] = round(min(v, float(item["end"]) - 0.1), 2)
+            self.timeline.update()
+            self._schedule_render()
+
+        def _on_end(v):
+            item["end"] = round(max(v, float(item["start"]) + 0.1), 2)
+            self.timeline.update()
+            self._schedule_render()
+
+        s_spin.valueChanged.connect(_on_start)
+        e_spin.valueChanged.connect(_on_end)
+        se_grid.addWidget(QLabel("Start"), 0, 0)
+        se_grid.addWidget(s_spin, 1, 0)
+        se_grid.addWidget(QLabel("End"), 0, 1)
+        se_grid.addWidget(e_spin, 1, 1)
+        self.item_lay.addLayout(se_grid)
+
+        if tk == "zooms":
+            self._slider_row(
+                self.item_lay, "Zoom Depth", 110, 350, int(float(item.get("depth", 1.75)) * 100), "%",
+                lambda v: self._mut_item(item, "depth", round(v / 100.0, 2)),
+            )
+            self._slider_row(
+                self.item_lay, "Focus X", 0, 100, int(float(item.get("x", 0.5)) * 100), "%",
+                lambda v: self._mut_item_focus(item, "x", v / 100.0),
+            )
+            self._slider_row(
+                self.item_lay, "Focus Y", 0, 100, int(float(item.get("y", 0.5)) * 100), "%",
+                lambda v: self._mut_item_focus(item, "y", v / 100.0),
+            )
+            tip = QLabel("Tip: Click anywhere on the preview canvas to aim this zoom.")
+            tip.setObjectName("dim")
+            tip.setWordWrap(True)
+            self.item_lay.addWidget(tip)
+            self.preview.set_reticle((float(item.get("x", 0.5)), float(item.get("y", 0.5))), f"Zoom {float(item.get('depth', 1.75)):.1f}x")
+
+        elif tk == "speeds":
+            presets = QHBoxLayout()
+            presets.setSpacing(4)
+            for r in (0.5, 0.75, 1.5, 2.0, 3.0, 4.0):
+                b = QPushButton(f"{r:g}x")
+                b.clicked.connect(lambda _c=False, rate=r: (self._mut_item(item, "rate", rate), self._rebuild_item_inspector()))
+                presets.addWidget(b)
+            self.item_lay.addLayout(presets)
+            self._slider_row(
+                self.item_lay, "Speed Multiplier", 25, 400, int(float(item.get("rate", 2.0)) * 100), "%",
+                lambda v: self._mut_item(item, "rate", round(v / 100.0, 2)),
+            )
+            self.preview.set_reticle(None)
+
+        elif tk == "annotations":
+            kind = item.get("kind", "text")
+            if kind == "text":
+                t_edit = QLineEdit(item.get("text", "Note"))
+                t_edit.textChanged.connect(lambda txt: self._mut_item(item, "text", txt))
+                self.item_lay.addWidget(QLabel("Label Text"))
+                self.item_lay.addWidget(t_edit)
+                self._slider_row(
+                    self.item_lay, "Font Size", 16, 72, int(item.get("font_size", 32)), "px",
+                    lambda v: self._mut_item(item, "font_size", v),
+                )
+            elif kind == "image":
+                b_img = QPushButton("Choose Overlay Image...")
+                b_img.clicked.connect(lambda: self._pick_ann_image(item))
+                self.item_lay.addWidget(b_img)
+
+            if kind in ("text", "box", "arrow"):
+                cr = QHBoxLayout()
+                bc = QPushButton("Accent / Text Color")
+                bc.clicked.connect(lambda: self._pick_ann_color(item, "color"))
+                cr.addWidget(bc)
+                if kind == "text":
+                    bb = QPushButton("Pill BG")
+                    bb.clicked.connect(lambda: self._pick_ann_color(item, "bg"))
+                    cr.addWidget(bb)
+                self.item_lay.addLayout(cr)
+
+            if kind != "text":
+                self._slider_row(self.item_lay, "Width", 5, 80, int(float(item.get("w", 0.22)) * 100), "%", lambda v: self._mut_item(item, "w", v / 100.0))
+                self._slider_row(self.item_lay, "Height", 5, 80, int(float(item.get("h", 0.12)) * 100), "%", lambda v: self._mut_item(item, "h", v / 100.0))
+
+            tip = QLabel("Tip: Click anywhere on the preview canvas to position this overlay.")
+            tip.setObjectName("dim")
+            tip.setWordWrap(True)
+            self.item_lay.addWidget(tip)
+            self.preview.set_reticle((float(item.get("x", 0.5)), float(item.get("y", 0.25))), kind.title())
+        else:
+            self.preview.set_reticle(None)
+
+        b_del = QPushButton("Delete Selected Item")
+        b_del.setObjectName("dangerBtn")
+        b_del.clicked.connect(self._delete_selected)
+        self.item_lay.addWidget(b_del)
+        self.item_lay.addStretch()
+
+    # ---------------- Inspector Tab 3: Export ----------------
+    def _build_export_tab(self) -> QWidget:
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(2, 4, 6, 8)
+        lay.setSpacing(10)
+
+        lay.addWidget(self._sec_lbl("Export Settings"))
+
+        self.exp_fmt = QComboBox()
+        self.exp_fmt.addItem("MP4 Video (H.264 + AAC)", "mp4")
+        self.exp_fmt.addItem("Animated GIF (Palette)", "gif")
+        self.exp_fmt.currentIndexChanged.connect(lambda: self._mut_export("format", self.exp_fmt.currentData()))
+
+        self.exp_res = QComboBox()
+        for val, lbl in (("720p", "720p HD"), ("1080p", "1080p Full HD"), ("1440p", "1440p QHD"), ("4k", "4K UHD")):
+            self.exp_res.addItem(lbl, val)
+        self.exp_res.currentIndexChanged.connect(lambda: self._mut_export("resolution", self.exp_res.currentData()))
+
+        self.exp_fps = QComboBox()
+        self.exp_fps.addItem("30 fps", 30)
+        self.exp_fps.addItem("60 fps", 60)
+        self.exp_fps.currentIndexChanged.connect(lambda: self._mut_export("fps", self.exp_fps.currentData()))
+
+        self.exp_qual = QComboBox()
+        for val, lbl in (("high", "High Quality (CRF 17)"), ("balanced", "Balanced (CRF 20)"), ("compact", "Compact (CRF 24)")):
+            self.exp_qual.addItem(lbl, val)
+        self.exp_qual.currentIndexChanged.connect(lambda: self._mut_export("quality", self.exp_qual.currentData()))
+
+        for lbl, w in (("Format", self.exp_fmt), ("Resolution", self.exp_res), ("Framerate", self.exp_fps), ("Quality", self.exp_qual)):
+            tl = QLabel(lbl)
+            tl.setObjectName("muted")
+            lay.addWidget(tl)
+            lay.addWidget(w)
+
+        self.exp_summary = QLabel("1920 × 1080 · 00:10.0")
+        self.exp_summary.setObjectName("monoTag")
+        self.exp_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.exp_summary)
+
+        self.exp_prog = QProgressBar()
+        self.exp_prog.setRange(0, 100)
+        self.exp_prog.hide()
+        lay.addWidget(self.exp_prog)
+
+        self.exp_status = QLabel("")
+        self.exp_status.setObjectName("muted")
+        self.exp_status.setWordWrap(True)
+        lay.addWidget(self.exp_status)
+
+        self.exp_btn = QPushButton("Export Video")
+        self.exp_btn.setObjectName("recBtn")
+        self.exp_btn.setFixedHeight(36)
+        self.exp_btn.clicked.connect(self._start_export)
+        lay.addWidget(self.exp_btn)
+
+        self.exp_cancel_btn = QPushButton("Cancel Export")
+        self.exp_cancel_btn.setObjectName("dangerBtn")
+        self.exp_cancel_btn.hide()
+        self.exp_cancel_btn.clicked.connect(self._cancel_export)
+        lay.addWidget(self.exp_cancel_btn)
+
+        lay.addStretch()
+        return self._scroll_wrap(inner)
+
+    # ---------------- Load / Save Project & Media ----------------
+    def load_media_or_project(self, path: str):
+        p = Path(path)
+        if not p.is_file():
+            self.toast_requested.emit(f"File not found: {p.name}")
+            return
+
+        if p.suffix.lower() == ".recproj":
+            self.proj = ENG.load_project(str(p))
+            self.project_path = str(p)
+        elif p.suffix.lower() == ".cast":
+            # Render raw unframed MP4 once via cast2mp4 so Studio Editor can edit any .cast clip!
+            raw_mp4 = str(p.with_suffix(".studio_src.mp4"))
+            self.toast_requested.emit("Preparing .cast for Studio...")
+            QApplication.processEvents()
+            res = subprocess.run(
+                ["cast2mp4", "--no-frame", "--res", "1080p", str(p), raw_mp4],
+                capture_output=True, text=True,
+            )
+            if res.returncode != 0 or not os.path.isfile(raw_mp4):
+                QMessageBox.warning(self, "Import .cast", f"Could not render .cast:\n{res.stderr}")
+                return
+            self.proj = ENG.default_project(raw_mp4)
+            self.project_path = ""
+        else:
+            self.proj = ENG.default_project(str(p))
+            self.project_path = ""
+
+        self._frame_cache.clear()
+        self._webcam_cache.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.cur_t = 0.0
+        self.sel_track = ""
+        self.sel_id = ""
+        self.file_badge.setText(p.name[:28])
+        self._sync_ui_from_project()
+        self._render_preview_now()
+        self.toast_requested.emit(f"Loaded {p.name}")
+
+    def _open_media_dialog(self):
+        vdir = self._video_dir_getter()
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Open Video or Cast", vdir, "Media (*.mp4 *.mkv *.webm *.mov *.cast);;All Files (*)"
+        )
+        if fn:
+            self.load_media_or_project(fn)
+
+    def _open_project_dialog(self):
+        vdir = self._video_dir_getter()
+        fn, _ = QFileDialog.getOpenFileName(self, "Open Studio Project", vdir, "rec-cli Project (*.recproj)")
+        if fn:
+            self.load_media_or_project(fn)
+
+    def _save_project_dialog(self):
+        default_p = self.project_path
+        if not default_p:
+            src = self.proj.get("source", "")
+            base = Path(src).stem if src else f"project_{time.strftime('%Y%m%d-%H%M%S')}"
+            default_p = str(Path(self._video_dir_getter()) / f"{base}.recproj")
+        fn, _ = QFileDialog.getSaveFileName(self, "Save Studio Project", default_p, "rec-cli Project (*.recproj)")
+        if fn:
+            if not fn.endswith(".recproj"):
+                fn += ".recproj"
+            ENG.save_project(self.proj, fn)
+            self.project_path = fn
+            self.toast_requested.emit(f"Saved {Path(fn).name}")
+
+    # ---------------- Undo / Redo & Mutations ----------------
+    def _push_undo(self):
+        self._undo_stack.append(copy.deepcopy(self.proj))
+        if len(self._undo_stack) > 30:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(copy.deepcopy(self.proj))
+        self.proj = self._undo_stack.pop()
+        self._sync_ui_from_project()
+        self._schedule_render()
+        self.toast_requested.emit("Undo")
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(copy.deepcopy(self.proj))
+        self.proj = self._redo_stack.pop()
+        self._sync_ui_from_project()
+        self._schedule_render()
+        self.toast_requested.emit("Redo")
+
+    def _set_aspect_ratio(self, ar: str):
+        self._push_undo()
+        self.proj["aspect_ratio"] = ar
+        self._sync_ui_from_project()
+        self._schedule_render()
+
+    def _set_bg_type(self, btype: str):
+        self._push_undo()
+        self.proj["background"]["type"] = btype
+        self._sync_ui_from_project()
+        self._schedule_render()
+
+    def _set_bg_preset(self, key: str):
+        self._push_undo()
+        self.proj["background"]["type"] = "preset"
+        self.proj["background"]["preset"] = key
+        self._sync_ui_from_project()
+        self._schedule_render()
+
+    def _pick_bg_color(self, key: str):
+        cur = QColor(self.proj["background"].get(key, "#0f172a"))
+        col = QColorDialog.getColor(cur, self, "Choose Background Color")
+        if col.isValid():
+            self._push_undo()
+            self.proj["background"][key] = col.name()
+            if self.proj["background"]["type"] == "preset":
+                self.proj["background"]["type"] = "gradient"
+            self._sync_ui_from_project()
+            self._schedule_render()
+
+    def _pick_bg_image(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Choose Wallpaper Image", str(Path.home()), "Images (*.png *.jpg *.jpeg *.webp)")
+        if fn:
+            self._push_undo()
+            self.proj["background"]["type"] = "image"
+            self.proj["background"]["image"] = fn
+            self._sync_ui_from_project()
+            self._schedule_render()
+
+    def _mut_bg(self, key: str, val):
+        self.proj["background"][key] = val
+        self._schedule_render()
+
+    def _mut_frame(self, key: str, val):
+        self.proj["frame"][key] = val
+        self._schedule_render()
+
+    def _mut_nested(self, section: str, key: str, val):
+        self.proj[section][key] = val
+        self._schedule_render()
+
+    def _mut_export(self, key: str, val):
+        if self._syncing_ui:
+            return
+        self.proj["export"][key] = val
+        self._update_export_summary()
+
+    def _mut_item(self, item: dict, key: str, val):
+        item[key] = val
+        self.timeline.update()
+        self._schedule_render()
+
+    def _mut_item_focus(self, item: dict, key: str, val: float):
+        item[key] = round(val, 3)
+        self.preview.set_reticle((float(item.get("x", 0.5)), float(item.get("y", 0.5))), f"Zoom {float(item.get('depth', 1.75)):.1f}x")
+        self._schedule_render()
+
+    def _pick_webcam_video(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Choose Webcam Video", self._video_dir_getter(), "Video (*.mp4 *.mkv *.webm *.mov)")
+        if fn:
+            self._push_undo()
+            self.proj["webcam"]["path"] = fn
+            self.proj["webcam"]["enabled"] = True
+            self._webcam_cache.clear()
+            self._sync_ui_from_project()
+            self._schedule_render()
+
+    def _pick_audio_overlay(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Choose Audio Track", str(Path.home()), "Audio (*.mp3 *.wav *.m4a *.ogg *.flac)")
+        if fn:
+            self._push_undo()
+            self.proj["audio"]["overlay_path"] = fn
+            self._sync_ui_from_project()
+            self.timeline.update()
+
+    def _clear_audio_overlay(self):
+        self._push_undo()
+        self.proj["audio"]["overlay_path"] = ""
+        self._sync_ui_from_project()
+        self.timeline.update()
+
+    def _pick_ann_color(self, item: dict, key: str):
+        col = QColorDialog.getColor(QColor(item.get(key, "#e5484d")), self, "Choose Color")
+        if col.isValid():
+            item[key] = col.name()
+            self._schedule_render()
+
+    def _pick_ann_image(self, item: dict):
+        fn, _ = QFileDialog.getOpenFileName(self, "Choose Overlay Image", str(Path.home()), "Images (*.png *.jpg *.jpeg *.webp)")
+        if fn:
+            item["image_path"] = fn
+            self._schedule_render()
+
+    # ---------------- Timeline Item Operations ----------------
+    def _get_selected_item(self) -> dict | None:
+        if not self.sel_track or not self.sel_id:
+            return None
+        for it in self.proj.get(self.sel_track, []):
+            if it.get("id") == self.sel_id:
+                return it
+        return None
+
+    def _select_and_focus(self, track: str, item_id: str):
+        self.sel_track = track
+        self.sel_id = item_id
+        self.timeline.set_selection(track, item_id)
+        self._rebuild_item_inspector()
+        self._switch_inspector_tab(2)
+        self._schedule_render()
+
+    def _add_zoom(self):
+        self._push_undo()
+        dur = max(0.5, float(self.proj.get("duration", 10.0)))
+        s = round(min(self.cur_t, max(0.0, dur - 0.8)), 2)
+        e = round(min(dur, s + min(2.5, dur * 0.35)), 2)
+        item = {"id": ENG.new_id("zoom"), "start": s, "end": e, "depth": 1.8, "x": 0.5, "y": 0.5, "auto": False}
+        self.proj["zooms"].append(item)
+        self.timeline.set_project(self.proj)
+        self._select_and_focus("zooms", item["id"])
+
+    def _add_trim(self):
+        self._push_undo()
+        dur = max(0.5, float(self.proj.get("duration", 10.0)))
+        s = round(min(self.cur_t, max(0.0, dur - 0.5)), 2)
+        e = round(min(dur, s + min(1.5, dur * 0.2)), 2)
+        item = {"id": ENG.new_id("trim"), "start": s, "end": e}
+        self.proj["trims"].append(item)
+        self.timeline.set_project(self.proj)
+        self._select_and_focus("trims", item["id"])
+        self._update_export_summary()
+
+    def _add_speed(self):
+        self._push_undo()
+        dur = max(0.5, float(self.proj.get("duration", 10.0)))
+        s = round(min(self.cur_t, max(0.0, dur - 0.6)), 2)
+        e = round(min(dur, s + min(3.0, dur * 0.35)), 2)
+        item = {"id": ENG.new_id("spd"), "start": s, "end": e, "rate": 2.0}
+        self.proj["speeds"].append(item)
+        self.timeline.set_project(self.proj)
+        self._select_and_focus("speeds", item["id"])
+        self._update_export_summary()
+
+    def _add_annotation(self, kind: str):
+        self._push_undo()
+        dur = max(0.5, float(self.proj.get("duration", 10.0)))
+        s = round(min(self.cur_t, max(0.0, dur - 0.6)), 2)
+        e = round(min(dur, s + min(3.0, dur * 0.35)), 2)
+        item = {
+            "id": ENG.new_id("ann"), "kind": kind, "start": s, "end": e,
+            "x": 0.5, "y": 0.22 if kind == "text" else 0.5,
+            "w": 0.24, "h": 0.14,
+            "text": "Callout" if kind == "text" else "",
+            "color": "#f2f2f5" if kind == "text" else "#e5484d",
+            "bg": "#141418", "font_size": 32, "image_path": "",
+        }
+        if kind == "image":
+            self._pick_ann_image(item)
+        self.proj["annotations"].append(item)
+        self.timeline.set_project(self.proj)
+        self._select_and_focus("annotations", item["id"])
+
+    def _delete_selected(self):
+        if not self.sel_track or not self.sel_id:
+            return
+        self._push_undo()
+        self.proj[self.sel_track] = [x for x in self.proj.get(self.sel_track, []) if x.get("id") != self.sel_id]
+        self.sel_track = ""
+        self.sel_id = ""
+        self.timeline.set_selection("", "")
+        self.timeline.set_project(self.proj)
+        self._rebuild_item_inspector()
+        self._update_export_summary()
+        self._schedule_render()
+
+    def _run_auto_zoom(self):
+        if not self.proj.get("source"):
+            self.toast_requested.emit("Open a video first")
+            return
+        self._push_undo()
+        self.toast_requested.emit("Analyzing motion for Auto-Zoom...")
+        QApplication.processEvents()
+        new_z = ENG.generate_auto_zooms(self.proj)
+        # Keep manual zooms, replace previous auto zooms
+        manual = [z for z in self.proj.get("zooms", []) if not z.get("auto")]
+        self.proj["zooms"] = manual + new_z
+        self.timeline.set_project(self.proj)
+        self._schedule_render()
+        self.toast_requested.emit(f"Added {len(new_z)} Auto-Zoom region(s)")
+
+    # ---------------- Preview Playback & Canvas Interaction ----------------
+    def _on_canvas_point_picked(self, nx: float, ny: float):
+        item = self._get_selected_item()
+        if item is not None and self.sel_track in ("zooms", "annotations"):
+            item["x"] = round(nx, 3)
+            item["y"] = round(ny, 3)
+            self._rebuild_item_inspector()
+            self._schedule_render()
+
+    def _on_timeline_seek(self, t: float):
+        self.cur_t = max(0.0, min(float(self.proj.get("duration", 10.0)), t))
+        self._update_time_label()
+        self._schedule_render()
+
+    def _on_timeline_select(self, track: str, item_id: str):
+        self.sel_track = track
+        self.sel_id = item_id
+        self._rebuild_item_inspector()
+        if item_id:
+            self._switch_inspector_tab(2)
+        self._schedule_render()
+
+    def _on_timeline_mutated(self):
+        self._rebuild_item_inspector()
+        self._update_export_summary()
+        self._schedule_render()
+
+    def _toggle_play(self):
+        if not self.proj.get("source"):
+            return
+        self.playing = not self.playing
+        self.play_btn.setText("❚❚ Pause" if self.playing else "▶ Play")
+        if self.playing:
+            if self.cur_t >= float(self.proj.get("duration", 10.0)) - 0.05:
+                self.cur_t = 0.0
+            self._play_timer.start()
+        else:
+            self._play_timer.stop()
+
+    def _on_play_tick(self):
+        dur = float(self.proj.get("duration", 10.0))
+        self.cur_t += 0.066
+        if self.cur_t >= dur:
+            self.cur_t = dur
+            self.playing = False
+            self._play_timer.stop()
+            self.play_btn.setText("▶ Play")
+        self.timeline.set_time(self.cur_t)
+        self._update_time_label()
+        self._render_preview_now()
+
+    def _update_time_label(self):
+        dur = float(self.proj.get("duration", 0.0))
+        self.time_lbl.setText(f"{fmt_ts(self.cur_t)} / {fmt_ts(dur)}")
+
+    def _schedule_render(self):
+        self._render_debounce.start()
+
+    def _get_cached_src_frame(self, t: float) -> Image.Image | None:
+        src = self.proj.get("source", "")
+        if not src or not os.path.isfile(src):
+            return None
+        bucket = int(round(t * 15))
+        if bucket not in self._frame_cache:
+            img = ENG.extract_frame_pil(src, bucket / 15.0, max_w=800)
+            if img is None:
+                return None
+            if len(self._frame_cache) > 90:
+                self._frame_cache.pop(next(iter(self._frame_cache)))
+            self._frame_cache[bucket] = img
+        return self._frame_cache[bucket]
+
+    def _get_cached_webcam_frame(self, t: float) -> Image.Image | None:
+        wcfg = self.proj.get("webcam", {})
+        wpath = wcfg.get("path", "")
+        if not wcfg.get("enabled") or not wpath or not os.path.isfile(wpath):
+            return None
+        bucket = int(round(t * 10))
+        if bucket not in self._webcam_cache:
+            img = ENG.extract_frame_pil(wpath, bucket / 10.0, max_w=240)
+            if img is None:
+                return None
+            if len(self._webcam_cache) > 40:
+                self._webcam_cache.pop(next(iter(self._webcam_cache)))
+            self._webcam_cache[bucket] = img
+        return self._webcam_cache[bucket]
+
+    def _render_preview_now(self):
+        src_img = self._get_cached_src_frame(self.cur_t)
+        if src_img is None:
+            self.preview.set_frame(None)
+            return
+        pw, ph = ENG.compute_output_dims(self.proj, preview_max=760)
+        w_img = self._get_cached_webcam_frame(self.cur_t)
+        composed = self.compositor.compose(src_img, self.proj, self.cur_t, pw, ph, webcam_img=w_img)
+        self.preview.set_frame(pil_to_qpixmap(composed))
+
+    # ---------------- Sync UI Controls <-> Project Dict ----------------
+    def _select_combo(self, cb: QComboBox, target):
+        for i in range(cb.count()):
+            if str(cb.itemData(i)) == str(target):
+                cb.setCurrentIndex(i)
+                return
+
+    def _sync_ui_from_project(self):
+        self._syncing_ui = True
+        try:
+            ar = self.proj.get("aspect_ratio", "16:9")
+            for k, b in self._ar_btns.items():
+                b.setProperty("active", k == ar)
+                b.style().unpolish(b)
+                b.style().polish(b)
+
+            bg = self.proj.get("background", {})
+            btype = bg.get("type", "preset")
+            for k, b in self._bg_type_btns.items():
+                b.setProperty("active", k == btype)
+                b.style().unpolish(b)
+                b.style().polish(b)
+            for k, sw in self._swatches.items():
+                sw.set_selected(btype == "preset" and bg.get("preset") == k)
+            self.bg_presets_box.setVisible(btype == "preset")
+            self.c1_btn.setVisible(btype in ("gradient", "solid"))
+            self.c2_btn.setVisible(btype == "gradient")
+            self.img_btn.setVisible(btype == "image")
+            self.bg_blur_sld.setValue(int(bg.get("blur", 0)))
+
+            fr = self.proj.get("frame", {})
+            self.pad_sld.setValue(int(fr.get("padding", 7)))
+            self.rad_sld.setValue(int(fr.get("radius", 18)))
+            self.shd_sld.setValue(int(fr.get("shadow", 65)))
+            self._select_combo(self.chrome_combo, fr.get("chrome", "none"))
+            self.ct_sld.setValue(int(fr.get("crop_top", 0)))
+            self.cb_sld.setValue(int(fr.get("crop_bottom", 0)))
+            self.cl_sld.setValue(int(fr.get("crop_left", 0)))
+            self.cr_sld.setValue(int(fr.get("crop_right", 0)))
+
+            mot = self.proj.get("motion", {})
+            self._select_combo(self.spring_combo, mot.get("spring", "smooth"))
+            self.mblur_sld.setValue(int(mot.get("motion_blur", 20)))
+
+            cur = self.proj.get("cursor", {})
+            self.sw_cur_en.setChecked(bool(cur.get("enabled", False)))
+            self.sw_cur_bounce.setChecked(bool(cur.get("click_bounce", True)))
+            self.sw_cur_idle.setChecked(bool(cur.get("hide_idle", True)))
+            self._select_combo(self.cur_style_combo, cur.get("style", "macos"))
+            self.cur_sz_sld.setValue(int(float(cur.get("size", 1.25)) * 100))
+            self.cur_sm_sld.setValue(int(cur.get("smoothing", 65)))
+
+            wb = self.proj.get("webcam", {})
+            self.sw_wb_en.setChecked(bool(wb.get("enabled", False)))
+            self.wb_lbl.setText(Path(wb["path"]).name if wb.get("path") else "No webcam video")
+            self._select_combo(self.wb_corner_combo, wb.get("corner", "br"))
+            self.wb_sz_sld.setValue(int(wb.get("size", 20)))
+            self.wb_rnd_sld.setValue(int(wb.get("roundness", 100)))
+            self.sw_wb_shd.setChecked(bool(wb.get("shadow", True)))
+            self.sw_wb_shrink.setChecked(bool(wb.get("shrink_on_zoom", True)))
+
+            au = self.proj.get("audio", {})
+            self.au_lbl.setText(Path(au["overlay_path"]).name if au.get("overlay_path") else "No audio overlay")
+            self.au_vol_sld.setValue(int(float(au.get("overlay_volume", 0.75)) * 100))
+            self.sw_au_mute.setChecked(bool(au.get("mute_source", False)))
+
+            exp = self.proj.get("export", {})
+            self._select_combo(self.exp_fmt, exp.get("format", "mp4"))
+            self._select_combo(self.exp_res, exp.get("resolution", "1080p"))
+            self._select_combo(self.exp_fps, exp.get("fps", 30))
+            self._select_combo(self.exp_qual, exp.get("quality", "high"))
+
+            self.timeline.set_project(self.proj)
+            self.timeline.set_time(self.cur_t)
+            self._update_time_label()
+            self._update_export_summary()
+            self._rebuild_item_inspector()
+        finally:
+            self._syncing_ui = False
+
+    def _update_export_summary(self):
+        w, h = ENG.compute_output_dims(self.proj)
+        dur = ENG.output_duration(self.proj)
+        fmt = self.proj.get("export", {}).get("format", "mp4").upper()
+        fps = self.proj.get("export", {}).get("fps", 30)
+        self.exp_summary.setText(f"{w} × {h} · {fps}fps {fmt} · {fmt_ts(dur)}")
+
+    # ---------------- Export Pipeline ----------------
+    def _start_export(self):
+        if not self.proj.get("source"):
+            QMessageBox.information(self, "Export", "Load a video clip first.")
+            return
+        fmt = self.proj.get("export", {}).get("format", "mp4").lower()
+        stem = Path(self.proj["source"]).stem
+        default_out = str(Path(self._video_dir_getter()) / f"{stem}_edited.{fmt}")
+        flt = "MP4 Video (*.mp4)" if fmt == "mp4" else "Animated GIF (*.gif)"
+        out_path, _ = QFileDialog.getSaveFileName(self, "Export Studio Video", default_out, flt)
+        if not out_path:
+            return
+        if not out_path.lower().endswith(f".{fmt}"):
+            out_path += f".{fmt}"
+
+        self.exp_btn.setEnabled(False)
+        self.exp_cancel_btn.show()
+        self.exp_prog.setValue(0)
+        self.exp_prog.show()
+        self.exp_status.setText("Starting export...")
+
+        self._export_worker = ExportWorker(self.proj, out_path)
+        self._export_worker.progress.connect(self._on_export_progress)
+        self._export_worker.finished_export.connect(self._on_export_done)
+        self._export_worker.start()
+
+    def _cancel_export(self):
+        if self._export_worker is not None:
+            self._export_worker.cancel()
+            self.exp_status.setText("Canceling...")
+
+    def _on_export_progress(self, pct: int, msg: str):
+        self.exp_prog.setValue(pct)
+        self.exp_status.setText(msg)
+
+    def _on_export_done(self, ok: bool, msg: str):
+        self.exp_btn.setEnabled(True)
+        self.exp_cancel_btn.hide()
+        self._export_worker = None
+        if ok:
+            self.exp_prog.setValue(100)
+            self.exp_status.setText(f"Saved: {Path(msg).name}")
+            self.toast_requested.emit(f"Exported {Path(msg).name}")
+        else:
+            self.exp_status.setText(msg)
+            self.toast_requested.emit("Export stopped")
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("rec-cli Studio")
+    win = QMainWindow()
+    win.setWindowTitle("rec-cli Studio Editor")
+    win.resize(1220, 760)
+    ed = StudioEditorPage(lambda: str(Path.home() / "Videos/content"))
+    win.setCentralWidget(ed)
+
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args and os.path.isfile(args[0]):
+        ed.load_media_or_project(args[0])
+
+    if "--smoke-test" in sys.argv:
+        win.show()
+        app.processEvents()
+        win.close()
+        print("STUDIO_SMOKE_OK")
+        return 0
+
+    win.show()
+    return app.exec() if hasattr(app, "exec") else app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

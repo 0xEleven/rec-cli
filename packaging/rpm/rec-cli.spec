@@ -1,5 +1,5 @@
 Name:           rec-cli
-Version:        1.4.0
+Version:        2.0.0
 Release:        1%{?dist}
 Summary:        Smart terminal clip recorder CLI for Zsh, Bash, and Fish
 License:        MIT
@@ -24,11 +24,14 @@ or process you ran.
 %setup -q
 
 %install
-install -Dm755 bin/rec-cli    %{buildroot}%{_bindir}/rec-cli
-install -Dm755 bin/rec-pty    %{buildroot}%{_bindir}/rec-pty
-install -Dm755 bin/rec-gui    %{buildroot}%{_bindir}/rec-gui
-install -Dm755 bin/cast2mp4   %{buildroot}%{_bindir}/cast2mp4
-install -Dm755 bin/casts2mp4  %{buildroot}%{_bindir}/casts2mp4
+install -Dm755 bin/rec-cli           %{buildroot}%{_bindir}/rec-cli
+install -Dm755 bin/rec-pty           %{buildroot}%{_bindir}/rec-pty
+install -Dm755 bin/rec-gui           %{buildroot}%{_bindir}/rec-gui
+install -Dm755 bin/rec-studio-engine %{buildroot}%{_bindir}/rec-studio-engine
+install -Dm755 bin/rec-studio-editor %{buildroot}%{_bindir}/rec-studio-editor
+install -Dm755 bin/rec-capture       %{buildroot}%{_bindir}/rec-capture
+install -Dm755 bin/cast2mp4          %{buildroot}%{_bindir}/cast2mp4
+install -Dm755 bin/casts2mp4         %{buildroot}%{_bindir}/casts2mp4
 install -Dm644 shell/rec.zsh  %{buildroot}%{_datadir}/rec-cli/shell/rec.zsh
 install -Dm644 shell/rec.bash %{buildroot}%{_datadir}/rec-cli/shell/rec.bash
 install -Dm644 shell/rec.fish %{buildroot}%{_datadir}/rec-cli/shell/rec.fish
@@ -52,6 +55,9 @@ echo ""
 %{_bindir}/rec-cli
 %{_bindir}/rec-pty
 %{_bindir}/rec-gui
+%{_bindir}/rec-studio-engine
+%{_bindir}/rec-studio-editor
+%{_bindir}/rec-capture
 %{_bindir}/cast2mp4
 %{_bindir}/casts2mp4
 %{_datadir}/rec-cli/

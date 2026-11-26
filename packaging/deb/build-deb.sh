@@ -4,7 +4,7 @@ umask 022
 
 # Build a Debian/Ubuntu/Kali/Mint/Pop!_OS .deb package for rec-cli
 
-VERSION="${VERSION:-1.4.0}"
+VERSION="${VERSION:-2.0.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
@@ -20,11 +20,14 @@ mkdir -p "$PKG_ROOT/DEBIAN" \
          "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps" \
          "$PKG_ROOT/usr/share/doc/rec-cli"
 
-install -m 755 "$REPO_ROOT/bin/rec-cli"   "$PKG_ROOT/usr/bin/rec-cli"
-install -m 755 "$REPO_ROOT/bin/rec-pty"   "$PKG_ROOT/usr/bin/rec-pty"
-install -m 755 "$REPO_ROOT/bin/rec-gui"   "$PKG_ROOT/usr/bin/rec-gui"
-install -m 755 "$REPO_ROOT/bin/cast2mp4"  "$PKG_ROOT/usr/bin/cast2mp4"
-install -m 755 "$REPO_ROOT/bin/casts2mp4" "$PKG_ROOT/usr/bin/casts2mp4"
+install -m 755 "$REPO_ROOT/bin/rec-cli"           "$PKG_ROOT/usr/bin/rec-cli"
+install -m 755 "$REPO_ROOT/bin/rec-pty"           "$PKG_ROOT/usr/bin/rec-pty"
+install -m 755 "$REPO_ROOT/bin/rec-gui"           "$PKG_ROOT/usr/bin/rec-gui"
+install -m 755 "$REPO_ROOT/bin/rec-studio-engine" "$PKG_ROOT/usr/bin/rec-studio-engine"
+install -m 755 "$REPO_ROOT/bin/rec-studio-editor" "$PKG_ROOT/usr/bin/rec-studio-editor"
+install -m 755 "$REPO_ROOT/bin/rec-capture"       "$PKG_ROOT/usr/bin/rec-capture"
+install -m 755 "$REPO_ROOT/bin/cast2mp4"          "$PKG_ROOT/usr/bin/cast2mp4"
+install -m 755 "$REPO_ROOT/bin/casts2mp4"         "$PKG_ROOT/usr/bin/casts2mp4"
 
 install -m 644 "$REPO_ROOT/shell/rec.zsh"  "$PKG_ROOT/usr/share/rec-cli/shell/rec.zsh"
 install -m 644 "$REPO_ROOT/shell/rec.bash" "$PKG_ROOT/usr/share/rec-cli/shell/rec.bash"

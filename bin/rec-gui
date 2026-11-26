@@ -10,6 +10,8 @@ Clean monochrome Dark & Light UI with real-time detection of:
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shlex
@@ -68,7 +70,20 @@ except ImportError:
             )
             sys.exit(1)
 
-VERSION = "1.4.0"
+VERSION = "2.0.0"
+
+def _load_studio_ui():
+    here = Path(__file__).resolve().parent
+    for cand in (here / "rec-studio-editor", Path(shutil.which("rec-studio-editor") or "")):
+        if cand and cand.is_file():
+            loader = importlib.machinery.SourceFileLoader("rec_studio_editor", str(cand))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    return None
+
+STUDIO_UI = _load_studio_ui()
 
 CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "rec-cli"
 CONF_FILE = CONF_DIR / "config"
@@ -347,6 +362,20 @@ def make_nav_icon(kind: str, color_hex: str, size: int = 16) -> QIcon:
         p.setBrush(QColor(color_hex))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QRectF(6, 6, 4, 4))
+    elif kind == "screen":
+        # Monitor frame + stand
+        p.drawRoundedRect(QRectF(1.8, 2.2, 12.4, 8.6), 2.0, 2.0)
+        p.drawLine(QPointF(5.5, 13.4), QPointF(10.5, 13.4))
+        p.drawLine(QPointF(8.0, 10.8), QPointF(8.0, 13.4))
+    elif kind == "editor":
+        # Timeline / cut filmstrip icon
+        p.drawRoundedRect(QRectF(2.0, 2.5, 12.0, 11.0), 2.2, 2.2)
+        p.drawLine(QPointF(2.2, 6.5), QPointF(13.8, 6.5))
+        p.drawLine(QPointF(2.2, 10.0), QPointF(13.8, 10.0))
+        p.setBrush(QColor(color_hex))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(4.2, 7.3, 4.8, 1.9), 0.9, 0.9)
+        p.drawRoundedRect(QRectF(6.8, 10.8, 4.8, 1.9), 0.9, 0.9)
     elif kind == "terminals":
         # Terminal box with >_
         p.drawRoundedRect(QRectF(2, 2.5, 12, 11), 2.5, 2.5)
@@ -595,13 +624,57 @@ def build_stylesheet(mode: str) -> str:
         background-color: {t['rec']};
         color: #ffffff;
     }}
-    QLineEdit, QComboBox {{
+    QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{
         background-color: {t['surface_alt']};
         color: {t['text']};
         border: 1px solid {t['border']};
         border-radius: 7px;
-        padding: 6px 10px;
-        font-size: 13px;
+        padding: 5px 9px;
+        font-size: 12px;
+    }}
+    QSlider::groove:horizontal {{
+        height: 4px;
+        background: {t['border_strong']};
+        border-radius: 2px;
+    }}
+    QSlider::sub-page:horizontal {{
+        background: {t['primary_bg']};
+        border-radius: 2px;
+    }}
+    QSlider::handle:horizontal {{
+        background: {t['primary_bg']};
+        border: 2px solid {t['surface']};
+        width: 13px;
+        height: 13px;
+        margin: -5px 0;
+        border-radius: 7px;
+    }}
+    QProgressBar {{
+        background-color: {t['surface_alt']};
+        border: 1px solid {t['border']};
+        border-radius: 6px;
+        height: 12px;
+        text-align: center;
+        color: {t['text']};
+        font-size: 10px;
+    }}
+    QProgressBar::chunk {{
+        background-color: {t['rec']};
+        border-radius: 5px;
+    }}
+    QMenu {{
+        background-color: {t['surface']};
+        color: {t['text']};
+        border: 1px solid {t['border_strong']};
+        border-radius: 8px;
+        padding: 4px;
+    }}
+    QMenu::item {{
+        padding: 6px 14px;
+        border-radius: 5px;
+    }}
+    QMenu::item:selected {{
+        background-color: {t['surface_hover']};
     }}
     QComboBox {{
         padding-right: 28px;
@@ -1098,9 +1171,9 @@ class RecGuiWindow(QMainWindow):
         self.last_clips_sig = None
         self.running_counts: dict[str, int] = {}
 
-        self.setWindowTitle("rec-cli")
-        self.setMinimumSize(920, 560)
-        self.resize(1040, 640)
+        self.setWindowTitle("rec-cli Studio")
+        self.setMinimumSize(1020, 620)
+        self.resize(1240, 760)
         self.setWindowIcon(QIcon(make_logo_pixmap(48, dark=True)))
 
         self._build_ui()
@@ -1168,6 +1241,8 @@ class RecGuiWindow(QMainWindow):
         # Navigation items
         self.nav_defs = [
             ("sessions", "Sessions"),
+            ("screen", "Screen Rec"),
+            ("editor", "Studio Editor"),
             ("terminals", "Terminals"),
             ("clips", "Clips"),
             ("settings", "Settings"),
@@ -1246,10 +1321,28 @@ class RecGuiWindow(QMainWindow):
         # ---- Main Content Area ----
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_sessions_page())
+
+        if STUDIO_UI is not None:
+            vdir_fn = lambda: self.cfg.get("REC_VIDEO_DIR", str(Path.home() / "Videos/content"))
+            self.screen_page = STUDIO_UI.ScreenRecorderPage(vdir_fn)
+            self.screen_page.recording_finished.connect(self._open_in_editor)
+            self.editor_page = STUDIO_UI.StudioEditorPage(vdir_fn)
+            self.editor_page.toast_requested.connect(self._show_toast)
+        else:
+            self.screen_page = QLabel("rec-studio-editor not found")
+            self.editor_page = QLabel("rec-studio-editor not found")
+
+        self.stack.addWidget(self.screen_page)
+        self.stack.addWidget(self.editor_page)
         self.stack.addWidget(self._build_terminals_page())
         self.stack.addWidget(self._build_clips_page())
         self.stack.addWidget(self._build_settings_page())
         outer.addWidget(self.stack, 1)
+
+    def _open_in_editor(self, path: str):
+        if STUDIO_UI is not None and hasattr(self.editor_page, "load_media_or_project"):
+            self._switch_page(2)
+            self.editor_page.load_media_or_project(str(path))
 
     def _switch_page(self, idx: int):
         self.stack.setCurrentIndex(idx)
@@ -1258,9 +1351,9 @@ class RecGuiWindow(QMainWindow):
             b.style().unpolish(b)
             b.style().polish(b)
         self._update_nav_icons()
-        if idx in (0, 1):
+        if idx in (0, 3):
             self._refresh_sessions(force=True)
-        elif idx == 2:
+        elif idx == 4:
             self._refresh_clips(force=True)
 
     # ---------------- Page 0: Live & Running Terminals ----------------
@@ -1592,6 +1685,10 @@ class RecGuiWindow(QMainWindow):
             sw.set_theme(self.ui_mode, accent_red=red)
         for cb in self.combos:
             cb.set_theme(self.ui_mode)
+        if hasattr(self, "screen_page") and hasattr(self.screen_page, "set_theme"):
+            self.screen_page.set_theme(self.ui_mode)
+        if hasattr(self, "editor_page") and hasattr(self.editor_page, "set_theme"):
+            self.editor_page.set_theme(self.ui_mode)
         self._update_nav_icons()
 
     def _set_theme(self, mode: str):
@@ -1796,7 +1893,7 @@ class RecGuiWindow(QMainWindow):
     # ---------------- Periodic Refresh ----------------
     def _on_tick(self):
         self._refresh_sessions(force=False)
-        if self.stack.currentIndex() == 2:
+        if self.stack.currentIndex() == 4:
             self._refresh_clips(force=False)
 
     def _clear_layout(self, layout: QVBoxLayout):
@@ -2093,7 +2190,7 @@ class RecGuiWindow(QMainWindow):
 
         total_bytes = sum(s for _, s, _ in sig)
         self.clips_title.setText(f"Clips  ({len(mp4s)} · {fmt_size(total_bytes)})" if mp4s else "Clips")
-        self.nav_btns[2].setText(f"  Clips ({len(mp4s)})" if mp4s else "  Clips")
+        self.nav_btns[4].setText(f"  Clips ({len(mp4s)})" if mp4s else "  Clips")
 
         self._clear_layout(self.clips_lay)
 
@@ -2129,6 +2226,9 @@ class RecGuiWindow(QMainWindow):
             info.addWidget(meta_lbl)
             rl.addLayout(info, 1)
 
+            b_edit = QPushButton("Edit")
+            b_edit.setObjectName("recBtn")
+            b_edit.clicked.connect(lambda _c=False, path=p: self._open_in_editor(str(path)))
             b_play = QPushButton("Play")
             b_play.setObjectName("primaryBtn")
             b_play.clicked.connect(lambda _c=False, path=p: self._play_clip(path))
@@ -2140,7 +2240,7 @@ class RecGuiWindow(QMainWindow):
             b_del.setObjectName("dangerBtn")
             b_del.clicked.connect(lambda _c=False, path=p: self._delete_clip(path))
 
-            for b in (b_play, b_gif, b_thumb, b_del):
+            for b in (b_edit, b_play, b_gif, b_thumb, b_del):
                 rl.addWidget(b)
             self.clips_lay.addWidget(card)
 
@@ -2151,8 +2251,17 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("rec-cli")
     win = RecGuiWindow()
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args and os.path.isfile(args[0]):
+        win._open_in_editor(args[0])
+    elif "--editor" in sys.argv:
+        win._switch_page(2)
+    elif "--screen" in sys.argv:
+        win._switch_page(1)
     if "--smoke-test" in sys.argv:
         win.show()
+        win._switch_page(1)
+        win._switch_page(2)
         win._toggle_theme()
         win._toggle_theme()
         app.processEvents()

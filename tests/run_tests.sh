@@ -25,18 +25,20 @@ if command -v fish >/dev/null 2>&1; then
   echo "PASS: fish syntax OK"
 fi
 
-echo "=== 2. rec-cli init, rec-pty & rec-gui checks ==="
-python3 -m py_compile "$REPO_ROOT/bin/rec-pty" "$REPO_ROOT/bin/rec-gui"
-rec-cli version | grep -q "rec-cli 1.4.0"
+echo "=== 2. rec-cli init, rec-pty, rec-gui & Studio v2.0.0 checks ==="
+python3 -m py_compile "$REPO_ROOT/bin/rec-pty" "$REPO_ROOT/bin/rec-gui" "$REPO_ROOT/bin/rec-studio-engine" "$REPO_ROOT/bin/rec-studio-editor" "$REPO_ROOT/bin/rec-capture"
+rec-cli version | grep -q "rec-cli 2.0.0"
 rec-cli init zsh  | grep -q "_rec_is_allowed_terminal"
 rec-cli init bash | grep -q "_rec_bash_preexec"
 rec-cli init fish | grep -q "_rec_fish_preexec"
+"$REPO_ROOT/bin/rec-capture" --probe | grep -q '"backend"'
 XDG_CONFIG_HOME="$(mktemp -d)" rec-cli config auto | grep -q "Resolution set to auto"
 if python3 -c "import PyQt6" 2>/dev/null || python3 -c "import PySide6" 2>/dev/null || python3 -c "import PyQt5" 2>/dev/null; then
   QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME="" XDG_CURRENT_DESKTOP="" GNOME_DESKTOP_SESSION_ID="" XDG_CONFIG_HOME="$(mktemp -d)" "$REPO_ROOT/bin/rec-gui" --smoke-test | grep -q "SMOKE_OK"
-  echo "PASS: rec-gui Qt smoke test (dark/light theme toggle + UI init) OK"
+  QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME="" XDG_CURRENT_DESKTOP="" GNOME_DESKTOP_SESSION_ID="" XDG_CONFIG_HOME="$(mktemp -d)" "$REPO_ROOT/bin/rec-studio-editor" --smoke-test | grep -q "STUDIO_SMOKE_OK"
+  echo "PASS: rec-gui & Studio Editor Qt smoke tests (dark/light + screen + editor) OK"
 fi
-echo "PASS: rec-pty/rec-gui compile, rec-cli init & config auto work for zsh, bash, fish"
+echo "PASS: rec-pty/rec-gui/studio compile, rec-capture probe, rec-cli init & config auto work"
 
 echo "=== 2b. Live process-manager test (rec-pty + rec ps/pause/resume/mark/stop/start/cancel/kill) ==="
 RT_TEST="$(mktemp -d)"
@@ -198,5 +200,41 @@ REC_VIDEO_DIR="$OUT" rec-cli trim "$NMAP_MP4" 00:00 00:02 >/dev/null
 REC_VIDEO_DIR="$OUT" rec-cli stats | grep -q "Total clips:"
 echo "PASS: rec thumb, gif, trim, stats all verified"
 
+echo "=== 4. Studio Editor Engine (.recproj, Auto-Zoom, Zoom/Trim/Speed/Overlays, MP4 & GIF export) ==="
+python3 - "$REPO_ROOT/bin/rec-studio-engine" "$NMAP_MP4" "$TDIR" <<'PYEOF'
+import importlib.machinery, importlib.util, os, sys
+loader = importlib.machinery.SourceFileLoader("eng", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+eng = importlib.util.module_from_spec(spec)
+loader.exec_module(eng)
+
+src, tdir = sys.argv[2], sys.argv[3]
+proj = eng.default_project(src)
+proj["background"]["preset"] = "aurora"
+proj["frame"]["chrome"] = "macos"
+proj["zooms"] = eng.generate_auto_zooms(proj)
+proj["speeds"] = [{"id": "s1", "start": 0.2, "end": 1.0, "rate": 2.0}]
+proj["annotations"] = [
+    {"id": "a1", "kind": "text", "start": 0.0, "end": 2.0, "x": 0.5, "y": 0.15, "w": 0.2, "h": 0.08, "text": "Studio Test", "color": "#ffffff", "bg": "#141418", "font_size": 28},
+    {"id": "a2", "kind": "blur", "start": 0.0, "end": 2.0, "x": 0.7, "y": 0.5, "w": 0.15, "h": 0.08, "color": "#ffffff", "bg": "#141418", "font_size": 28},
+]
+proj["export"]["resolution"] = "720p"
+proj["export"]["fps"] = 15
+
+proj_path = os.path.join(tdir, "test.recproj")
+eng.save_project(proj, proj_path)
+loaded = eng.load_project(proj_path)
+
+out_mp4 = os.path.join(tdir, "studio_out.mp4")
+ok, msg = eng.export_project(loaded, out_mp4)
+assert ok and os.path.getsize(out_mp4) > 5000, f"Studio MP4 export failed: {msg}"
+
+loaded["export"]["format"] = "gif"
+out_gif = os.path.join(tdir, "studio_out.gif")
+ok, msg = eng.export_project(loaded, out_gif)
+assert ok and os.path.getsize(out_gif) > 2000, f"Studio GIF export failed: {msg}"
+print("PASS: Studio .recproj save/load, Auto-Zoom, overlays, speed & MP4/GIF export verified!")
+PYEOF
+
 echo ""
-echo "ALL v1.4.0 TESTS PASSED!"
+echo "ALL v2.0.0 TESTS PASSED!"

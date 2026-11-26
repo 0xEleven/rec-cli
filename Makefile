@@ -1,4 +1,4 @@
-VERSION ?= 1.4.0
+VERSION ?= 2.0.0
 PREFIX  ?= $(HOME)/.local
 
 .PHONY: install uninstall deb rpm tarball packages test lint clean
