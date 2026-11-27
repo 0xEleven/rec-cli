@@ -5,34 +5,28 @@
 <h1 align="center">rec-cli</h1>
 
 <p align="center">
-  Terminal clip recorder for Linux (Zsh, Bash, Fish). Up to 4K MP4s, 2x speed, 5-minute chunks, named after what you ran.
+  Fast terminal clip recorder and native Rust desktop app for Linux (Zsh, Bash, Fish).<br>
+  Record crisp demos, tutorials, content clips, and proof-of-concepts up to 4K MP4 or 9:16 vertical.
 </p>
 
 <p align="center">
   <a href="https://github.com/0xEleven/rec-cli/actions/workflows/ci.yml"><img src="https://github.com/0xEleven/rec-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/0xEleven/rec-cli/releases"><img src="https://github.com/0xEleven/rec-cli/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/0xEleven/rec-cli/releases"><img src="https://github.com/0xEleven/rec-cli/releases/latest/badge.svg" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-bb9af7.svg" alt="License: MIT"></a>
 </p>
 
 ## What it does
 
-- **Studio Desktop App (`rec gui`)**: Clean monochrome Qt6 GUI with Dark and Light mode, live terminal PID manager (1-click in-place recording via silent standby), visual terminal auto-record picker, screen/region recorder, multi-track video editor, and clips library.
-- **Recordly-style Multi-Track Studio Editor (`rec edit [clip|project]`)**:
-  - **Smart Auto-Zoom & Manual Zoom Regions**: 1-click Auto-Zoom from cursor/motion activity plus draggable zoom regions on the timeline with critically damped spring easing, click-on-canvas focus targeting, and motion blur.
-  - **Interactive Multi-Track Timeline**: Drag and resize Zoom regions, Trim Cuts (remove unwanted sections), Speed regions (0.25x to 4x), Overlays, and supplementary Audio tracks, with Undo/Redo and Spacebar preview playback.
-  - **Wallpapers, Frames & Aspect Ratios**: 8 built-in studio wallpapers, custom gradients, solid fills, or blurred wallpaper images, padding, corner radius, drop shadows, macOS/minimal window chrome, crop controls, and aspect ratio presets (`16:9`, `9:16`, `1:1`, `4:5`, `4:3`, `21:9`, `Original`).
-  - **Cursor Polish**: Smoothed macOS-style vector cursor, highlight ring or dot modes, click bounce & ripple animation, and auto-hide when idle.
-  - **Annotations & Dynamic Webcam Bubble**: Timed Text callouts, Blur/Redact boxes, Highlight boxes, Arrows, Image overlays, and a floating rounded webcam bubble that auto-shrinks during zooms.
-  - **Projects & Export**: Save and reopen non-destructive `.recproj` project files, and export to MP4 (`720p` to `4K UHD`, 30/60fps, synced AAC audio) or palette-optimized GIF (`rec render-project`).
-- **Screen, Region, Audio & Webcam Capture (`rec screen`)**: Record full screen or custom regions on Wayland (GNOME DBus / `wf-recorder`) or X11 (`x11grab`) with Microphone + System Audio, synchronized webcam sidecar, cursor tracking, and live zoom point flagging (`SIGUSR2`).
-- **Process-Managed Parallel Terminal Recording (`rec ps`)**: Start, stop, pause, resume, cancel, or drop YouTube chapter markers on any live terminal or SSH session by PID or name from any other terminal without dropping SSH.
-- **Smart Auto-Render Pipeline**: Records terminal sessions at `auto`, `720p`, `1080p`, `1440p`, `4k`, `reels` (9:16 cursor-following auto-reframe), or `reels-4k`, at 2x speed in 5-minute chunks, auto-named after the tool you ran, with automatic secret redaction and passive OpenVPN/log skip.
+- **Fast Native Rust Desktop App (`rec gui`)**: Clean, responsive Dark & Light interface built in Rust (`rec-gui`) for everyday users — start a new recorded terminal in 1 click, pause/resume/snapshot/bookmark live sessions, browse your clips with real video thumbnails, export GIFs, rename, trim losslessly, and configure video themes & terminal apps without touching the command line.
+- **Live Terminal Recording Control (`rec start`, `rec stop`, `rec save`, `rec ps`)**: Start, stop, pause, resume, snapshot, discard, or add YouTube chapter markers to any live terminal or SSH session without ever closing your tab or dropping SSH.
+- **Smart Auto-Render Pipeline**: Exports crisp terminal MP4s at `auto`, `720p`, `1080p`, `1440p`, `4k`, `reels` (9:16 cursor-following vertical), or `reels-4k`, with customizable speed, 5-minute chunking, auto-naming, rounded window frames, and automatic secret/password redaction.
+- **Manual-First or Auto-Record**: New terminals start in zero-overhead standby ready for 1-click recording, or flip on `Auto-record` for specific terminal apps (Kitty, Tabby, Alacritty, WezTerm, Ghostty, Foot, Konsole, GNOME Terminal).
 
 ## Install
 
 ### All Linux distros (universal script)
 
-Handles `apt`, `pacman`, `dnf`, `yum`, `zypper`, `apk`, `xbps-install`, and `emerge`, installs `agg`, and adds the shell hook:
+Handles `apt`, `pacman`, `dnf`, `yum`, `zypper`, `apk`, `xbps-install`, and `emerge`, installs `agg`, builds `rec-gui`, and adds the shell hook:
 
 ```bash
 git clone https://github.com/0xEleven/rec-cli.git
@@ -45,7 +39,7 @@ cd rec-cli
 Download the `.deb` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo apt install ./rec-cli_2.0.0_all.deb
+sudo apt install ./rec-cli_2.1.0_amd64.deb
 ```
 
 ### Fedora / RHEL / Rocky / Alma / openSUSE
@@ -53,9 +47,9 @@ sudo apt install ./rec-cli_2.0.0_all.deb
 Download the `.rpm` from [Releases](https://github.com/0xEleven/rec-cli/releases):
 
 ```bash
-sudo dnf install ./rec-cli-2.0.0-1.noarch.rpm
+sudo dnf install ./rec-cli-2.1.0-1.x86_64.rpm
 # openSUSE
-sudo zypper install ./rec-cli-2.0.0-1.noarch.rpm
+sudo zypper install ./rec-cli-2.1.0-1.x86_64.rpm
 ```
 
 ### Arch / Manjaro / EndeavourOS
@@ -78,20 +72,18 @@ Optional Starship `● REC` prompt badge: paste [starship/rec-module.toml](stars
 
 | Command | Action |
 | --- | --- |
-| `rec gui` | Open the Qt Studio GUI (Dark/Light mode, live PID sessions, Screen Rec, Studio Editor, terminal picker, clips library) |
-| `rec edit [clip\|project]` | Open any MP4, `.cast`, or `.recproj` directly in the multi-track Studio Editor |
-| `rec screen [flags]` | Open the Screen Recorder tab (or capture via CLI with `--mic`, `--system-audio`, `--webcam`, `--area`) |
-| `rec render-project <f.recproj>` | Render a saved `.recproj` project headlessly to MP4 or GIF |
+| `rec gui` | Open the native Rust desktop app (live sessions, 1-click record, clips library & settings) |
 | `rec ps` | List all live recording sessions with PID, state (`REC`/`PAUSED`/`STANDBY`), name, elapsed time, size, and running command |
-| `rec start [name]` | Start recording this terminal, or run `rec start <pid> [name]` to start a fresh clip on another live session |
-| `rec stop [pid\|name\|all]` | Stop and render MP4 without closing the tab or dropping SSH |
+| `rec start [--new] [name]` | Start recording this terminal (or `rec start <pid> [--new] [name]`); refuses to silently stop an active clip unless `--new` is passed |
+| `rec stop [--bg] [pid\|name\|all]` | Stop and save MP4 right now without closing the tab or dropping SSH (`--bg` renders in background) |
+| `rec save [pid\|name] [label]` | Save an instant MP4 snapshot right now without stopping the active recording |
 | `rec pause [pid\|name\|all]` | Pause a recording live (keeps shell/SSH running) |
 | `rec resume [pid\|name\|all]` | Resume a paused recording |
 | `rec cancel [pid\|name\|all]` | Stop and discard the take without saving |
 | `rec mark [pid\|name] <label>` | Add a chapter marker to this or another PID (writes `.chapters.txt` next to the MP4) |
 | `rec kill <pid\|name\|all>` | Force-terminate a recording session process |
 | `rec status` | Show current tab status, active PIDs, and saved clip count |
-| `rec auto on\|off` | Switch between auto-recording new tabs and manual `rec start` |
+| `rec auto on\|off` | Toggle auto-recording on new tabs (default: `off` — manual `rec start` / `rec stop`) |
 | `rec list` | List saved MP4 clips |
 | `rec play [clip\|latest]` | Open a clip in `mpv`, `vlc`, or your default player |
 | `rec gif [clip\|latest]` | Convert a clip to a palette-optimized GIF |
@@ -107,7 +99,7 @@ Optional Starship `● REC` prompt badge: paste [starship/rec-module.toml](stars
 
 ## Configuration
 
-Settings live in `~/.config/rec-cli/config`:
+Settings live in `~/.config/rec-cli/config` (and can all be edited in `rec gui`):
 
 ```bash
 rec config auto                   # auto-detect display resolution (720p/1080p/1440p/4k)
@@ -122,7 +114,7 @@ rec config terminals kitty,tabby  # comma-separated list, or "all"
 rec config video-dir "$HOME/Videos/content"
 ```
 
-## Build packages locally
+## Build & test locally
 
 ```bash
 make test

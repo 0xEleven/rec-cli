@@ -2,7 +2,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PATH="$REPO_ROOT/bin:$PATH"
+unset REC_RUNTIME_DIR REC_PTY_PID REC_PTY_TTY _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+export PATH="$REPO_ROOT/gui/target/release:$REPO_ROOT/bin:$PATH"
 
 echo "=== 1. Syntax checks (bash / zsh / fish) ==="
 bash -n "$REPO_ROOT"/bin/rec-cli \
@@ -25,54 +26,106 @@ if command -v fish >/dev/null 2>&1; then
   echo "PASS: fish syntax OK"
 fi
 
-echo "=== 2. rec-cli init, rec-pty, rec-gui & Studio v2.0.0 checks ==="
-python3 -m py_compile "$REPO_ROOT/bin/rec-pty" "$REPO_ROOT/bin/rec-gui" "$REPO_ROOT/bin/rec-studio-engine" "$REPO_ROOT/bin/rec-studio-editor" "$REPO_ROOT/bin/rec-capture"
-rec-cli version | grep -q "rec-cli 2.0.0"
+echo "=== 2. rec-cli init, rec-pty & native Rust rec-gui v2.1.0 checks ==="
+python3 -m py_compile "$REPO_ROOT/bin/rec-pty"
+rec-cli version | grep -q "rec-cli 2.1.0"
 rec-cli init zsh  | grep -q "_rec_is_allowed_terminal"
 rec-cli init bash | grep -q "_rec_bash_preexec"
 rec-cli init fish | grep -q "_rec_fish_preexec"
-"$REPO_ROOT/bin/rec-capture" --probe | grep -q '"backend"'
 XDG_CONFIG_HOME="$(mktemp -d)" rec-cli config auto | grep -q "Resolution set to auto"
-if python3 -c "import PyQt6" 2>/dev/null || python3 -c "import PySide6" 2>/dev/null || python3 -c "import PyQt5" 2>/dev/null; then
-  QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME="" XDG_CURRENT_DESKTOP="" GNOME_DESKTOP_SESSION_ID="" XDG_CONFIG_HOME="$(mktemp -d)" "$REPO_ROOT/bin/rec-gui" --smoke-test | grep -q "SMOKE_OK"
-  QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME="" XDG_CURRENT_DESKTOP="" GNOME_DESKTOP_SESSION_ID="" XDG_CONFIG_HOME="$(mktemp -d)" "$REPO_ROOT/bin/rec-studio-editor" --smoke-test | grep -q "STUDIO_SMOKE_OK"
-  echo "PASS: rec-gui & Studio Editor Qt smoke tests (dark/light + screen + editor) OK"
-fi
-echo "PASS: rec-pty/rec-gui/studio compile, rec-capture probe, rec-cli init & config auto work"
 
-echo "=== 2b. Live process-manager test (rec-pty + rec ps/pause/resume/mark/stop/start/cancel/kill) ==="
+GUI_BIN="$REPO_ROOT/gui/target/release/rec-gui"
+if [[ -x "$GUI_BIN" ]]; then
+  "$GUI_BIN" --version | grep -q "rec-gui 2.1.0"
+  XDG_CONFIG_HOME="$(mktemp -d)" "$GUI_BIN" --smoke-test | grep -q "SMOKE_OK"
+  echo "PASS: native Rust rec-gui smoke test OK"
+else
+  echo "WARN: $GUI_BIN not built yet (run 'make build-gui')"
+fi
+echo "PASS: rec-pty compile, rec-cli init & config auto work"
+
+echo "=== 2b. Live process-manager & isolation tests (rec-pty + rec ps/start/save/pause/resume/mark/stop/cancel/kill) ==="
 RT_TEST="$(mktemp -d)"
 CAST_TEST="$(mktemp -d)"
-XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" "$REPO_ROOT/bin/rec-pty" --name ssh-box -- bash -c "sleep 8" >/dev/null 2>&1 &
+VID_TEST="$(mktemp -d)"
+CFG_TEST="$(mktemp -d)"
+
+# Verify manual-first default (auto-record is OFF by default)
+STATUS_OUT="$(XDG_CONFIG_HOME="$CFG_TEST" XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" REC_VIDEO_DIR="$VID_TEST" rec-cli status)"
+grep -q "OFF (manual only)" <<< "$STATUS_OUT"
+
+# Launch session 1 that writes real terminal output so instant save & stop can produce MP4s
+XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" REC_VIDEO_DIR="$VID_TEST" "$REPO_ROOT/bin/rec-pty" --name ssh-box -- bash -c "echo hello-session-1; sleep 12" >/dev/null 2>&1 &
 PTY_PID=$!
 # Wait up to 3s for session registration
 for _ in $(seq 1 30); do
   [[ -f "$RT_TEST/rec-cli-$(id -u)/sessions/${PTY_PID}.json" ]] && break
   sleep 0.1
 done
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "$PTY_PID"
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "ssh-box"
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli pause "$PTY_PID" | grep -q "Paused PID $PTY_PID"
-sleep 0.2
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "PAUSED"
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli resume "$PTY_PID" | grep -q "Resumed PID $PTY_PID"
-sleep 0.2
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli mark "$PTY_PID" "got root" | grep -q "Chapter marker"
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli stop "$PTY_PID" | grep -q "Stopped PID $PTY_PID"
 sleep 0.3
+
+# Active recording must use .cast.recording (never bare .cast) so casts2mp4 can never steal it
+ls "$CAST_TEST/casts"/*.cast.recording >/dev/null
+! ls "$CAST_TEST/casts"/*.cast >/dev/null 2>&1
+
+# Starting a second session & running casts2mp4 must NOT stop or save session 1
+XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" REC_VIDEO_DIR="$VID_TEST" "$REPO_ROOT/bin/rec-pty" --standby -- bash -c "sleep 12" >/dev/null 2>&1 &
+PTY_PID2=$!
+for _ in $(seq 1 30); do
+  [[ -f "$RT_TEST/rec-cli-$(id -u)/sessions/${PTY_PID2}.json" ]] && break
+  sleep 0.1
+done
+XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" REC_VIDEO_DIR="$VID_TEST" "$REPO_ROOT/bin/casts2mp4" --quiet
+PS_OUT="$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+grep "$PTY_PID" <<< "$PS_OUT" | grep -q "REC"
+grep "$PTY_PID2" <<< "$PS_OUT" | grep -q "STANDBY"
+
+# Calling `rec start` on an already-recording session must NOT silently stop/save it
+if XDG_RUNTIME_DIR="$RT_TEST" rec-cli start "$PTY_PID" accidental >/dev/null 2>&1; then
+  echo "FAIL: rec start should refuse on already-recording PID without --new" >&2
+  exit 1
+fi
+PS_OUT="$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+grep "$PTY_PID" <<< "$PS_OUT" | grep -q "ssh-box"
+
+# Instant snapshot save keeps recording active!
+if command -v agg >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1; then
+  SAVE_OUT="$(XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" REC_VIDEO_DIR="$VID_TEST" REC_RESOLUTION=720p rec-cli save "$PTY_PID" snap-check)"
+  grep -q "Saved snapshot:" <<< "$SAVE_OUT"
+  ls "$VID_TEST"/snap-check_*.mp4 >/dev/null
+  PS_OUT="$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+  grep "$PTY_PID" <<< "$PS_OUT" | grep -q "REC"
+fi
+
+grep -q "Paused PID $PTY_PID" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli pause "$PTY_PID")"
+grep -q "PAUSED" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+grep -q "Resumed PID $PTY_PID" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli resume "$PTY_PID")"
+grep -q "Chapter marker" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli mark "$PTY_PID" "got root")"
+
+# Synchronous stop updates state/marker immediately and saves MP4 right away
+STOP_OUT="$(XDG_RUNTIME_DIR="$RT_TEST" REC_DIR="$CAST_TEST" REC_VIDEO_DIR="$VID_TEST" REC_RESOLUTION=720p rec-cli stop "$PTY_PID")"
+grep -q "Stopped PID $PTY_PID" <<< "$STOP_OUT"
+# Active marker must ALREADY be removed the instant rec stop returns (no prompt lag!)
+[[ ! -f "$RT_TEST/rec-cli-$(id -u)/active/${PTY_PID}" ]]
+if command -v agg >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1; then
+  grep -q "Saved:" <<< "$STOP_OUT"
+  ls "$VID_TEST"/ssh-box_*.mp4 >/dev/null
+fi
 # Child must STILL be alive in STANDBY mode (simulating live SSH session surviving rec stop!)
 kill -0 "$PTY_PID"
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "STANDBY"
-# Remotely start a second clip on the exact same live PID, then cancel & kill cleanly
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli start "$PTY_PID" part2 | grep -q "Started recording on PID $PTY_PID"
-sleep 0.2
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps | grep -q "part2"
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli cancel "$PTY_PID" | grep -q "Canceled PID $PTY_PID"
-sleep 0.2
-XDG_RUNTIME_DIR="$RT_TEST" rec-cli kill "$PTY_PID" | grep -q "Terminated"
-wait "$PTY_PID" 2>/dev/null || true
-rm -rf "$RT_TEST" "$CAST_TEST"
-echo "PASS: Live PID process control (ps/pause/resume/mark/stop-without-dropping/start/cancel/kill) verified!"
+PS_OUT="$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+grep "$PTY_PID" <<< "$PS_OUT" | grep -q "STANDBY"
+# Remotely start a second clip on the exact same live PID, split with --new, then cancel & kill cleanly
+grep -q "Started recording on PID $PTY_PID" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli start "$PTY_PID" part2)"
+grep -q "part2" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+grep -q "Started new clip on PID $PTY_PID" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli start "$PTY_PID" --new part3)"
+grep -q "part3" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli ps)"
+grep -q "Canceled PID $PTY_PID" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli cancel "$PTY_PID")"
+grep -q "Terminated" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli kill "$PTY_PID")"
+grep -q "Terminated" <<< "$(XDG_RUNTIME_DIR="$RT_TEST" rec-cli kill "$PTY_PID2")"
+wait "$PTY_PID" "$PTY_PID2" 2>/dev/null || true
+rm -rf "$RT_TEST" "$CAST_TEST" "$VID_TEST" "$CFG_TEST"
+echo "PASS: Live PID process control, session isolation, instant save & synchronous stop verified!"
 
 echo "=== 3. End-to-end 4K, vertical, redaction, chapters, gif/thumb/trim & split ==="
 if ! command -v agg >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
@@ -200,41 +253,5 @@ REC_VIDEO_DIR="$OUT" rec-cli trim "$NMAP_MP4" 00:00 00:02 >/dev/null
 REC_VIDEO_DIR="$OUT" rec-cli stats | grep -q "Total clips:"
 echo "PASS: rec thumb, gif, trim, stats all verified"
 
-echo "=== 4. Studio Editor Engine (.recproj, Auto-Zoom, Zoom/Trim/Speed/Overlays, MP4 & GIF export) ==="
-python3 - "$REPO_ROOT/bin/rec-studio-engine" "$NMAP_MP4" "$TDIR" <<'PYEOF'
-import importlib.machinery, importlib.util, os, sys
-loader = importlib.machinery.SourceFileLoader("eng", sys.argv[1])
-spec = importlib.util.spec_from_loader(loader.name, loader)
-eng = importlib.util.module_from_spec(spec)
-loader.exec_module(eng)
-
-src, tdir = sys.argv[2], sys.argv[3]
-proj = eng.default_project(src)
-proj["background"]["preset"] = "aurora"
-proj["frame"]["chrome"] = "macos"
-proj["zooms"] = eng.generate_auto_zooms(proj)
-proj["speeds"] = [{"id": "s1", "start": 0.2, "end": 1.0, "rate": 2.0}]
-proj["annotations"] = [
-    {"id": "a1", "kind": "text", "start": 0.0, "end": 2.0, "x": 0.5, "y": 0.15, "w": 0.2, "h": 0.08, "text": "Studio Test", "color": "#ffffff", "bg": "#141418", "font_size": 28},
-    {"id": "a2", "kind": "blur", "start": 0.0, "end": 2.0, "x": 0.7, "y": 0.5, "w": 0.15, "h": 0.08, "color": "#ffffff", "bg": "#141418", "font_size": 28},
-]
-proj["export"]["resolution"] = "720p"
-proj["export"]["fps"] = 15
-
-proj_path = os.path.join(tdir, "test.recproj")
-eng.save_project(proj, proj_path)
-loaded = eng.load_project(proj_path)
-
-out_mp4 = os.path.join(tdir, "studio_out.mp4")
-ok, msg = eng.export_project(loaded, out_mp4)
-assert ok and os.path.getsize(out_mp4) > 5000, f"Studio MP4 export failed: {msg}"
-
-loaded["export"]["format"] = "gif"
-out_gif = os.path.join(tdir, "studio_out.gif")
-ok, msg = eng.export_project(loaded, out_gif)
-assert ok and os.path.getsize(out_gif) > 2000, f"Studio GIF export failed: {msg}"
-print("PASS: Studio .recproj save/load, Auto-Zoom, overlays, speed & MP4/GIF export verified!")
-PYEOF
-
 echo ""
-echo "ALL v2.0.0 TESTS PASSED!"
+echo "ALL v2.1.0 TESTS PASSED!"

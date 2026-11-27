@@ -1,4 +1,4 @@
-# rec-cli Bash Integration (v1.3.0 — process-managed via rec-pty)
+# rec-cli Bash Integration (v2.0.0 — process-managed via rec-pty)
 # Add to ~/.bashrc:  eval "$(rec-cli init bash)"
 
 _rec_load_config() {
@@ -10,10 +10,26 @@ _rec_load_config() {
 }
 _rec_load_config
 
+# Clear inherited rec-pty env vars if this shell is on a different PTY or the parent rec-pty exited
+_rec_sanitize_env() {
+  if [[ -n "${REC_PTY_PID:-}" ]]; then
+    if ! kill -0 "$REC_PTY_PID" 2>/dev/null; then
+      unset REC_PTY_PID REC_PTY_TTY REC_RUNTIME_DIR _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+    elif [[ -n "${REC_PTY_TTY:-}" && -t 0 ]]; then
+      local cur_tty
+      cur_tty="$(tty 2>/dev/null || true)"
+      if [[ -n "$cur_tty" && "$cur_tty" != "not a tty" && "$cur_tty" != "$REC_PTY_TTY" ]]; then
+        unset REC_PTY_PID REC_PTY_TTY REC_RUNTIME_DIR _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+      fi
+    fi
+  fi
+}
+_rec_sanitize_env
+
 _rec_detect_terminal() {
   if [[ -n "${KITTY_WINDOW_ID:-}" || -n "${KITTY_PID:-}" || "${TERM:-}" == "xterm-kitty" ]]; then
     echo "kitty"
-  elif [[ "${TERM_PROGRAM:-}" == "Tabby" ]]; then
+  elif [[ "${TERM_PROGRAM:-}" == "Tabby" || -n "${TABBY_CONFIG_DIRECTORY:-}" ]]; then
     echo "tabby"
   elif [[ -n "${ALACRITTY_WINDOW_ID:-}" || -n "${ALACRITTY_SOCKET:-}" || "${TERM:-}" == "alacritty" ]]; then
     echo "alacritty"
@@ -27,6 +43,8 @@ _rec_detect_terminal() {
     echo "konsole"
   elif [[ -n "${GNOME_TERMINAL_SCREEN:-}" || -n "${VTE_VERSION:-}" ]]; then
     echo "gnome-terminal"
+  elif [[ "$(ps -o comm= -p "$PPID" 2>/dev/null)" == "tabby" ]]; then
+    echo "tabby"
   elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" && "${TERM:-}" == xterm* ]]; then
     echo "xterm"
   fi
@@ -41,15 +59,33 @@ _rec_is_allowed_terminal() {
   [[ -n "$cur" && ",${allowed_lc}," == *",${cur},"* ]]
 }
 
+_rec_is_auto_enabled() {
+  [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/auto-disabled" ]] && return 1
+  [[ -f "$HOME/.config/term-rec/auto-disabled" ]] && return 1
+  local auto_lc="${REC_AUTO_RECORD:-off}"
+  auto_lc="${auto_lc,,}"
+  case "$auto_lc" in
+    on|enable|enabled|1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 rec() {
   _rec_load_config
+  _rec_sanitize_env
   local sub="${1:-help}"
   if [[ "$sub" == "start" || "$sub" == "on" ]]; then
     shift
-    if [[ "${1:-}" =~ ^[0-9]+$ || -n "${REC_PTY_PID:-}" ]]; then
+    local first_pos="" arg
+    for arg in "$@"; do
+      [[ "$arg" == "--new" || "$arg" == "--restart" || "$arg" == "-n" ]] && continue
+      first_pos="$arg"
+      break
+    done
+    if [[ "$first_pos" =~ ^[0-9]+$ || -n "${REC_PTY_PID:-}" ]]; then
       rec-cli start "$@"
     else
-      rec-pty ${1:+--name "$1"} -- "${SHELL:-bash}"
+      rec-pty ${first_pos:+--name "$first_pos"} -- "${SHELL:-bash}"
     fi
     return $?
   fi
@@ -83,7 +119,7 @@ if [[ -n "${_TERM_REC_META:-}" ]]; then
   trap '_rec_bash_preexec' DEBUG
 fi
 
-# Wrap interactive desktop terminals in rec-pty (recording if allowed + auto ON, otherwise silent standby for 1-click in-place recording)
+# Wrap interactive desktop terminals in rec-pty (manual standby by default; auto-record only if enabled via `rec auto on`)
 if [[ -n "$(_rec_detect_terminal)" ]] \
   && [[ $- == *i* ]] \
   && [[ -t 0 && -t 1 ]] \
@@ -92,11 +128,8 @@ if [[ -n "$(_rec_detect_terminal)" ]] \
   && [[ "$(ps -o comm= -p "$PPID" 2>/dev/null)" != "ttyd" ]] \
   && command -v rec-pty >/dev/null 2>&1; then
   mkdir -p "$TERM_REC_DIR/casts" "$TERM_VIDEO_DIR"
-  command -v casts2mp4 >/dev/null 2>&1 && casts2mp4 --bg
-  if _rec_is_allowed_terminal \
-    && [[ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli/auto-disabled" ]] \
-    && [[ ! -f "$HOME/.config/term-rec/auto-disabled" ]]; then
-    exec rec-pty -- "${SHELL:-bash}"
+  if _rec_is_allowed_terminal && _rec_is_auto_enabled; then
+    exec rec-pty --auto -- "${SHELL:-bash}"
   else
     exec rec-pty --standby -- "${SHELL:-bash}"
   fi

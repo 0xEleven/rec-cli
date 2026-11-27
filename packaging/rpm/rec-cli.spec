@@ -1,11 +1,10 @@
 Name:           rec-cli
-Version:        2.0.0
+Version:        2.1.0
 Release:        1%{?dist}
-Summary:        Smart terminal clip recorder CLI for Zsh, Bash, and Fish
+Summary:        Terminal clip recorder and native Rust desktop app for Linux
 License:        MIT
 URL:            https://github.com/0xEleven/rec-cli
 Source0:        %{name}-%{version}.tar.gz
-BuildArch:      noarch
 
 Requires:       bash
 Requires:       python3
@@ -14,24 +13,20 @@ Requires:       ffmpeg
 Requires:       util-linux
 
 %description
-rec-cli is a smart terminal clip recorder for Linux supporting Zsh, Bash, and
-Fish. It records real input+output sessions in whitelisted terminals (Kitty and
-Tabby by default), skips passive OpenVPN/log panes, renders crisp 1080p 2x-speed
-MP4 clips capped at 5 minutes each, and names every clip after the primary tool
-or process you ran.
+rec-cli is a terminal clip recorder for Linux supporting Zsh, Bash, and Fish,
+paired with a fast native Rust desktop app (rec-gui) to start, pause, snapshot,
+bookmark, stop, and organize recorded terminal clips for demos, tutorials,
+content creation, and proof-of-concepts.
 
 %prep
 %setup -q
 
 %install
-install -Dm755 bin/rec-cli           %{buildroot}%{_bindir}/rec-cli
-install -Dm755 bin/rec-pty           %{buildroot}%{_bindir}/rec-pty
-install -Dm755 bin/rec-gui           %{buildroot}%{_bindir}/rec-gui
-install -Dm755 bin/rec-studio-engine %{buildroot}%{_bindir}/rec-studio-engine
-install -Dm755 bin/rec-studio-editor %{buildroot}%{_bindir}/rec-studio-editor
-install -Dm755 bin/rec-capture       %{buildroot}%{_bindir}/rec-capture
-install -Dm755 bin/cast2mp4          %{buildroot}%{_bindir}/cast2mp4
-install -Dm755 bin/casts2mp4         %{buildroot}%{_bindir}/casts2mp4
+install -Dm755 bin/rec-cli   %{buildroot}%{_bindir}/rec-cli
+install -Dm755 bin/rec-pty   %{buildroot}%{_bindir}/rec-pty
+install -Dm755 bin/rec-gui   %{buildroot}%{_bindir}/rec-gui
+install -Dm755 bin/cast2mp4  %{buildroot}%{_bindir}/cast2mp4
+install -Dm755 bin/casts2mp4 %{buildroot}%{_bindir}/casts2mp4
 install -Dm644 shell/rec.zsh  %{buildroot}%{_datadir}/rec-cli/shell/rec.zsh
 install -Dm644 shell/rec.bash %{buildroot}%{_datadir}/rec-cli/shell/rec.bash
 install -Dm644 shell/rec.fish %{buildroot}%{_datadir}/rec-cli/shell/rec.fish
@@ -46,7 +41,7 @@ echo '  Zsh  (~/.zshrc):                   eval "$(rec-cli init zsh)"'
 echo '  Bash (~/.bashrc):                  eval "$(rec-cli init bash)"'
 echo '  Fish (~/.config/fish/config.fish): rec-cli init fish | source'
 echo ""
-echo "Then run: rec doctor"
+echo "Then launch the desktop app with: rec gui"
 echo ""
 
 %files
@@ -55,9 +50,6 @@ echo ""
 %{_bindir}/rec-cli
 %{_bindir}/rec-pty
 %{_bindir}/rec-gui
-%{_bindir}/rec-studio-engine
-%{_bindir}/rec-studio-editor
-%{_bindir}/rec-capture
 %{_bindir}/cast2mp4
 %{_bindir}/casts2mp4
 %{_datadir}/rec-cli/
@@ -65,5 +57,7 @@ echo ""
 %{_datadir}/icons/hicolor/scalable/apps/rec-cli.svg
 
 %changelog
+* Fri Nov 27 2026 0xEleven <0xEleven@users.noreply.github.com> - 2.1.0-1
+- Rebuilt desktop GUI in native Rust (rec-gui) and removed Recordly screen/editor bloat
 * Wed Nov 25 2026 0xEleven <0xEleven@users.noreply.github.com> - 1.0.0-1
 - Initial release with Zsh, Bash, and Fish support

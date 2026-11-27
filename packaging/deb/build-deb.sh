@@ -4,14 +4,21 @@ umask 022
 
 # Build a Debian/Ubuntu/Kali/Mint/Pop!_OS .deb package for rec-cli
 
-VERSION="${VERSION:-2.0.0}"
+VERSION="${VERSION:-2.1.0}"
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
-PKG_ROOT="$STAGE/rec-cli_${VERSION}_all"
+GUI_BIN="$REPO_ROOT/gui/target/release/rec-gui"
+if [[ ! -x "$GUI_BIN" ]]; then
+  CARGO_BIN="$(command -v cargo 2>/dev/null || echo "$HOME/.cargo/bin/cargo")"
+  "$CARGO_BIN" build --release --manifest-path "$REPO_ROOT/gui/Cargo.toml"
+fi
+
+PKG_ROOT="$STAGE/rec-cli_${VERSION}_${ARCH}"
 mkdir -p "$PKG_ROOT/DEBIAN" \
          "$PKG_ROOT/usr/bin" \
          "$PKG_ROOT/usr/share/rec-cli/shell" \
@@ -20,14 +27,11 @@ mkdir -p "$PKG_ROOT/DEBIAN" \
          "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps" \
          "$PKG_ROOT/usr/share/doc/rec-cli"
 
-install -m 755 "$REPO_ROOT/bin/rec-cli"           "$PKG_ROOT/usr/bin/rec-cli"
-install -m 755 "$REPO_ROOT/bin/rec-pty"           "$PKG_ROOT/usr/bin/rec-pty"
-install -m 755 "$REPO_ROOT/bin/rec-gui"           "$PKG_ROOT/usr/bin/rec-gui"
-install -m 755 "$REPO_ROOT/bin/rec-studio-engine" "$PKG_ROOT/usr/bin/rec-studio-engine"
-install -m 755 "$REPO_ROOT/bin/rec-studio-editor" "$PKG_ROOT/usr/bin/rec-studio-editor"
-install -m 755 "$REPO_ROOT/bin/rec-capture"       "$PKG_ROOT/usr/bin/rec-capture"
-install -m 755 "$REPO_ROOT/bin/cast2mp4"          "$PKG_ROOT/usr/bin/cast2mp4"
-install -m 755 "$REPO_ROOT/bin/casts2mp4"         "$PKG_ROOT/usr/bin/casts2mp4"
+install -m 755 "$REPO_ROOT/bin/rec-cli"   "$PKG_ROOT/usr/bin/rec-cli"
+install -m 755 "$REPO_ROOT/bin/rec-pty"   "$PKG_ROOT/usr/bin/rec-pty"
+install -m 755 "$GUI_BIN"                 "$PKG_ROOT/usr/bin/rec-gui"
+install -m 755 "$REPO_ROOT/bin/cast2mp4"  "$PKG_ROOT/usr/bin/cast2mp4"
+install -m 755 "$REPO_ROOT/bin/casts2mp4" "$PKG_ROOT/usr/bin/casts2mp4"
 
 install -m 644 "$REPO_ROOT/shell/rec.zsh"  "$PKG_ROOT/usr/share/rec-cli/shell/rec.zsh"
 install -m 644 "$REPO_ROOT/shell/rec.bash" "$PKG_ROOT/usr/share/rec-cli/shell/rec.bash"
@@ -43,15 +47,16 @@ Package: rec-cli
 Version: ${VERSION}
 Section: utils
 Priority: optional
-Architecture: all
+Architecture: ${ARCH}
 Depends: bash, python3, asciinema, ffmpeg, util-linux
-Recommends: zsh | fish, python3-pil, python3-pyqt6
+Recommends: zsh | fish, python3-pil
 Maintainer: 0xEleven <0xEleven@users.noreply.github.com>
 Homepage: https://github.com/0xEleven/rec-cli
-Description: Smart terminal clip recorder CLI for Zsh, Bash, and Fish
- Automatically or manually records terminal sessions with real input+output,
- skips passive OpenVPN/log panes, splits clips to 5-minute max at 2x speed,
- and names each 1080p MP4 clip after the process you ran (e.g. nmap).
+Description: Terminal clip recorder and native Rust desktop app for Linux
+ Record crisp terminal demos, tutorials, and proof-of-concepts in Zsh, Bash,
+ and Fish. Includes a fast native Rust GUI (rec-gui) to start, pause, snapshot,
+ bookmark, stop, and organize your clips library with thumbnails, GIF export,
+ and lossless trimming.
 EOF
 
 cat > "$PKG_ROOT/DEBIAN/postinst" <<'EOF'
@@ -63,13 +68,13 @@ echo '  Zsh  (~/.zshrc):                  eval "$(rec-cli init zsh)"'
 echo '  Bash (~/.bashrc):                 eval "$(rec-cli init bash)"'
 echo '  Fish (~/.config/fish/config.fish): rec-cli init fish | source'
 echo ""
-echo "Then run: rec doctor"
+echo "Then launch the desktop app with: rec gui"
 echo ""
 EOF
 chmod 755 "$PKG_ROOT/DEBIAN" "$PKG_ROOT/DEBIAN/postinst"
 chmod 644 "$PKG_ROOT/DEBIAN/control"
 
 mkdir -p "$DIST_DIR"
-OUT_DEB="$DIST_DIR/rec-cli_${VERSION}_all.deb"
+OUT_DEB="$DIST_DIR/rec-cli_${VERSION}_${ARCH}.deb"
 dpkg-deb --build --root-owner-group "$PKG_ROOT" "$OUT_DEB"
 echo "Built: $OUT_DEB"

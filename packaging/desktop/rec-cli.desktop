@@ -1,10 +1,10 @@
 [Desktop Entry]
 Name=rec-cli
-Comment=Smart terminal clip recorder and live session manager
+Comment=Fast terminal recorder and clips library for demos and POCs
 Exec=rec-gui
 Icon=rec-cli
 Terminal=false
 Type=Application
 Categories=AudioVideo;Recorder;Utility;
-Keywords=terminal;record;screen;mp4;reels;kitty;tabby;
-StartupWMClass=rec-cli
+Keywords=terminal;record;cli;demo;mp4;gif;reels;kitty;tabby;
+StartupWMClass=rec-gui

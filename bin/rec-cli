@@ -4,17 +4,30 @@ set -euo pipefail
 # rec-cli — Process-managed terminal clip recorder CLI (v1.3.0)
 # Manage parallel recordings across tabs, panes, and SSH sessions by PID or name.
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rec-cli"
 CONF_FILE="$CONF_DIR/config"
 AUTO_OFF_FLAG="$CONF_DIR/auto-disabled"
 LEGACY_AUTO_OFF="$HOME/.config/term-rec/auto-disabled"
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/rec-cli-$(id -u)"
+RUNTIME_DIR="${REC_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/rec-cli-$(id -u)}"
 
 if [[ -f "$CONF_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$CONF_FILE"
+fi
+
+# Verify REC_PTY_PID actually belongs to THIS terminal's PTY (never trust leaked env vars from another tab/tmux/GUI!)
+if [[ -n "${REC_PTY_PID:-}" ]]; then
+  if ! kill -0 "$REC_PTY_PID" 2>/dev/null; then
+    unset REC_PTY_PID REC_PTY_TTY REC_RUNTIME_DIR _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+  elif [[ -n "${REC_PTY_TTY:-}" && -t 0 ]]; then
+    _cur_tty="$(tty 2>/dev/null || true)"
+    if [[ -n "$_cur_tty" && "$_cur_tty" != "not a tty" && "$_cur_tty" != "$REC_PTY_TTY" ]]; then
+      unset REC_PTY_PID REC_PTY_TTY REC_RUNTIME_DIR _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+    fi
+    unset _cur_tty
+  fi
 fi
 
 REC_DIR="${REC_DIR:-${TERM_REC_DIR:-$HOME/Videos/terminal-recordings}}"
@@ -28,6 +41,7 @@ REC_RESOLUTION="${REC_RESOLUTION:-auto}"
 REC_FRAME="${REC_FRAME:-on}"
 REC_REDACT="${REC_REDACT:-on}"
 REC_REELS_COPY="${REC_REELS_COPY:-off}"
+REC_AUTO_RECORD="${REC_AUTO_RECORD:-off}"
 
 detect_display_info() {
   local dims="" w=0 h=0 preset="1080p"
@@ -117,13 +131,11 @@ show_help() {
 ${C_PURPLE}${C_BOLD}rec-cli${C_RESET} v${VERSION} - Process-Managed Terminal Clip Recorder (Zsh, Bash, Fish)
 
 ${C_CYAN}Process & Parallel Recording Control (works across tabs, panes & SSH):${C_RESET}
-  ${C_BOLD}rec gui${C_RESET}                        Open the Qt Studio GUI (Dark/Light mode, live PIDs, Screen Rec & Editor)
-  ${C_BOLD}rec edit [clip|project]${C_RESET}        Open a clip (.mp4/.cast) or .recproj in the multi-track Studio Editor
-  ${C_BOLD}rec screen [flags]${C_RESET}             Record full screen / region with mic, system audio & webcam bubble
-  ${C_BOLD}rec render-project <f.recproj>${C_RESET} Export a saved .recproj Studio project headlessly to MP4 or GIF
+  ${C_BOLD}rec gui${C_RESET}                        Open the native Rust desktop app (live sessions, 1-click record & clips library)
   ${C_BOLD}rec ps${C_RESET}                         List all live recording processes with PID, state, name & cmd
-  ${C_BOLD}rec start [name]${C_RESET}               Start recording this terminal (or: rec start <pid> [name])
-  ${C_BOLD}rec stop [pid|name|all]${C_RESET}        Stop & render MP4 without dropping SSH or closing the tab
+  ${C_BOLD}rec start [--new] [name]${C_RESET}       Start recording this terminal (or: rec start <pid> [--new] [name])
+  ${C_BOLD}rec stop [--bg] [pid|name|all]${C_RESET} Stop & save MP4 right now without dropping SSH (--bg for background)
+  ${C_BOLD}rec save [pid|name] [label]${C_RESET}    Save an instant MP4 snapshot right now without stopping recording
   ${C_BOLD}rec pause [pid|name|all]${C_RESET}       Pause recording live (keeps SSH/shell alive)
   ${C_BOLD}rec resume [pid|name|all]${C_RESET}      Resume a paused recording
   ${C_BOLD}rec cancel [pid|name|all]${C_RESET}      Stop & discard recording without saving
@@ -154,23 +166,34 @@ EOF
 }
 
 is_auto_disabled() {
-  [[ -f "$AUTO_OFF_FLAG" || -f "$LEGACY_AUTO_OFF" ]]
+  if [[ -f "$AUTO_OFF_FLAG" || -f "$LEGACY_AUTO_OFF" ]]; then
+    return 0
+  fi
+  case "${REC_AUTO_RECORD,,}" in
+    on|enable|enabled|1|true|yes) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
-# Python helper for live PID/name session management (`rec ps`, remote `stop`/`pause`/`resume`/`cancel`/`start`/`mark`/`kill`)
+# Python helper for live PID/name session management (`rec ps`, remote `stop`/`save`/`pause`/`resume`/`cancel`/`start`/`mark`/`kill`)
 run_session_mgr() {
-  python3 - "$RUNTIME_DIR" "${REC_PTY_PID:-}" "$@" <<'PYEOF'
+  local script_dir
+  script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  python3 - "$RUNTIME_DIR" "${REC_PTY_PID:-}" "$script_dir" "$@" <<'PYEOF'
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 runtime_dir = Path(sys.argv[1])
 my_pid = int(sys.argv[2]) if sys.argv[2].isdigit() else 0
-action = sys.argv[3]
-args = sys.argv[4:]
+script_dir = Path(sys.argv[3])
+action = sys.argv[4]
+args = sys.argv[5:]
 
 sess_dir = runtime_dir / "sessions"
 active_dir = runtime_dir / "active"
@@ -358,18 +381,65 @@ def resolve_targets(sessions: list[dict], target: str, require_active: bool = Fa
     ]
 
 
-def send_ctrl(pid: int, command_line: str) -> None:
+def send_ctrl(pid: int, command_line: str, wait_ack: bool = True, timeout: float = 2.0) -> dict | None:
+    req_id = f"{os.getpid()}-{time.time_ns()}"
+    ack_file = sess_dir / f"{pid}.ack.{req_id}"
     cmd_file = sess_dir / f"{pid}.cmd"
     with open(cmd_file, "a", encoding="utf-8") as f:
-        f.write(command_line.strip() + "\n")
+        f.write(f"REQ:{req_id} {command_line.strip()}\n")
     os.kill(pid, signal.SIGUSR1)
+    if not wait_ack:
+        return None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ack_file.exists():
+            try:
+                data = json.loads(ack_file.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            ack_file.unlink(missing_ok=True)
+            return data
+        if not is_alive(pid):
+            break
+        time.sleep(0.02)
+    return None
+
+
+def find_cast2mp4() -> str | None:
+    cand = script_dir / "cast2mp4"
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return str(cand)
+    return shutil.which("cast2mp4")
+
+
+def render_cast_now(cast_path: str, manual: bool) -> tuple[bool, list[str], str]:
+    """Render a finalized .cast synchronously and return (ok, saved_mp4_paths, error_msg)."""
+    if not cast_path or not os.path.exists(cast_path):
+        return (True, [], "")
+    c2m = find_cast2mp4()
+    if not c2m or not shutil.which("agg") or not shutil.which("ffmpeg"):
+        return (False, [], "agg/ffmpeg/cast2mp4 not available")
+    cmd = [c2m]
+    if not manual:
+        cmd.append("--auto")
+    cmd.extend(["--cleanup", "--print-output", cast_path])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    saved = [
+        line[len("SAVED:"):].strip()
+        for line in (proc.stdout or "").splitlines()
+        if line.startswith("SAVED:")
+    ]
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "render failed").strip()
+        return (False, saved, err)
+    return (True, saved, "")
 
 
 sessions = load_sessions()
 
 if action == "ps":
     if not sessions:
-        print(f"{C_DIM}No active rec-cli sessions. Open a Kitty/Tabby tab or run 'rec start'.{C_RESET}")
+        print(f"{C_DIM}No active rec-cli sessions. Open a terminal or run 'rec start'.{C_RESET}")
         sys.exit(0)
     print(f"{C_PURPLE}{C_BOLD}{'PID':<8} {'STATE':<10} {'NAME':<16} {'TERM':<8} {'TIME':<8} {'SIZE':<7} {'RUNNING / DIR'}{C_RESET}")
     for s in sessions:
@@ -393,7 +463,7 @@ if action == "ps":
         if s.get("fg_cmd") and cwd:
             info = f"{s['fg_cmd']}  ({cwd})"
         print(f"{pid:<8} {st_col} {name:<16} {term:<8} {el:<8} {sz:<7} {info[:58]}")
-    print(f"{C_DIM}(* = current terminal; manage any PID from any terminal: rec stop <pid>, rec pause <pid>, rec mark <pid> <label>){C_RESET}")
+    print(f"{C_DIM}(* = current terminal; manage any PID from any terminal: rec start <pid>, rec stop <pid>, rec save <pid>, rec pause <pid>){C_RESET}")
     sys.exit(0)
 
 if action == "count":
@@ -404,7 +474,14 @@ if action == "count":
     sys.exit(0)
 
 if action in ("stop", "cancel", "pause", "resume"):
-    target = args[0] if args else ""
+    bg_mode = False
+    clean_args = []
+    for a in args:
+        if a in ("--bg", "--background", "-b"):
+            bg_mode = True
+        else:
+            clean_args.append(a)
+    target = clean_args[0] if clean_args else ""
     matches = resolve_targets(sessions, target, require_active=(action != "resume"))
     if not matches:
         if not target and os.environ.get("ASCIINEMA_REC"):
@@ -426,7 +503,7 @@ if action in ("stop", "cancel", "pause", "resume"):
             )
             sys.exit(1)
         if not target:
-            print("Not currently recording in this terminal. Run 'rec ps' to manage other terminals.", file=sys.stderr)
+            print("Not currently recording in this terminal. Run 'rec start' to begin or 'rec ps' to manage other terminals.", file=sys.stderr)
         else:
             print(f"No matching active recording found for '{target}'. Run 'rec ps' to list PIDs.", file=sys.stderr)
         sys.exit(1)
@@ -435,31 +512,114 @@ if action in ("stop", "cancel", "pause", "resume"):
         if s.get("legacy"):
             print(f"{C_YELLOW}PID {pid} is a legacy asciinema tab (pre-v1.3.0).{C_RESET} Type 'exit' inside that tab to save it, or 'rec kill {pid}' to terminate it.", file=sys.stderr)
             continue
-        send_ctrl(pid, action)
         label = s.get("name") or s.get("fg_cmd") or f"PID {pid}"
         if action == "stop":
-            print(f"{C_GREEN}■ Stopped PID {pid}{C_RESET} ({label}) - rendering MP4 in background (shell/SSH stays alive).")
+            if bg_mode:
+                send_ctrl(pid, "stop", wait_ack=True)
+                print(f"{C_GREEN}■ Stopped PID {pid}{C_RESET} ({label}) - rendering MP4 in background (shell/SSH stays alive).")
+            else:
+                ack = send_ctrl(pid, "stop_handover", wait_ack=True)
+                cast_path = (ack or {}).get("cast", "")
+                was_manual = bool((ack or {}).get("manual", True))
+                print(f"{C_GREEN}■ Stopped PID {pid}{C_RESET} ({label}) - saving MP4...", flush=True)
+                if not cast_path:
+                    print(f"{C_DIM}  ○ No terminal output recorded; nothing to save.{C_RESET}")
+                else:
+                    ok, saved, err = render_cast_now(cast_path, manual=was_manual)
+                    if ok and saved:
+                        for mp4 in saved:
+                            sz = fmt_size(os.path.getsize(mp4)) if os.path.exists(mp4) else "-"
+                            print(f"{C_GREEN}✓ Saved:{C_RESET} {C_CYAN}{mp4}{C_RESET} ({sz})")
+                    elif ok:
+                        print(f"{C_DIM}  ○ Skipped empty/idle recording.{C_RESET}")
+                    else:
+                        print(f"{C_YELLOW}⚠ Could not render MP4 ({err}). Raw cast kept at:{C_RESET} {cast_path}", file=sys.stderr)
         elif action == "cancel":
+            send_ctrl(pid, "cancel", wait_ack=True)
             print(f"{C_YELLOW}✕ Canceled PID {pid}{C_RESET} ({label}) - clip discarded (shell/SSH stays alive).")
         elif action == "pause":
+            send_ctrl(pid, "pause", wait_ack=True)
             print(f"{C_YELLOW}❚❚ Paused PID {pid}{C_RESET} ({label}).")
         elif action == "resume":
+            send_ctrl(pid, "resume", wait_ack=True)
             print(f"{C_RED}● Resumed PID {pid}{C_RESET} ({label}).")
     sys.exit(0)
 
+if action == "save":
+    # Instant snapshot save without stopping the active recording: `rec save [pid|name] [clip-name]`
+    target_sessions = []
+    clip_name = ""
+    if args:
+        cand = resolve_targets(sessions, args[0], require_active=True)
+        if cand:
+            target_sessions = cand
+            clip_name = " ".join(args[1:]).strip()
+        else:
+            target_sessions = resolve_targets(sessions, "", require_active=True)
+            clip_name = " ".join(args).strip()
+    else:
+        target_sessions = resolve_targets(sessions, "", require_active=True)
+    if not target_sessions:
+        print("Not currently recording in this terminal. Run 'rec start' first (or 'rec render' for pending casts).", file=sys.stderr)
+        sys.exit(1)
+    for s in target_sessions:
+        pid = s["pid"]
+        if s.get("legacy"):
+            print(f"{C_YELLOW}PID {pid} is a legacy asciinema tab and does not support live snapshots.{C_RESET}", file=sys.stderr)
+            continue
+        ack = send_ctrl(pid, f"snapshot {clip_name}".strip(), wait_ack=True)
+        if not ack or not ack.get("ok"):
+            print(f"{C_YELLOW}Could not capture snapshot from PID {pid}.{C_RESET}", file=sys.stderr)
+            continue
+        cast_path = ack.get("cast", "")
+        print(f"{C_CYAN}◆ Saving snapshot of PID {pid}...{C_RESET}", flush=True)
+        ok, saved, err = render_cast_now(cast_path, manual=True)
+        if ok and saved:
+            for mp4 in saved:
+                sz = fmt_size(os.path.getsize(mp4)) if os.path.exists(mp4) else "-"
+                print(f"{C_GREEN}✓ Saved snapshot:{C_RESET} {C_CYAN}{mp4}{C_RESET} ({sz}) {C_DIM}(PID {pid} still recording){C_RESET}")
+        elif ok:
+            print(f"{C_DIM}  ○ No terminal output recorded yet; nothing to save.{C_RESET}")
+        else:
+            print(f"{C_YELLOW}⚠ Could not render snapshot ({err}). Raw cast kept at:{C_RESET} {cast_path}", file=sys.stderr)
+    sys.exit(0)
+
 if action == "start":
-    # Remote start on a specific PID: `rec start <pid> [name]`
-    if not args or not args[0].isdigit():
+    # Remote or in-place start: `rec start [--new] [pid] [name]`
+    force_new = False
+    clean_args = []
+    for a in args:
+        if a in ("--new", "--restart", "-n"):
+            force_new = True
+        else:
+            clean_args.append(a)
+    if not clean_args or not clean_args[0].isdigit():
         sys.exit(2)  # caller handles local start
-    target_pid = int(args[0])
-    custom_name = args[1] if len(args) > 1 else ""
+    target_pid = int(clean_args[0])
+    custom_name = clean_args[1] if len(clean_args) > 1 else ""
     matches = [s for s in sessions if s["pid"] == target_pid]
     if not matches:
         print(f"No live rec-cli session with PID {target_pid}. Run 'rec ps' to see live PIDs.", file=sys.stderr)
         sys.exit(1)
-    send_ctrl(target_pid, f"start {custom_name}".strip())
+    verb = "restart" if force_new else "start"
+    ack = send_ctrl(target_pid, f"{verb} {custom_name}".strip(), wait_ack=True)
+    if ack and not ack.get("ok") and ack.get("error") == "already_recording":
+        cur_name = ack.get("name") or "auto"
+        print(
+            f"{C_YELLOW}Already recording on PID {target_pid}{C_RESET} ({cur_name}).\n"
+            f"  Use {C_BOLD}rec stop{C_RESET} to stop & save, {C_BOLD}rec save{C_RESET} for an instant snapshot, "
+            f"or {C_BOLD}rec start --new [name]{C_RESET} to save & start a new clip.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if ack and ack.get("resumed"):
+        print(f"{C_RED}● Resumed recording on PID {target_pid}{C_RESET}.")
+        sys.exit(0)
     lbl = f" (name: {custom_name})" if custom_name else " (auto-named by process)"
-    print(f"{C_RED}● Started recording on PID {target_pid}{C_RESET}{lbl}.")
+    if force_new:
+        print(f"{C_RED}● Started new clip on PID {target_pid}{C_RESET}{lbl} {C_DIM}(previous clip saving in background){C_RESET}.")
+    else:
+        print(f"{C_RED}● Started recording on PID {target_pid}{C_RESET}{lbl}.")
     sys.exit(0)
 
 if action == "mark":
@@ -481,7 +641,7 @@ if action == "mark":
         print("No active recording in this tab. Specify a PID from 'rec ps': rec mark <pid> <label>", file=sys.stderr)
         sys.exit(1)
     for s in target_sessions:
-        send_ctrl(s["pid"], f"mark {label}")
+        send_ctrl(s["pid"], f"mark {label}", wait_ack=True)
         print(f"{C_PURPLE}◆ Chapter marker added to PID {s['pid']}:{C_RESET} {C_BOLD}{label}{C_RESET}")
     sys.exit(0)
 
@@ -602,15 +762,17 @@ cmd_auto() {
   case "${1:-}" in
     on|enable|1)
       rm -f "$AUTO_OFF_FLAG" "$LEGACY_AUTO_OFF"
+      set_config_key REC_AUTO_RECORD "on"
       echo -e "${C_GREEN}✓ Auto-recording ENABLED${C_RESET} for allowed terminals (${REC_TERMINALS})."
       ;;
     off|disable|0)
+      set_config_key REC_AUTO_RECORD "off"
       touch "$AUTO_OFF_FLAG"
-      echo -e "${C_YELLOW}✓ Auto-recording DISABLED${C_RESET} - new tabs will only record when you run ${C_BOLD}rec start${C_RESET}."
+      echo -e "${C_YELLOW}✓ Auto-recording DISABLED${C_RESET} - new tabs start in standby and only record when you run ${C_BOLD}rec start${C_RESET}."
       ;;
     *)
       if is_auto_disabled; then
-        echo -e "Auto-record is currently ${C_YELLOW}OFF${C_RESET}. Use 'rec auto on' or 'rec auto off'."
+        echo -e "Auto-record is currently ${C_YELLOW}OFF (manual control)${C_RESET}. Use 'rec auto on' or 'rec auto off'."
       else
         echo -e "Auto-record is currently ${C_GREEN}ON${C_RESET}. Use 'rec auto on' or 'rec auto off'."
       fi
@@ -880,40 +1042,9 @@ case "${1:-help}" in
       nohup rec-gui "$@" </dev/null >/dev/null 2>&1 &
     fi
     ;;
-  edit|studio)
-    shift
-    target=""
-    if [[ $# -ge 1 ]]; then
-      if [[ -f "$1" ]]; then
-        target="$1"
-      else
-        target="$(resolve_clip "$1")" || exit 1
-      fi
-    fi
-    if ! command -v rec-gui >/dev/null 2>&1; then
-      echo "Error: rec-gui not found in PATH." >&2
-      exit 1
-    fi
-    if [[ -n "$target" ]]; then
-      setsid -f rec-gui "$target" </dev/null >/dev/null 2>&1
-    else
-      setsid -f rec-gui --editor </dev/null >/dev/null 2>&1
-    fi
-    ;;
-  screen|capture)
-    shift
-    if [[ $# -eq 0 ]]; then
-      setsid -f rec-gui --screen </dev/null >/dev/null 2>&1
-    else
-      rec-capture "$@"
-    fi
-    ;;
-  render-project|export-project)
-    shift
-    rec-studio-engine "$@"
-    ;;
   ps|jobs|active) run_session_mgr ps ;;
   stop|off)       shift; run_session_mgr stop "$@" ;;
+  save|snap|snapshot) shift; run_session_mgr save "$@" ;;
   cancel|discard) shift; run_session_mgr cancel "$@" ;;
   pause)          shift; run_session_mgr pause "$@" ;;
   resume|unpause) shift; run_session_mgr resume "$@" ;;
@@ -921,14 +1052,24 @@ case "${1:-help}" in
   kill)           shift; run_session_mgr kill "$@" ;;
   start|on)
     shift
-    # If first arg is a live PID, remotely start recording on that standby session!
-    if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
-      run_session_mgr start "$@"
+    # Separate optional --new flag from positional [pid] [name]
+    _new_flag=()
+    _pos=()
+    for _a in "$@"; do
+      if [[ "$_a" == "--new" || "$_a" == "--restart" || "$_a" == "-n" ]]; then
+        _new_flag=("--new")
+      else
+        _pos+=("$_a")
+      fi
+    done
+    # If first positional arg is a live PID, remotely start recording on that standby session!
+    if [[ "${_pos[0]:-}" =~ ^[0-9]+$ ]]; then
+      run_session_mgr start "${_new_flag[@]}" "${_pos[@]}"
     elif [[ -n "${REC_PTY_PID:-}" ]]; then
-      run_session_mgr start "$REC_PTY_PID" "${1:-}"
+      run_session_mgr start "${_new_flag[@]}" "$REC_PTY_PID" "${_pos[0]:-}"
     else
       # Not yet inside rec-pty: spawn a fresh rec-pty session wrapping the current shell!
-      exec rec-pty ${1:+--name "$1"} -- "${SHELL:-/bin/sh}"
+      exec rec-pty ${_pos[0]:+--name "${_pos[0]}"} -- "${SHELL:-/bin/sh}"
     fi
     ;;
   init) shift; cmd_init "${1:-}" ;;

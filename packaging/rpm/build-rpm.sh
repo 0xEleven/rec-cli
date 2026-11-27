@@ -4,18 +4,25 @@ umask 022
 
 # Build a Fedora/RHEL/Rocky/Alma/openSUSE .rpm package for rec-cli
 
-VERSION="${VERSION:-2.0.0}"
+VERSION="${VERSION:-2.1.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
 TOPDIR="$(mktemp -d)"
 trap 'rm -rf "$TOPDIR"' EXIT
 
+GUI_BIN="$REPO_ROOT/gui/target/release/rec-gui"
+if [[ ! -x "$GUI_BIN" ]]; then
+  CARGO_BIN="$(command -v cargo 2>/dev/null || echo "$HOME/.cargo/bin/cargo")"
+  "$CARGO_BIN" build --release --manifest-path "$REPO_ROOT/gui/Cargo.toml"
+fi
+
 mkdir -p "$TOPDIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,TMP,rpmdb}
 
 SRC_STAGE="$TOPDIR/rec-cli-${VERSION}"
-mkdir -p "$SRC_STAGE"
+mkdir -p "$SRC_STAGE/bin"
 cp -r "$REPO_ROOT/bin" "$REPO_ROOT/shell" "$REPO_ROOT/starship" "$REPO_ROOT/assets" "$REPO_ROOT/packaging" "$REPO_ROOT/README.md" "$REPO_ROOT/LICENSE" "$SRC_STAGE/"
+install -m 755 "$GUI_BIN" "$SRC_STAGE/bin/rec-gui"
 tar -czf "$TOPDIR/SOURCES/rec-cli-${VERSION}.tar.gz" -C "$TOPDIR" "rec-cli-${VERSION}"
 
 sed "s/^Version:.*/Version:        ${VERSION}/" "$SCRIPT_DIR/rec-cli.spec" > "$TOPDIR/SPECS/rec-cli.spec"
@@ -29,5 +36,5 @@ rpmbuild \
   -bb "$TOPDIR/SPECS/rec-cli.spec"
 
 mkdir -p "$DIST_DIR"
-cp "$TOPDIR"/RPMS/noarch/rec-cli-*.rpm "$DIST_DIR/"
+cp "$TOPDIR"/RPMS/*/rec-cli-*.rpm "$DIST_DIR/"
 echo "Built: $(ls "$DIST_DIR"/rec-cli-*.rpm)"

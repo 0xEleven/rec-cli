@@ -1,0 +1,24 @@
+[package]
+name = "rec-gui"
+version = "2.1.0"
+edition = "2021"
+description = "Fast, consumer-friendly native Rust desktop app for rec-cli terminal recorder"
+license = "MIT"
+
+[[bin]]
+name = "rec-gui"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio", "svg", "image", "tiny-skia", "wgpu", "advanced"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+libc = "0.2"
+tokio = { version = "1", features = ["process", "rt-multi-thread", "time", "fs"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

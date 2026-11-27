@@ -55,16 +55,56 @@ if ! flock -n 9; then
 fi
 
 log() {
-  [[ "$QUIET" -eq 0 ]] && echo "$@"
+  if [[ "$QUIET" -eq 0 ]]; then
+    echo "$@"
+  fi
 }
+
+RUNTIME_DIR="${REC_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/rec-cli-$(id -u)}"
+SESS_DIR="$RUNTIME_DIR/sessions"
+LOCK_DIR="$RUNTIME_DIR/locks"
 
 is_cast_active() {
   local f="$1"
+  local bname
+  bname="$(basename "$f")"
+
+  # 1. Check if any live rec-pty session currently owns this cast file
+  if [[ -d "$SESS_DIR" ]] && python3 - "$SESS_DIR" "$f" <<'PYEOF'
+import json, os, sys
+from pathlib import Path
+
+sess_dir = Path(sys.argv[1])
+target = os.path.realpath(sys.argv[2])
+for p in sess_dir.glob("*.json"):
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        pid = int(data.get("pid", 0))
+        if pid <= 0:
+            continue
+        os.kill(pid, 0)
+        cast = data.get("cast", "")
+        if cast and os.path.realpath(cast) == target:
+            sys.exit(0)
+    except Exception:
+        continue
+sys.exit(1)
+PYEOF
+  then
+    return 0
+  fi
+
+  # 2. Check if cast2mp4 is already rendering this cast file
+  if [[ -f "$LOCK_DIR/${bname}.lock" ]] && command -v flock >/dev/null 2>&1; then
+    if ! flock -n "$LOCK_DIR/${bname}.lock" true 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  # 3. Check open file descriptors (fuser) and legacy asciinema processes
   if command -v fuser >/dev/null 2>&1 && fuser "$f" >/dev/null 2>&1; then
     return 0
   fi
-  local bname
-  bname="$(basename "$f")"
   if pgrep -f "asciinema.*${bname}" >/dev/null 2>&1; then
     return 0
   fi
@@ -100,7 +140,9 @@ for cast in "$CAST_DIR"/*.cast; do
 done
 
 for meta in "$CAST_DIR"/*.meta; do
-  [[ ! -f "${meta%.meta}.cast" ]] && rm -f "$meta"
+  if [[ ! -f "${meta%.meta}.cast" && ! -f "${meta%.meta}.cast.recording" ]]; then
+    rm -f "$meta"
+  fi
 done
 
 log "Done: ${processed} processed -> ${MP4_DIR}, ${skipped_active} currently active."

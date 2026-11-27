@@ -134,6 +134,7 @@ class RecSession:
         name: str = "",
         idle_limit: float = 2.0,
         cast_dir: str = "",
+        initial_manual: bool = True,
     ):
         self.pid = os.getpid()
         self.child_pid = 0
@@ -156,17 +157,22 @@ class RecSession:
 
         self.state = "standby"  # "recording" | "paused" | "standby"
         self.name = name
-        self.cast_path: Path | None = None
+        self.manual = initial_manual
+        self.cast_path: Path | None = None      # active recording file (*.cast.recording)
+        self.final_cast_path: Path | None = None  # finalized path (*.cast) on stop
         self.meta_path: Path | None = None
         self.cast_fp = None
         self.rec_started_at = 0.0
         self.last_event_mono = 0.0
         self.elapsed_recorded = 0.0
         self.paused_at = 0.0
+        self.snap_seq = 0
+        self.slave_tty = ""
 
         self.rows, self.cols, self.xpix, self.ypix = get_winsize(sys.stdin.fileno())
         self.initial_state = initial_state
         self.initial_name = name
+        self.initial_manual = initial_manual
 
         # Self-pipe to wake select() cleanly from SIGUSR1 / SIGWINCH / SIGCHLD
         self.wake_r, self.wake_w = os.pipe()
@@ -213,7 +219,9 @@ class RecSession:
                 "child_pid": self.child_pid,
                 "state": self.state,
                 "name": self.name,
+                "manual": self.manual,
                 "terminal": self.terminal,
+                "tty": self.slave_tty,
                 "cast": str(self.cast_path) if self.cast_path else "",
                 "meta": str(self.meta_path) if self.meta_path else "",
                 "cwd": get_child_cwd(self.child_pid) if self.child_pid > 0 else os.getcwd(),
@@ -228,6 +236,54 @@ class RecSession:
         except OSError:
             pass
 
+    def _write_ack(self, req_id: str, payload: dict) -> None:
+        if not req_id:
+            return
+        try:
+            ack_path = self.runtime_dir / "sessions" / f"{self.pid}.ack.{req_id}"
+            tmp = ack_path.with_suffix(".tmp")
+            payload = dict(payload)
+            payload["req_id"] = req_id
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, ack_path)
+        except OSError:
+            pass
+
+    def _find_cast2mp4(self) -> str | None:
+        here = Path(__file__).resolve().parent / "cast2mp4"
+        if here.is_file() and os.access(here, os.X_OK):
+            return str(here)
+        return shutil.which("cast2mp4")
+
+    def _spawn_render(self, cast_p: Path, manual: bool) -> None:
+        cast2mp4 = self._find_cast2mp4()
+        if not cast2mp4:
+            return
+        cmd = [cast2mp4]
+        if not manual:
+            cmd.append("--auto")
+        cmd.extend(["--cleanup", str(cast_p)])
+        log_fp = None
+        try:
+            log_path = self.runtime_dir / "render.log"
+            log_fp = open(log_path, "a", encoding="utf-8")
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log_fp,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError:
+            pass
+        finally:
+            if log_fp is not None:
+                try:
+                    log_fp.close()
+                except OSError:
+                    pass
+
     def _repoint_meta_link(self, target: Path | None) -> None:
         try:
             if self.live_meta_link.is_symlink() or self.live_meta_link.exists():
@@ -238,7 +294,7 @@ class RecSession:
         except OSError:
             pass
 
-    def start_recording(self, custom_name: str = "") -> None:
+    def start_recording(self, custom_name: str = "", manual: bool = True) -> None:
         if self.state == "recording":
             return
         if self.state == "paused":
@@ -246,9 +302,12 @@ class RecSession:
             return
 
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{self.pid}"
-        self.cast_path = self.cast_dir / f"session-{stamp}.cast"
+        # Keep active recordings under .cast.recording so batch tools (casts2mp4) can NEVER touch them mid-session
+        self.final_cast_path = self.cast_dir / f"session-{stamp}.cast"
+        self.cast_path = self.cast_dir / f"session-{stamp}.cast.recording"
         self.meta_path = self.cast_dir / f"session-{stamp}.meta"
         self.name = custom_name.strip()
+        self.manual = bool(manual)
 
         self.meta_path.write_text(f"NAME\t{self.name}\n" if self.name else "", encoding="utf-8")
         self._repoint_meta_link(self.meta_path)
@@ -303,12 +362,45 @@ class RecSession:
         except OSError:
             pass
 
-    def stop_recording(self, discard: bool = False) -> None:
-        if self.state == "standby":
-            return
+    def snapshot_recording(self, custom_name: str = "") -> Path | None:
+        """Flush and copy the live recording to a standalone finalized .cast without stopping."""
+        if self.state not in ("recording", "paused") or not self.cast_path or not self.cast_path.exists():
+            return None
+        if self.cast_fp:
+            try:
+                self.cast_fp.flush()
+            except OSError:
+                pass
+        self.snap_seq += 1
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{self.pid}-snap{self.snap_seq}"
+        snap_cast = self.cast_dir / f"session-{stamp}.cast"
+        snap_meta = self.cast_dir / f"session-{stamp}.meta"
+        try:
+            shutil.copy2(self.cast_path, snap_cast)
+            meta_lines: list[str] = []
+            if self.meta_path and self.meta_path.exists():
+                meta_lines = self.meta_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            snap_name = custom_name.strip() or self.name
+            if snap_name:
+                meta_lines = [ln for ln in meta_lines if not ln.startswith("NAME\t")]
+                meta_lines.insert(0, f"NAME\t{snap_name}")
+            if meta_lines:
+                snap_meta.write_text("\n".join(meta_lines) + "\n", encoding="utf-8")
+            return snap_cast
+        except OSError:
+            snap_cast.unlink(missing_ok=True)
+            snap_meta.unlink(missing_ok=True)
+            return None
 
-        cast_p = self.cast_path
+    def stop_recording(self, discard: bool = False, spawn_render: bool = True) -> tuple[Path | None, bool]:
+        """Stop current recording. Returns (finalized_cast_path, was_manual)."""
+        if self.state == "standby":
+            return (None, self.manual)
+
+        active_cast_p = self.cast_path
+        final_cast_p = self.final_cast_path or active_cast_p
         meta_p = self.meta_path
+        was_manual = self.manual
 
         if self.cast_fp:
             try:
@@ -320,7 +412,9 @@ class RecSession:
 
         self.state = "standby"
         self.name = ""
+        self.manual = True
         self.cast_path = None
+        self.final_cast_path = None
         self.meta_path = None
         self.rec_started_at = 0.0
         self._repoint_meta_link(None)
@@ -328,35 +422,35 @@ class RecSession:
         self._write_state_json()
 
         if discard:
-            for p in (cast_p, meta_p):
+            for p in (active_cast_p, final_cast_p, meta_p):
                 if p:
                     try:
                         p.unlink(missing_ok=True)
                     except OSError:
                         pass
-            return
+            return (None, was_manual)
 
-        if cast_p and cast_p.exists() and cast_p.stat().st_size > 0:
-            cast2mp4 = shutil.which("cast2mp4")
-            if cast2mp4:
+        if active_cast_p and active_cast_p.exists() and active_cast_p.stat().st_size > 0:
+            if final_cast_p and final_cast_p != active_cast_p:
                 try:
-                    subprocess.Popen(
-                        [cast2mp4, "--auto", "--cleanup", str(cast_p)],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                        close_fds=True,
-                    )
+                    os.replace(active_cast_p, final_cast_p)
+                    cast_p = final_cast_p
                 except OSError:
-                    pass
+                    cast_p = active_cast_p
+            else:
+                cast_p = active_cast_p
+
+            if spawn_render:
+                self._spawn_render(cast_p, manual=was_manual)
+            return (cast_p, was_manual)
         else:
-            for p in (cast_p, meta_p):
+            for p in (active_cast_p, final_cast_p, meta_p):
                 if p:
                     try:
                         p.unlink(missing_ok=True)
                     except OSError:
                         pass
+            return (None, was_manual)
 
     def record_event(self, etype: str, text: str) -> None:
         if self.state != "recording" or not self.cast_fp or not text:
@@ -375,9 +469,11 @@ class RecSession:
     def process_control_file(self) -> None:
         if not self.cmd_file.exists():
             return
+        proc_file = self.cmd_file.with_suffix(".cmd.proc")
         try:
-            lines = self.cmd_file.read_text(encoding="utf-8", errors="replace").splitlines()
-            self.cmd_file.unlink(missing_ok=True)
+            os.replace(self.cmd_file, proc_file)
+            lines = proc_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            proc_file.unlink(missing_ok=True)
         except OSError:
             return
 
@@ -385,31 +481,107 @@ class RecSession:
             line = line.strip()
             if not line:
                 continue
+            req_id = ""
+            if line.startswith("REQ:"):
+                rest_parts = line.split(None, 1)
+                req_id = rest_parts[0][4:]
+                line = rest_parts[1].strip() if len(rest_parts) > 1 else ""
+                if not line:
+                    continue
             parts = line.split(None, 1)
             verb = parts[0].lower()
             arg = parts[1].strip() if len(parts) > 1 else ""
             if verb == "stop":
-                self.stop_recording(discard=False)
+                cast_p, was_manual = self.stop_recording(discard=False, spawn_render=True)
+                self._write_ack(req_id, {
+                    "ok": True,
+                    "state": self.state,
+                    "cast": str(cast_p) if cast_p else "",
+                    "manual": was_manual,
+                })
+            elif verb == "stop_handover":
+                # Finalize & close .cast without spawning background cast2mp4 so caller renders synchronously
+                cast_p, was_manual = self.stop_recording(discard=False, spawn_render=False)
+                self._write_ack(req_id, {
+                    "ok": True,
+                    "state": self.state,
+                    "cast": str(cast_p) if cast_p else "",
+                    "manual": was_manual,
+                })
+            elif verb == "snapshot":
+                snap_p = self.snapshot_recording(custom_name=arg)
+                if snap_p:
+                    self._write_ack(req_id, {
+                        "ok": True,
+                        "state": self.state,
+                        "cast": str(snap_p),
+                        "manual": True,
+                    })
+                else:
+                    self._write_ack(req_id, {
+                        "ok": False,
+                        "error": "not_recording",
+                        "state": self.state,
+                    })
             elif verb == "cancel":
-                self.stop_recording(discard=True)
+                self.stop_recording(discard=True, spawn_render=False)
+                self._write_ack(req_id, {"ok": True, "state": self.state})
             elif verb == "pause":
                 self.pause_recording()
+                self._write_ack(req_id, {"ok": True, "state": self.state})
             elif verb == "resume":
                 self.resume_recording()
+                self._write_ack(req_id, {"ok": True, "state": self.state})
             elif verb == "start":
+                if self.state == "recording":
+                    # Never silently stop & save an active recording on `rec start`!
+                    self._write_ack(req_id, {
+                        "ok": False,
+                        "error": "already_recording",
+                        "state": self.state,
+                        "name": self.name,
+                    })
+                elif self.state == "paused":
+                    self.resume_recording()
+                    self._write_ack(req_id, {
+                        "ok": True,
+                        "resumed": True,
+                        "state": self.state,
+                        "name": self.name,
+                    })
+                else:
+                    self.start_recording(custom_name=arg, manual=True)
+                    self._write_ack(req_id, {
+                        "ok": True,
+                        "state": self.state,
+                        "name": self.name,
+                    })
+            elif verb == "restart":
+                # Explicit split: stop & save current take in background, then immediately start a new one
                 if self.state != "standby":
-                    self.stop_recording(discard=False)
-                self.start_recording(custom_name=arg)
+                    self.stop_recording(discard=False, spawn_render=True)
+                self.start_recording(custom_name=arg, manual=True)
+                self._write_ack(req_id, {
+                    "ok": True,
+                    "state": self.state,
+                    "name": self.name,
+                })
             elif verb == "mark":
                 self.add_mark(arg)
+                self._write_ack(req_id, {"ok": True, "state": self.state})
 
     def cleanup(self) -> None:
-        self.stop_recording(discard=False)
-        for p in (self.session_file, self.cmd_file, self.active_marker, self.live_meta_link):
+        self.stop_recording(discard=False, spawn_render=True)
+        for p in (self.session_file, self.cmd_file, self.cmd_file.with_suffix(".cmd.proc"), self.active_marker, self.live_meta_link):
             try:
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
+        try:
+            for ack_f in (self.runtime_dir / "sessions").glob(f"{self.pid}.ack.*"):
+                ack_f.unlink(missing_ok=True)
+        except OSError:
+            pass
         for fd in (self.wake_r, self.wake_w):
             try:
                 os.close(fd)
@@ -437,15 +609,22 @@ class RecSession:
 
         # Prepare initial recording state before fork so env vars exist inside child
         if self.initial_state == "recording":
-            self.start_recording(custom_name=self.initial_name)
+            self.start_recording(custom_name=self.initial_name, manual=self.initial_manual)
         else:
             self._update_active_marker()
             self._write_state_json()
 
         child_pid, master_fd = pty.fork()
         if child_pid == 0:
-            # Child process: expose stable rec-pty PID and live meta symlink
+            # Child process: expose stable rec-pty PID, exact slave PTY path, runtime dir, and live meta symlink
+            try:
+                child_tty = os.ttyname(0)
+            except OSError:
+                child_tty = ""
             os.environ["REC_PTY_PID"] = str(self.pid)
+            if child_tty:
+                os.environ["REC_PTY_TTY"] = child_tty
+            os.environ["REC_RUNTIME_DIR"] = str(self.runtime_dir)
             os.environ["_TERM_REC_ACTIVE"] = "1"
             os.environ["_TERM_REC_META"] = str(self.live_meta_link)
             os.environ["_TERM_REC_MARKER"] = str(self.active_marker)
@@ -454,6 +633,10 @@ class RecSession:
 
         self.child_pid = child_pid
         self.master_fd = master_fd
+        try:
+            self.slave_tty = os.readlink(f"/proc/{child_pid}/fd/0")
+        except OSError:
+            self.slave_tty = ""
         set_winsize(master_fd, self.rows, self.cols, self.xpix, self.ypix)
         self._write_state_json()
 
@@ -573,6 +756,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Live process-managed PTY recorder for rec-cli")
     parser.add_argument("--name", default="", help="Optional initial clip name")
     parser.add_argument("--standby", action="store_true", help="Start in standby passthrough mode (not recording yet)")
+    parser.add_argument("--auto", action="store_true", help="Mark initial recording as auto-started (enables auto-skip heuristics)")
     parser.add_argument("--idle-limit", type=float, default=2.0, help="Idle time limit in seconds")
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="Shell/command to run (default: $SHELL)")
     args = parser.parse_args()
@@ -588,6 +772,7 @@ def main() -> int:
         initial_state="standby" if args.standby else "recording",
         name=args.name,
         idle_limit=args.idle_limit,
+        initial_manual=(not args.auto),
     )
     return session.run()
 

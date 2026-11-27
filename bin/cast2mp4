@@ -19,6 +19,7 @@ fi
 
 AUTO_MODE=0
 CLEANUP=0
+PRINT_OUTPUT=0
 SPEED="${REC_SPEED:-${CAST_SPEED:-2}}"
 MAX_SECS="${REC_MAX_SECS:-${CAST_MAX_SECS:-300}}"
 IDLE_LIMIT="${REC_IDLE_LIMIT:-${CAST_IDLE_LIMIT:-1.5}}"
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --auto) AUTO_MODE=1; shift ;;
     --cleanup) CLEANUP=1; shift ;;
+    --print-output) PRINT_OUTPUT=1; shift ;;
     --speed|-s) SPEED="$2"; shift 2 ;;
     --max-secs|-m) MAX_SECS="$2"; shift 2 ;;
     --out-dir|-o) OUT_DIR="$2"; shift 2 ;;
@@ -56,6 +58,7 @@ Usage: cast2mp4 [options] <input.cast> [output.mp4] [speed]
   --reels-copy           Also export a 9:16 cursor-following Reels/TikTok version
   --auto                 Apply input+output gating, OpenVPN skip & process naming
   --cleanup              Delete source .cast + .meta after successful render
+  --print-output         Print SAVED:<path> for each rendered MP4
 EOF
       exit 0
       ;;
@@ -77,6 +80,17 @@ fi
 if [[ ! -f "$INPUT" ]]; then
   echo "Error: file not found: $INPUT" >&2
   exit 1
+fi
+
+# Per-cast render lock prevents duplicate concurrent renders (e.g. rec stop + casts2mp4)
+if command -v flock >/dev/null 2>&1; then
+  LOCK_DIR="${REC_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/rec-cli-$(id -u)}/locks"
+  mkdir -p "$LOCK_DIR" 2>/dev/null || true
+  CAST_LOCK="$LOCK_DIR/$(basename "$INPUT").lock"
+  exec 8>"$CAST_LOCK"
+  if ! flock -n 8; then
+    exit 0
+  fi
 fi
 
 # Auto-detect running display resolution (Wayland -> X11 -> Linux DRM sysfs -> fallback 1080p)
@@ -1084,6 +1098,7 @@ while IFS=$'\t' read -r START END TOOL STAMP PART IS_MULTI CHAP_FILE; do
     if render_reels_follow "$TMP_GIF" "$TMP_MP4" "$TOOL" "$START" "$OUT_W" "$OUT_H" "$CRF"; then
       mv -f "$TMP_MP4" "$OUTPUT"
       [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+      [[ "$PRINT_OUTPUT" -eq 1 ]] && echo "SAVED:$OUTPUT"
     else
       rm -f "$TMP_MP4"
       ALL_OK=0
@@ -1141,6 +1156,7 @@ PYEOF
       then
         mv -f "$TMP_MP4" "$OUTPUT"
         [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+        [[ "$PRINT_OUTPUT" -eq 1 ]] && echo "SAVED:$OUTPUT"
       else
         rm -f "$TMP_MP4"
         ALL_OK=0
@@ -1163,6 +1179,7 @@ PYEOF
       then
         mv -f "$TMP_MP4" "$OUTPUT"
         [[ -n "$CHAP_FILE" && -f "$CHAP_FILE" ]] && cp -f "$CHAP_FILE" "${OUTPUT%.mp4}.chapters.txt"
+        [[ "$PRINT_OUTPUT" -eq 1 ]] && echo "SAVED:$OUTPUT"
       else
         rm -f "$TMP_MP4"
         ALL_OK=0
@@ -1176,6 +1193,7 @@ PYEOF
       TMP_REELS="${REELS_OUT}.tmp.$$.mp4"
       if render_reels_follow "$TMP_GIF" "$TMP_REELS" "$TOOL" "$START" 1080 1920 18; then
         mv -f "$TMP_REELS" "$REELS_OUT"
+        [[ "$PRINT_OUTPUT" -eq 1 ]] && echo "SAVED:$REELS_OUT"
       else
         rm -f "$TMP_REELS"
       fi

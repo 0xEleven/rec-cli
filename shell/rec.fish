@@ -1,4 +1,4 @@
-# rec-cli Fish Integration (v1.3.0 — process-managed via rec-pty)
+# rec-cli Fish Integration (v2.0.0 — process-managed via rec-pty)
 # Add to ~/.config/fish/config.fish:  rec-cli init fish | source
 
 function _rec_load_config
@@ -32,10 +32,24 @@ function _rec_load_config
 end
 _rec_load_config
 
+function _rec_sanitize_env
+    if set -q REC_PTY_PID; and test -n "$REC_PTY_PID"
+        if not kill -0 "$REC_PTY_PID" 2>/dev/null
+            set -e REC_PTY_PID REC_PTY_TTY REC_RUNTIME_DIR _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+        else if set -q REC_PTY_TTY; and test -n "$REC_PTY_TTY"; and test -t 0
+            set -l cur_tty (tty 2>/dev/null)
+            if test -n "$cur_tty" -a "$cur_tty" != "not a tty" -a "$cur_tty" != "$REC_PTY_TTY"
+                set -e REC_PTY_PID REC_PTY_TTY REC_RUNTIME_DIR _TERM_REC_ACTIVE _TERM_REC_META _TERM_REC_MARKER
+            end
+        end
+    end
+end
+_rec_sanitize_env
+
 function _rec_detect_terminal
     if set -q KITTY_WINDOW_ID; or set -q KITTY_PID; or test "$TERM" = "xterm-kitty"
         echo "kitty"
-    else if test "$TERM_PROGRAM" = "Tabby"
+    else if test "$TERM_PROGRAM" = "Tabby"; or set -q TABBY_CONFIG_DIRECTORY
         echo "tabby"
     else if set -q ALACRITTY_WINDOW_ID; or set -q ALACRITTY_SOCKET; or test "$TERM" = "alacritty"
         echo "alacritty"
@@ -67,20 +81,49 @@ function _rec_is_allowed_terminal
     test -n "$cur"; and string match -q "*,{$cur},*" -- "$allowed_lc"
 end
 
+function _rec_is_auto_enabled
+    set -l auto_off "$HOME/.config/rec-cli/auto-disabled"
+    if set -q XDG_CONFIG_HOME
+        set auto_off "$XDG_CONFIG_HOME/rec-cli/auto-disabled"
+    end
+    if test -f "$auto_off" -o -f "$HOME/.config/term-rec/auto-disabled"
+        return 1
+    end
+    if not set -q REC_AUTO_RECORD
+        return 1
+    end
+    set -l auto_lc (string lower -- "$REC_AUTO_RECORD")
+    switch "$auto_lc"
+        case on enable enabled 1 true yes
+            return 0
+        case '*'
+            return 1
+    end
+end
+
 function rec
     _rec_load_config
+    _rec_sanitize_env
     set -l sub "help"
     if test (count $argv) -ge 1
         set sub $argv[1]
     end
     if test "$sub" = "start" -o "$sub" = "on"
         set -l rest $argv[2..]
-        if test (count $rest) -ge 1; and string match -qr '^[0-9]+$' -- "$rest[1]"
+        set -l first_pos ""
+        for a in $rest
+            if test "$a" = "--new" -o "$a" = "--restart" -o "$a" = "-n"
+                continue
+            end
+            set first_pos "$a"
+            break
+        end
+        if test -n "$first_pos"; and string match -qr '^[0-9]+$' -- "$first_pos"
             rec-cli start $rest
         else if set -q REC_PTY_PID
             rec-cli start $rest
-        else if test (count $rest) -ge 1
-            rec-pty --name "$rest[1]" -- fish
+        else if test -n "$first_pos"
+            rec-pty --name "$first_pos" -- fish
         else
             rec-pty -- fish
         end
@@ -107,12 +150,7 @@ if set -q _TERM_REC_META
     end
 end
 
-# Wrap interactive desktop terminals in rec-pty (recording if allowed + auto ON, else silent standby for 1-click in-place recording)
-set -l _rec_auto_off "$HOME/.config/rec-cli/auto-disabled"
-if set -q XDG_CONFIG_HOME
-    set _rec_auto_off "$XDG_CONFIG_HOME/rec-cli/auto-disabled"
-end
-
+# Wrap interactive desktop terminals in rec-pty (manual standby by default; auto-record only if enabled via `rec auto on`)
 if status is-interactive
     and test -n "(_rec_detect_terminal)"
     and test "$TERM" != "dumb"
@@ -124,13 +162,9 @@ if status is-interactive
     and not set -q VSCODE_INJECTION
     and type -q rec-pty
     mkdir -p "$TERM_REC_DIR/casts" "$TERM_VIDEO_DIR"
-    if type -q casts2mp4
-        casts2mp4 --bg
-    end
     if _rec_is_allowed_terminal
-        and not test -f "$_rec_auto_off"
-        and not test -f "$HOME/.config/term-rec/auto-disabled"
-        exec rec-pty -- fish
+        and _rec_is_auto_enabled
+        exec rec-pty --auto -- fish
     else
         exec rec-pty --standby -- fish
     end

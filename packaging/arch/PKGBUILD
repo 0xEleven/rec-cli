@@ -1,14 +1,15 @@
 # Maintainer: 0xEleven <0xEleven@users.noreply.github.com>
 pkgname=rec-cli
-pkgver=2.0.0
+pkgver=2.1.0
 pkgrel=1
-pkgdesc="Smart terminal clip recorder CLI for Zsh, Bash, and Fish (2x speed, 5-min chunks, process-named MP4s)"
-arch=('any')
+pkgdesc="Terminal clip recorder and fast native Rust desktop manager for demos, content, and POCs"
+arch=('x86_64' 'aarch64')
 url="https://github.com/0xEleven/rec-cli"
 license=('MIT')
 depends=('bash' 'python' 'asciinema' 'ffmpeg' 'util-linux')
+makedepends=('cargo')
 optdepends=(
-  'asciinema-agg: render .cast files to 1080p MP4 clips (or install agg binary)'
+  'asciinema-agg: render .cast files to crisp MP4 clips (or install agg binary)'
   'zsh: Zsh shell integration'
   'fish: Fish shell integration'
   'starship: live red REC prompt badge'
@@ -16,17 +17,19 @@ optdepends=(
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/0xEleven/rec-cli/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP')
 
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  cargo build --release --manifest-path gui/Cargo.toml
+}
+
 package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
 
-  install -Dm755 bin/rec-cli           "${pkgdir}/usr/bin/rec-cli"
-  install -Dm755 bin/rec-pty           "${pkgdir}/usr/bin/rec-pty"
-  install -Dm755 bin/rec-gui           "${pkgdir}/usr/bin/rec-gui"
-  install -Dm755 bin/rec-studio-engine "${pkgdir}/usr/bin/rec-studio-engine"
-  install -Dm755 bin/rec-studio-editor "${pkgdir}/usr/bin/rec-studio-editor"
-  install -Dm755 bin/rec-capture       "${pkgdir}/usr/bin/rec-capture"
-  install -Dm755 bin/cast2mp4          "${pkgdir}/usr/bin/cast2mp4"
-  install -Dm755 bin/casts2mp4         "${pkgdir}/usr/bin/casts2mp4"
+  install -Dm755 bin/rec-cli                "${pkgdir}/usr/bin/rec-cli"
+  install -Dm755 bin/rec-pty                "${pkgdir}/usr/bin/rec-pty"
+  install -Dm755 gui/target/release/rec-gui "${pkgdir}/usr/bin/rec-gui"
+  install -Dm755 bin/cast2mp4               "${pkgdir}/usr/bin/cast2mp4"
+  install -Dm755 bin/casts2mp4              "${pkgdir}/usr/bin/casts2mp4"
 
   install -Dm644 shell/rec.zsh  "${pkgdir}/usr/share/rec-cli/shell/rec.zsh"
   install -Dm644 shell/rec.bash "${pkgdir}/usr/share/rec-cli/shell/rec.bash"

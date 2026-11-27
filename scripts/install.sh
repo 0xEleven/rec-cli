@@ -6,7 +6,7 @@ set -euo pipefail
 #           Fedora, RHEL, Rocky, Alma, CentOS, openSUSE, Alpine, Void, Gentoo
 # Shells:   Zsh, Bash, Fish
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PREFIX="${PREFIX:-$HOME/.local}"
 INSTALL_DEPS=1
 CONFIGURE_SHELLS=1
@@ -103,6 +103,25 @@ install_deps() {
   fi
 }
 
+build_gui_if_needed() {
+  local gui_bin="$REPO_ROOT/gui/target/release/rec-gui"
+  if [[ -x "$gui_bin" ]]; then
+    return 0
+  fi
+  local cargo_bin=""
+  if command -v cargo >/dev/null 2>&1; then
+    cargo_bin="$(command -v cargo)"
+  elif [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+    cargo_bin="$HOME/.cargo/bin/cargo"
+  fi
+  if [[ -n "$cargo_bin" && -f "$REPO_ROOT/gui/Cargo.toml" ]]; then
+    echo -e "${C_CYAN}Building native Rust GUI (rec-gui)...${C_RESET}"
+    "$cargo_bin" build --release --manifest-path "$REPO_ROOT/gui/Cargo.toml"
+  else
+    echo -e "${C_YELLOW}Warning: cargo not found; skipping rec-gui build. Install Rust (https://rustup.rs) to build the desktop app.${C_RESET}"
+  fi
+}
+
 install_files() {
   local bin_dir="$PREFIX/bin"
   local share_dir="$PREFIX/share/rec-cli"
@@ -110,14 +129,18 @@ install_files() {
   local icons_dir="$PREFIX/share/icons/hicolor/scalable/apps"
   mkdir -p "$bin_dir" "$share_dir/shell" "$share_dir/starship" "$apps_dir" "$icons_dir"
 
-  install -m 755 "$REPO_ROOT/bin/rec-cli"           "$bin_dir/rec-cli"
-  install -m 755 "$REPO_ROOT/bin/rec-pty"           "$bin_dir/rec-pty"
-  install -m 755 "$REPO_ROOT/bin/rec-gui"           "$bin_dir/rec-gui"
-  install -m 755 "$REPO_ROOT/bin/rec-studio-engine" "$bin_dir/rec-studio-engine"
-  install -m 755 "$REPO_ROOT/bin/rec-studio-editor" "$bin_dir/rec-studio-editor"
-  install -m 755 "$REPO_ROOT/bin/rec-capture"       "$bin_dir/rec-capture"
-  install -m 755 "$REPO_ROOT/bin/cast2mp4"          "$bin_dir/cast2mp4"
-  install -m 755 "$REPO_ROOT/bin/casts2mp4"         "$bin_dir/casts2mp4"
+  install -m 755 "$REPO_ROOT/bin/rec-cli"   "$bin_dir/rec-cli"
+  install -m 755 "$REPO_ROOT/bin/rec-pty"   "$bin_dir/rec-pty"
+  install -m 755 "$REPO_ROOT/bin/cast2mp4"  "$bin_dir/cast2mp4"
+  install -m 755 "$REPO_ROOT/bin/casts2mp4" "$bin_dir/casts2mp4"
+
+  local gui_bin="$REPO_ROOT/gui/target/release/rec-gui"
+  if [[ -x "$gui_bin" ]]; then
+    install -m 755 "$gui_bin" "$bin_dir/rec-gui"
+  fi
+
+  # Remove deprecated v2.0.0 Recordly studio binaries if upgrading
+  rm -f "$bin_dir/rec-studio-engine" "$bin_dir/rec-studio-editor" "$bin_dir/rec-capture"
 
   install -m 644 "$REPO_ROOT/shell/rec.zsh"  "$share_dir/shell/rec.zsh"
   install -m 644 "$REPO_ROOT/shell/rec.bash" "$share_dir/shell/rec.bash"
@@ -165,6 +188,7 @@ configure_shells() {
 }
 
 [[ "$INSTALL_DEPS" -eq 1 ]] && install_deps
+build_gui_if_needed
 install_files
 [[ "$CONFIGURE_SHELLS" -eq 1 ]] && configure_shells
 
